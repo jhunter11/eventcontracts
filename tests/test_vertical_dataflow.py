@@ -19,8 +19,9 @@ from eventcontracts.ingestion import IngestionJob, IngestionPipeline, IterableCa
 from eventcontracts.normalization import BASIC_NORMALIZERS, EventNormalizer, NormalizationPipeline
 from eventcontracts.replay import NormalizedReplaySource, RawReplayEngine
 from eventcontracts.risk import SleeveRiskGate
-from eventcontracts.runner import InMemoryClock, InMemoryContext, StaticContextProvider, StrategyRunner
+from eventcontracts.runner import StrategyRunner
 from eventcontracts.storage import EventEnvelope, InMemoryEventStore
+from eventcontracts.testing import InMemoryClock, InMemoryContext, StaticContextProvider
 from eventcontracts.strategies import example_threshold  # noqa: F401 - registers strategy
 from eventcontracts.strategy import create
 

@@ -23,14 +23,14 @@ from eventcontracts.domain import (
     TradeEvent,
     Venue,
 )
-from eventcontracts.runner import (
+from eventcontracts.runner import StrategyRunner
+from eventcontracts.testing import (
     AllowAllRiskGate,
     InMemoryClock,
     InMemoryContext,
     InMemoryEventSource,
     InMemoryIntentSink,
     StaticContextProvider,
-    StrategyRunner,
 )
 from eventcontracts.strategies import example_threshold  # noqa: F401 — registers
 from eventcontracts.strategy import create, known

@@ -1,7 +1,8 @@
 """In-memory port implementations for tests, backtests, and local experiments.
 
 These let you wire up an end-to-end loop without any I/O. Production runners
-swap them for NATS, S3, ONNX, etc.
+swap them for NATS, S3, ONNX, etc. They live under ``eventcontracts.testing``
+so production import paths cannot reach them by accident.
 """
 
 from __future__ import annotations
