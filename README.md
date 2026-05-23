@@ -52,7 +52,7 @@ pytest plugins from affecting this repository.
 - `src/eventcontracts/plugins/strategies`: concrete strategy plugins; currently includes
   `example_threshold`.
 - `src/eventcontracts/runner`: reference runner plus in-memory ports for tests and local experiments.
-- `src/eventcontracts/venues`: Kalshi and Polymarket adapter boundaries.
+- `src/eventcontracts/adapters/venues`: Kalshi and Polymarket adapter boundaries.
 - `src/eventcontracts/ingestion`: capture job boundaries.
 - `src/eventcontracts/storage`: raw envelope and normalized storage boundaries.
 - `src/eventcontracts/normalization`: contract matching and cross-venue rejection logic.
