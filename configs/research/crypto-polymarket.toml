@@ -1,0 +1,13 @@
+[program]
+name = "polymarket_crypto_lead_lag"
+venue = "polymarket_global"
+enabled = false
+
+[inputs]
+market_categories = ["crypto"]
+external_sources = ["binance_mark_price", "binance_funding_rate"]
+
+[evaluation]
+horizons_seconds = [5, 15, 60, 300, 900]
+score_after_taker_fees = true
+score_order_book_walk = true

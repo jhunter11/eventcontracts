@@ -1,0 +1,13 @@
+[raw]
+path = "data/raw"
+format = "jsonl"
+schema_version = "raw-event-v1"
+
+[normalized]
+path = "data/normalized"
+format = "parquet"
+schema_version = "normalized-event-v1"
+
+[replay]
+path = "data/replay"
+checkpoint_interval_seconds = 60

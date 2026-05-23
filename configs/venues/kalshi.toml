@@ -1,0 +1,24 @@
+[venue]
+name = "kalshi"
+environment = "demo"
+public_rest_auth_required = false
+websocket_auth_required = true
+supports_queue_position = true
+supports_fractional_contracts = true
+
+[market_data]
+capture_markets = true
+capture_order_books = true
+capture_trades = true
+capture_lifecycle = true
+capture_series_settlement_sources = true
+
+[execution]
+enabled = false
+paper_only = true
+model_thursday_pause = true
+cancel_order_on_pause = false
+
+[fees]
+model = "kalshi-fill-level"
+source = "venue_fee_schedule"

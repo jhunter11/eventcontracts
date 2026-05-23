@@ -1,0 +1,14 @@
+[program]
+name = "cross_venue_spread_normalization"
+venues = ["kalshi", "polymarket_global"]
+enabled = false
+
+[normalization]
+require_matching_resolution_source = true
+require_matching_event_window = true
+record_rejection_reasons = true
+
+[evaluation]
+score_capital_lockup = true
+score_resolution_delay = true
+score_fee_adjusted_spread = true

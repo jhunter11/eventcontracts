@@ -1,0 +1,22 @@
+strategy_id = "example-threshold-v1"
+name = "example_threshold"
+version = "0.1.0"
+description = "Reference threshold strategy used for scaffold validation."
+feature_schema_id = "example_threshold_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["*"]
+event_kinds = ["trade"]
+external_sources = []
+
+[default_execution_priority]
+tier = "standard"
+
+[parameters]
+buy_below = "0.50"
+size = "5"
+
+[tags]
+family = "example"
+mode = "paper"

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "event-contracts"
+version = "0.1.0"
+description = "Research and execution framework for Kalshi and Polymarket event contracts."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "QWS" }]
+# Runtime dependencies are tracked in requirements.txt.
+# Dev dependencies are tracked in requirements-dev.txt.
+dependencies = []
+
+[project.scripts]
+eventcontracts = "eventcontracts.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/eventcontracts"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src/eventcontracts", "tests"]

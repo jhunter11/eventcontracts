@@ -1,0 +1,25 @@
+[venue]
+name = "polymarket_global"
+environment = "production"
+settlement_chain = "polygon"
+collateral = "pUSD"
+supports_queue_position = false
+supports_onchain_fill_join = true
+
+[market_data]
+capture_gamma_discovery = true
+capture_clob_books = true
+capture_clob_trades = true
+capture_price_history = true
+capture_resolution_rules = true
+capture_onchain_fills = true
+
+[execution]
+enabled = false
+paper_only = true
+model_matching_engine_restarts = true
+model_sports_start_rules = true
+
+[fees]
+model = "polymarket-category-fill-level"
+source = "venue_fee_schedule"

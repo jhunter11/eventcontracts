@@ -1,0 +1,13 @@
+[program]
+name = "kalshi_weather_event_study"
+venue = "kalshi"
+enabled = false
+
+[inputs]
+market_categories = ["weather"]
+external_sources = ["nws_observations", "aviation_weather_metar", "noaa_climate"]
+
+[evaluation]
+latency_buckets_seconds = [1, 5, 15, 60, 300, 900]
+measure_fillability = true
+score_after_fees = true

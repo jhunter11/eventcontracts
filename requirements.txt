@@ -1,0 +1,14 @@
+# Runtime dependencies for the event-contracts framework.
+# Install with: python3 -m pip install -r requirements.txt
+
+# Configuration
+pydantic>=2.7
+
+# Storage / analytics
+polars>=1.0
+pyarrow>=16.0
+duckdb>=1.0
+
+# Networking (venue REST + WebSocket clients)
+httpx>=0.27
+websockets>=12.0
