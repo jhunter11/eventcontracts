@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eventcontracts/contracts/schemas/normalized_event.schema.json",
+  "title": "Normalized Event",
+  "description": "Discriminated union of every NormalizedEvent variant the framework emits. Mirrors python/src/eventcontracts/domain/events.py.",
+  "oneOf": [
+    { "$ref": "#/$defs/quote_event" },
+    { "$ref": "#/$defs/trade_event" },
+    { "$ref": "#/$defs/book_event" },
+    { "$ref": "#/$defs/lifecycle_event" },
+    { "$ref": "#/$defs/settlement_resolved_event" },
+    { "$ref": "#/$defs/external_signal_event" },
+    { "$ref": "#/$defs/timer_event" },
+    { "$ref": "#/$defs/own_fill_event" },
+    { "$ref": "#/$defs/own_order_update_event" },
+    { "$ref": "#/$defs/own_order_reject_event" }
+  ],
+  "$defs": {
+    "instrument_id": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["venue", "market_id"],
+      "properties": {
+        "venue": { "type": "string", "enum": ["kalshi", "polymarket_global"] },
+        "market_id": { "type": "string", "minLength": 1 },
+        "outcome_id": { "type": "string" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event_id", "source"],
+      "properties": {
+        "event_id": { "type": "string" },
+        "source": { "type": "string" },
+        "received_at": { "type": "string", "format": "date-time" },
+        "exchange_time": { "type": "string", "format": "date-time" }
+      }
+    },
+    "quote_event": {
+      "type": "object",
+      "required": ["kind", "instrument", "bid", "ask", "exchange_time", "provenance"],
+      "properties": {
+        "kind": { "const": "quote" },
+        "instrument": { "$ref": "#/$defs/instrument_id" },
+        "bid": { "type": "string" },
+        "ask": { "type": "string" },
+        "exchange_time": { "type": "string", "format": "date-time" },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      }
+    },
+    "trade_event": {
+      "type": "object",
+      "required": ["kind", "instrument", "price", "size", "exchange_time", "provenance"],
+      "properties": {
+        "kind": { "const": "trade" },
+        "instrument": { "$ref": "#/$defs/instrument_id" },
+        "price": { "type": "string" },
+        "size": { "type": "string" },
+        "exchange_time": { "type": "string", "format": "date-time" },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      }
+    },
+    "book_event": {
+      "type": "object",
+      "required": ["kind", "instrument", "bids", "asks", "exchange_time", "provenance"],
+      "properties": {
+        "kind": { "const": "book" },
+        "instrument": { "$ref": "#/$defs/instrument_id" },
+        "bids": { "type": "array", "items": { "$ref": "#/$defs/level" } },
+        "asks": { "type": "array", "items": { "$ref": "#/$defs/level" } },
+        "exchange_time": { "type": "string", "format": "date-time" },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      }
+    },
+    "level": {
+      "type": "object",
+      "required": ["price", "size"],
+      "properties": {
+        "price": { "type": "string" },
+        "size": { "type": "string" }
+      }
+    },
+    "lifecycle_event": {
+      "type": "object",
+      "required": ["kind", "instrument", "status", "exchange_time", "provenance"],
+      "properties": {
+        "kind": { "const": "lifecycle" },
+        "instrument": { "$ref": "#/$defs/instrument_id" },
+        "status": { "type": "string" },
+        "exchange_time": { "type": "string", "format": "date-time" },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      }
+    },
+    "settlement_resolved_event": {
+      "type": "object",
+      "required": ["kind", "instrument", "outcome", "exchange_time", "provenance"],
+      "properties": {
+        "kind": { "const": "settlement_resolved" },
+        "instrument": { "$ref": "#/$defs/instrument_id" },
+        "outcome": { "type": "string" },
+        "exchange_time": { "type": "string", "format": "date-time" },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      }
+    },
+    "external_signal_event": {
+      "type": "object",
+      "required": ["kind", "source", "payload", "exchange_time", "provenance"],
+      "properties": {
+        "kind": { "const": "external_signal" },
+        "source": { "type": "string" },
+        "payload": { "type": "object" },
+        "exchange_time": { "type": "string", "format": "date-time" },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      }
+    },
+    "timer_event": {
+      "type": "object",
+      "required": ["kind", "label", "exchange_time", "provenance"],
+      "properties": {
+        "kind": { "const": "timer" },
+        "label": { "type": "string" },
+        "exchange_time": { "type": "string", "format": "date-time" },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      }
+    },
+    "own_fill_event": {
+      "type": "object",
+      "required": ["kind", "fill_id", "order_id", "exchange_time", "provenance"],
+      "properties": {
+        "kind": { "const": "own_fill" },
+        "fill_id": { "type": "string" },
+        "order_id": { "type": "string" },
+        "exchange_time": { "type": "string", "format": "date-time" },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      }
+    },
+    "own_order_update_event": {
+      "type": "object",
+      "required": ["kind", "order_id", "status", "exchange_time", "provenance"],
+      "properties": {
+        "kind": { "const": "own_order_update" },
+        "order_id": { "type": "string" },
+        "status": { "type": "string" },
+        "exchange_time": { "type": "string", "format": "date-time" },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      }
+    },
+    "own_order_reject_event": {
+      "type": "object",
+      "required": ["kind", "order_id", "reason", "exchange_time", "provenance"],
+      "properties": {
+        "kind": { "const": "own_order_reject" },
+        "order_id": { "type": "string" },
+        "reason": { "type": "string" },
+        "exchange_time": { "type": "string", "format": "date-time" },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      }
+    }
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eventcontracts/contracts/schemas/sleeve_spec.schema.json",
+  "title": "SleeveSpec",
+  "description": "Deployment sleeve: venue, capital, currency, and risk profile. Mirrors python/src/eventcontracts/config.py:SleeveSpecConfig.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "sleeve_id",
+    "strategy_id",
+    "strategy_version",
+    "venue",
+    "capital_allocation",
+    "currency",
+    "risk"
+  ],
+  "properties": {
+    "sleeve_id": { "type": "string", "minLength": 1 },
+    "strategy_id": { "type": "string", "minLength": 1 },
+    "strategy_version": { "type": "string", "minLength": 1 },
+    "venue": { "type": "string", "enum": ["kalshi", "polymarket_global"] },
+    "capital_allocation": {
+      "type": "string",
+      "description": "Decimal as string to preserve precision across languages."
+    },
+    "currency": { "type": "string", "minLength": 3, "maxLength": 3 },
+    "risk": { "$ref": "#/$defs/risk_profile" },
+    "tags": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    }
+  },
+  "$defs": {
+    "risk_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_order_notional",
+        "max_position_notional",
+        "max_daily_loss",
+        "max_open_orders",
+        "max_gross_exposure",
+        "currency"
+      ],
+      "properties": {
+        "max_order_notional": { "type": "string" },
+        "max_position_notional": { "type": "string" },
+        "max_daily_loss": { "type": "string" },
+        "max_open_orders": { "type": "integer", "minimum": 0 },
+        "max_gross_exposure": { "type": "string" },
+        "currency": { "type": "string", "minLength": 3, "maxLength": 3 }
+      }
+    }
+  }
+}

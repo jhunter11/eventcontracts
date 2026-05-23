@@ -1,0 +1,44 @@
+schema_version = "1"
+bundle_id = "weather_threshold/example-0000-placeholder"
+created_at = "2026-01-01T00:00:00Z"
+created_by = "scaffold"
+
+[strategy]
+name = "weather_threshold"
+version = "0.1.0"
+strategy_spec = "strategy_spec.toml"
+
+[model]
+name = "weather_threshold"
+version = "v1"
+format = "rules"
+path = ""
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+optional = true
+
+[features]
+schema = "feature_schema.json"
+schema_id = "weather_threshold_features"
+schema_version = "1"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[parity]
+cases = "../../parity/weather_threshold/parity_cases.parquet"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+expected_rows = 0
+
+[[files]]
+path = "manifest.toml"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[files]]
+path = "strategy_spec.toml"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[files]]
+path = "sleeve_spec.toml"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[files]]
+path = "feature_schema.json"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"

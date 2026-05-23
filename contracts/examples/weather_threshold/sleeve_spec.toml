@@ -1,0 +1,18 @@
+sleeve_id = "weather-threshold-kalshi-paper-a"
+strategy_id = "weather-threshold-v1"
+strategy_version = "0.1.0"
+venue = "kalshi"
+capital_allocation = "10000"
+currency = "USD"
+
+[risk]
+max_order_notional = "500"
+max_position_notional = "2500"
+max_daily_loss = "250"
+max_open_orders = 10
+max_gross_exposure = "2500"
+currency = "USD"
+
+[tags]
+mode = "paper"
+family = "weather"

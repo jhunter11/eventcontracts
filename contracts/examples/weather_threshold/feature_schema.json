@@ -1,0 +1,39 @@
+{
+  "schema_id": "weather_threshold_features",
+  "schema_version": "1",
+  "description": "Features used by the weather_threshold example bundle. Built from Kalshi market data and the latest NWS observation for the relevant station.",
+  "features": [
+    {
+      "name": "implied_prob",
+      "dtype": "float64",
+      "description": "Mid-quote on the YES outcome.",
+      "nullable": false
+    },
+    {
+      "name": "spread_bps",
+      "dtype": "float64",
+      "description": "Bid-ask spread in basis points of mid.",
+      "nullable": false
+    },
+    {
+      "name": "obs_temp_f",
+      "dtype": "float64",
+      "description": "Latest NWS temperature observation for the contract's station, in Fahrenheit.",
+      "nullable": true,
+      "default": null
+    },
+    {
+      "name": "obs_age_seconds",
+      "dtype": "int64",
+      "description": "Seconds since the NWS observation was issued. 0 if no observation is available.",
+      "nullable": false,
+      "default": 0
+    },
+    {
+      "name": "minutes_to_settlement",
+      "dtype": "int64",
+      "description": "Whole minutes until the contract's settlement window opens.",
+      "nullable": false
+    }
+  ]
+}

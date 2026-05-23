@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eventcontracts/contracts/schemas/raw_envelope.schema.json",
+  "title": "Raw Event Envelope",
+  "description": "Persisted before normalization. Preserves source attribution, both timestamps, and the unmodified raw payload. See docs/architecture.md storage boundary.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "venue",
+    "channel",
+    "received_at",
+    "payload"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "raw-event-v1" },
+    "venue": { "type": "string", "enum": ["kalshi", "polymarket_global"] },
+    "channel": {
+      "type": "string",
+      "description": "Source channel within the venue (e.g. 'market_data', 'trades', 'fills').",
+      "minLength": 1
+    },
+    "exchange_time": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Timestamp as reported by the venue when available."
+    },
+    "received_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Local receipt timestamp."
+    },
+    "payload": {
+      "description": "Raw payload, unmodified from the venue.",
+      "type": ["object", "array", "string", "number", "boolean", "null"]
+    },
+    "correlation_id": { "type": "string" }
+  }
+}
