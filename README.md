@@ -141,6 +141,8 @@ rate-limit allocation, but never to bypass risk checks.
 ## Documentation Map
 
 - [docs/architecture.md](docs/architecture.md): layer boundaries and data flow.
+- [docs/dataflow-map.md](docs/dataflow-map.md): current partial implementation
+  functions and the data types handed between layers.
 - [docs/strategy-runner-contract.md](docs/strategy-runner-contract.md): concrete
   data types and plug-in contract.
 - [docs/artifact-contract.md](docs/artifact-contract.md): planned model and

@@ -8,6 +8,7 @@ from decimal import Decimal
 import pytest
 
 from eventcontracts.domain import (
+    ClientOrderId,
     EventId,
     EventProvenance,
     InstrumentId,
@@ -69,7 +70,7 @@ def test_trade_rejects_invalid_price_and_naive_time() -> None:
 def test_order_decision_requires_limit_price() -> None:
     with pytest.raises(ValueError, match="price is required"):
         PlaceOrder(
-            client_order_id="client-1",
+            client_order_id=ClientOrderId("client-1"),
             instrument_id=_instrument(),
             outcome_side=OutcomeSide.YES,
             order_side=OrderSide.BUY,

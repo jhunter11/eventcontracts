@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Protocol
 
+from eventcontracts.domain.events import NormalizedEvent
 from eventcontracts.domain.metadata import FrozenMap, freeze_mapping
 from eventcontracts.domain.models import Venue
 from eventcontracts.domain.validation import (
@@ -44,3 +45,20 @@ class EventStore(Protocol):
 
     def read(self, source: str) -> Iterable[EventEnvelope]:
         """Read events for a source in deterministic order."""
+
+
+class NormalizedEventStore(Protocol):
+    """Persist strategy-facing events after normalization.
+
+    Handoff:
+    ``normalization.pipeline.NormalizationPipeline``
+    writes ``NormalizedEvent`` values here.
+    ``replay.engine.NormalizedReplaySource`` reads them back and presents them
+    to ``runner.StrategyRunner`` through the ``EventSource`` port.
+    """
+
+    def append_normalized(self, event: NormalizedEvent) -> None:
+        """Persist one normalized event."""
+
+    def read_normalized(self) -> Iterable[NormalizedEvent]:
+        """Read normalized events in deterministic replay order."""
