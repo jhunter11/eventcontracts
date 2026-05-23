@@ -1,0 +1,11 @@
+# Rust workspace stub.
+#
+# Crates are added under rust/crates/ when the first low-latency
+# component is implemented. Planned members per docs/architecture.md:
+# online feature builder, sleeve runner, gateway, allocator, and
+# bus-facing services. The cross-language contract is file formats
+# under contracts/, not Python imports.
+
+[workspace]
+resolver = "2"
+members = []

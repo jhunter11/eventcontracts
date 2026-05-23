@@ -12,9 +12,13 @@ from eventcontracts.config import (
 )
 from eventcontracts.domain import LatencyTier, Venue
 
+from tests.conftest import REPO_ROOT
+
+CONFIGS = REPO_ROOT / "configs"
+
 
 def test_load_strategy_spec_from_toml() -> None:
-    spec = load_strategy_spec("configs/strategies/example-threshold.toml")
+    spec = load_strategy_spec(CONFIGS / "strategies/example-threshold.toml")
 
     assert spec.name == "example_threshold"
     assert spec.subscription.venues == (Venue.KALSHI,)
@@ -24,7 +28,7 @@ def test_load_strategy_spec_from_toml() -> None:
 
 
 def test_load_sleeve_spec_from_toml() -> None:
-    sleeve = load_sleeve_spec("configs/sleeves/example-kalshi-paper.toml")
+    sleeve = load_sleeve_spec(CONFIGS / "sleeves/example-kalshi-paper.toml")
 
     assert sleeve.venue is Venue.KALSHI
     assert sleeve.capital_allocation == Decimal("1000")
@@ -32,8 +36,8 @@ def test_load_sleeve_spec_from_toml() -> None:
 
 
 def test_load_storage_and_venue_configs() -> None:
-    storage = load_storage_config("configs/storage/lake.toml")
-    venue = load_venue_config("configs/venues/kalshi.toml")
+    storage = load_storage_config(CONFIGS / "storage/lake.toml")
+    venue = load_venue_config(CONFIGS / "venues/kalshi.toml")
 
     assert storage.raw.schema_version == "raw-event-v1"
     assert venue.venue["name"] == "kalshi"

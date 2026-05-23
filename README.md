@@ -11,33 +11,50 @@ execution, and risk are still mostly stubs. The important foundation now in
 place is the object model that lets strategy code plug into a runner without
 knowing how data capture, replay, risk, storage, or execution are implemented.
 
+## Repository Layout
+
+This is a polyglot workspace. Python code lives under `python/`, future
+Rust crates under `rust/`, and the cross-language file-format contracts
+that both consume under `contracts/`. The Python/Rust seam is files on
+disk (TOML specs, JSON schemas, Parquet parity cases, ONNX models), not
+in-process imports.
+
 ## Dependency Setup
 
-Use `requirements.txt` as the runtime dependency source of truth.
+Use `python/requirements.txt` as the runtime dependency source of truth.
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install --upgrade pip
-python3 -m pip install -r requirements.txt
+python3 -m pip install -r python/requirements.txt
 ```
 
 For tests, linting, and type checking, install the development requirements.
-`requirements-dev.txt` includes `requirements.txt`.
+`python/requirements-dev.txt` includes `python/requirements.txt`.
 
 ```bash
-python3 -m pip install -r requirements-dev.txt
+python3 -m pip install -r python/requirements-dev.txt
 ```
 
 Optional editable package install for the CLI:
 
 ```bash
-python3 -m pip install -e .
+python3 -m pip install -e ./python
 ```
 
 ## Verify The Scaffold
 
+From the repo root, the Makefile delegates into `python/` for you:
+
 ```bash
+make quality
+```
+
+Or run the underlying commands directly:
+
+```bash
+cd python
 python3 -m compileall -q src tests
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest
 ```
@@ -47,21 +64,29 @@ pytest plugins from affecting this repository.
 
 ## Current Package Shape
 
-- `src/eventcontracts/domain`: venue-neutral dataclasses and closed sum types.
-- `src/eventcontracts/strategy`: the researcher-facing strategy protocol,lifecycle states, read-only context contract, and registry.
-- `src/eventcontracts/plugins/strategies`: concrete strategy plugins; currently includes
-  `example_threshold`.
-- `src/eventcontracts/runner`: reference runner plus in-memory ports for tests and local experiments.
-- `src/eventcontracts/adapters/venues`: Kalshi and Polymarket adapter boundaries.
-- `src/eventcontracts/ingestion`: capture job boundaries.
-- `src/eventcontracts/storage`: raw envelope and normalized storage boundaries.
-- `src/eventcontracts/normalization`: contract matching and cross-venue rejection logic.
-- `src/eventcontracts/replay`: deterministic event-time replay boundary.
-- `src/eventcontracts/research`: initial research program scaffolds.
-- `src/eventcontracts/execution`: paper execution, fill simulation, and queue modeling boundary.
-- `src/eventcontracts/risk`: pre-trade policy, limits, and compliance boundary.
-- `configs`: non-secret config examples for venues, storage, and research.
-- `docs`: architecture, contracts, roadmap, and development notes.
+All Python source lives under `python/src/eventcontracts/`:
+
+- `domain`: venue-neutral dataclasses and closed sum types.
+- `strategy`: the researcher-facing strategy protocol, lifecycle states, read-only context contract, and registry.
+- `plugins/strategies`: concrete strategy plugins; currently includes `example_threshold`.
+- `runner`: reference runner. In-memory ports for tests live under `testing/`.
+- `testing`: in-memory ports and other test doubles. Not for production imports.
+- `adapters/venues`: Kalshi and Polymarket adapter boundaries.
+- `ingestion`: capture job boundaries.
+- `storage`: raw envelope and normalized storage boundaries.
+- `normalization`: contract matching and cross-venue rejection logic.
+- `replay`: deterministic event-time replay boundary.
+- `execution`: paper execution, fill simulation, and queue modeling boundary.
+- `risk`: pre-trade policy, limits, and compliance boundary.
+
+Other top-level directories:
+
+- `python/tests`: pytest suite.
+- `rust/`: Rust workspace stub. Crates land here when low-latency components are built.
+- `contracts/`: cross-language file-format contracts (JSON schemas, TOML examples, parity cases).
+- `configs/`: non-secret config examples for venues, storage, and research programs.
+- `docs/`: architecture, contracts, roadmap, research programs, and development notes.
+- `notebooks/`: researcher exploration surface.
 
 ## Core Data Flow
 

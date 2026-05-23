@@ -5,33 +5,35 @@ Python scaffold.
 
 ## Environment
 
-Create a virtual environment and install runtime dependencies from
-`requirements.txt`.
+All Python sources, tests, and requirements live under `python/`. Create a
+virtual environment from the repo root and install runtime dependencies from
+`python/requirements.txt`.
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install --upgrade pip
-python3 -m pip install -r requirements.txt
+python3 -m pip install -r python/requirements.txt
 ```
 
 Install development tooling when running tests, lint, or type checks:
 
 ```bash
-python3 -m pip install -r requirements-dev.txt
+python3 -m pip install -r python/requirements-dev.txt
 ```
 
-`requirements-dev.txt` includes `requirements.txt`, so it is enough for a full
-local development environment.
+`python/requirements-dev.txt` includes `python/requirements.txt`, so it is
+enough for a full local development environment.
 
 ## Editable Install
 
-The tests use `pythonpath = ["src"]` from `pyproject.toml`, so an editable
-install is not required for pytest. Install the package editable when you want
-the `eventcontracts` console script available:
+The tests use `pythonpath = ["src"]` from `python/pyproject.toml`, so an
+editable install is not required for pytest (run from `python/`). Install
+the package editable when you want the `eventcontracts` console script
+available:
 
 ```bash
-python3 -m pip install -e .
+python3 -m pip install -e ./python
 ```
 
 ## Environment Variables
@@ -47,7 +49,11 @@ data providers. Do not commit real credentials.
 
 ## Verification Commands
 
+From the repo root, `make quality` runs everything in `python/`. To invoke
+the steps directly:
+
 ```bash
+cd python
 python3 -m compileall -q src tests
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest
 python3 -m ruff check src tests
@@ -65,20 +71,21 @@ After editable install:
 eventcontracts check-config configs/venues/kalshi.toml
 ```
 
-Without editable install:
+Without editable install (run from the repo root):
 
 ```bash
-PYTHONPATH=src python3 -m eventcontracts.cli check-config configs/venues/kalshi.toml
+PYTHONPATH=python/src python3 -m eventcontracts.cli check-config configs/venues/kalshi.toml
 ```
 
 ## Adding A Strategy
 
-1. Add a module under `src/eventcontracts/plugins/strategies/`.
+1. Add a module under `python/src/eventcontracts/plugins/strategies/`.
 2. Implement `StrategyBase.on_event`.
 3. Register a factory with `@register("strategy_name")`.
-4. Import the module in `src/eventcontracts/plugins/strategies/__init__.py` so the
-   registry is populated.
-5. Add a test using the in-memory runner ports.
+4. Import the module in `python/src/eventcontracts/plugins/strategies/__init__.py`
+   so the registry is populated (or expose it via the
+   `eventcontracts.strategies` entry-point group in `python/pyproject.toml`).
+5. Add a test using the in-memory ports from `eventcontracts.testing`.
 
 ## Adding A Domain Type
 
