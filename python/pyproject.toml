@@ -17,6 +17,9 @@ dependencies = []
 [project.scripts]
 eventcontracts = "eventcontracts.cli:main"
 
+[project.entry-points."eventcontracts.strategies"]
+example_threshold = "eventcontracts.plugins.strategies.example_threshold"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/eventcontracts"]
 
