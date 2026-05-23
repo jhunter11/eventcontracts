@@ -151,7 +151,7 @@ rate-limit allocation, but never to bypass risk checks.
   contribution conventions.
 - [docs/implementation-roadmap.md](docs/implementation-roadmap.md): gap matrix,
   MVP sequence, and hardening plan.
-- [deep-research-report.md](deep-research-report.md): research assessment and
+- [docs/deep-research-report.md](docs/deep-research-report.md): research assessment and
   market-structure rationale behind the roadmap.
 
 ## Live Trading Boundary
