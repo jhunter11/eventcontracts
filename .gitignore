@@ -13,3 +13,8 @@ data/raw/
 data/normalized/
 data/replay/
 notebooks/.ipynb_checkpoints/
+
+# Local artifact bundles produced by the (future) exporter. The
+# canonical store is documented in docs/artifact-contract.md.
+artifacts/*
+!artifacts/.gitkeep
