@@ -202,7 +202,7 @@ def factory(spec):
 ```
 
 The complete reference example is
-`src/eventcontracts/strategies/example_threshold.py`.
+`src/eventcontracts/plugins/strategies/example_threshold.py`.
 
 ## Test Wiring Pattern
 

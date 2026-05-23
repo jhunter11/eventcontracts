@@ -49,7 +49,7 @@ pytest plugins from affecting this repository.
 
 - `src/eventcontracts/domain`: venue-neutral dataclasses and closed sum types.
 - `src/eventcontracts/strategy`: the researcher-facing strategy protocol,lifecycle states, read-only context contract, and registry.
-- `src/eventcontracts/strategies`: concrete strategy plugins; currently includes
+- `src/eventcontracts/plugins/strategies`: concrete strategy plugins; currently includes
   `example_threshold`.
 - `src/eventcontracts/runner`: reference runner plus in-memory ports for tests and local experiments.
 - `src/eventcontracts/venues`: Kalshi and Polymarket adapter boundaries.
@@ -103,7 +103,7 @@ The runner resolves a `StrategySpec` through the registry, feeds it
 `IntentEnvelope` objects, and passes them through a `RiskGate` before emitting.
 
 See [docs/strategy-runner-contract.md](docs/strategy-runner-contract.md) for the
-full contract and [src/eventcontracts/strategies/example_threshold.py](src/eventcontracts/strategies/example_threshold.py)
+full contract and [src/eventcontracts/plugins/strategies/example_threshold.py](src/eventcontracts/plugins/strategies/example_threshold.py)
 for the smallest working example.
 
 ## Implemented Type Scaffolding
@@ -130,7 +130,7 @@ rate-limit allocation, but never to bypass risk checks.
 
 ## Adding A Strategy
 
-1. Create a new module in `src/eventcontracts/strategies/`.
+1. Create a new module in `src/eventcontracts/plugins/strategies/`.
 2. Subclass `StrategyBase` or implement the `Strategy` protocol.
 3. Match only on `NormalizedEvent` variants your strategy understands.
 4. Return `StrategyDecision` values such as `PlaceOrder` or `NoAction`.

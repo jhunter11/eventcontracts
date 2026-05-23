@@ -32,7 +32,7 @@ from eventcontracts.testing import (
     InMemoryIntentSink,
     StaticContextProvider,
 )
-from eventcontracts.strategies import example_threshold  # noqa: F401 — registers
+from eventcontracts.plugins.strategies import example_threshold  # noqa: F401 — registers
 from eventcontracts.strategy import create, known
 from eventcontracts.strategy.lifecycle import StrategyState
 

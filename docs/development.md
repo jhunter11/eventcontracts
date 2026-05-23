@@ -73,10 +73,10 @@ PYTHONPATH=src python3 -m eventcontracts.cli check-config configs/venues/kalshi.
 
 ## Adding A Strategy
 
-1. Add a module under `src/eventcontracts/strategies/`.
+1. Add a module under `src/eventcontracts/plugins/strategies/`.
 2. Implement `StrategyBase.on_event`.
 3. Register a factory with `@register("strategy_name")`.
-4. Import the module in `src/eventcontracts/strategies/__init__.py` so the
+4. Import the module in `src/eventcontracts/plugins/strategies/__init__.py` so the
    registry is populated.
 5. Add a test using the in-memory runner ports.
 
