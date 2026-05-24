@@ -13,6 +13,7 @@ from eventcontracts.execution.market_simulator import (
     PendingOrder,
 )
 from eventcontracts.execution.paper import PaperBroker, PaperIntentSink
+from eventcontracts.execution.pnl import PnLTracker, PositionRecord
 from eventcontracts.execution.queue import (
     DepthQueueEstimator,
     FractionalQueueEstimator,
@@ -45,6 +46,8 @@ __all__ = [
     "PaperBroker",
     "PaperIntentSink",
     "PendingOrder",
+    "PnLTracker",
+    "PositionRecord",
     "QueueEstimate",
     "QueuePositionEstimator",
     "SimulatedFill",
