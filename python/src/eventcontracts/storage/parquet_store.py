@@ -18,14 +18,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Iterator
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-import pyarrow as pa
-import pyarrow.parquet as pq
-
-from decimal import Decimal
+import pyarrow as _pa_mod
+import pyarrow.parquet as _pq_mod
 
 from eventcontracts.domain.events import (
     EVENT_KINDS,
@@ -35,6 +34,11 @@ from eventcontracts.domain.events import (
 from eventcontracts.domain.models import Venue
 from eventcontracts.domain.serialization import to_primitive
 from eventcontracts.storage.interfaces import EventEnvelope, EventStore, NormalizedEventStore
+
+# pyarrow does not ship strict type stubs; treat the modules as Any so the
+# rest of this file stays strict-mypy clean without scattering type:ignore.
+pa: Any = _pa_mod
+pq: Any = _pq_mod
 
 
 def _parse_decimal(value: Any, field_name: str) -> Decimal:
@@ -47,8 +51,15 @@ def _parse_datetime(value: Any, field_name: str) -> datetime | None:
     if value is None:
         return None
     if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
     return datetime.fromisoformat(str(value))
+
+
+def _parse_required_datetime(value: Any, field_name: str) -> datetime:
+    parsed = _parse_datetime(value, field_name)
+    if parsed is None:
+        raise ValueError(f"{field_name} is required")
+    return parsed
 
 
 RAW_SCHEMA = pa.schema(
@@ -82,8 +93,8 @@ def _utc_microsecond(dt: datetime | None) -> datetime | None:
     if dt is None:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 def _partition_dir_raw(root: Path, venue: Venue | None, source: str, day: date) -> Path:
@@ -121,9 +132,9 @@ def _row_to_envelope(row: dict[str, Any]) -> EventEnvelope:
     received_at = row["received_at"]
     exchange_ts = row.get("exchange_ts")
     if isinstance(received_at, datetime) and received_at.tzinfo is None:
-        received_at = received_at.replace(tzinfo=timezone.utc)
+        received_at = received_at.replace(tzinfo=UTC)
     if isinstance(exchange_ts, datetime) and exchange_ts.tzinfo is None:
-        exchange_ts = exchange_ts.replace(tzinfo=timezone.utc)
+        exchange_ts = exchange_ts.replace(tzinfo=UTC)
     return EventEnvelope(
         venue=venue,
         source=row["source"],
@@ -169,6 +180,9 @@ def _extract_event_timestamps(event: NormalizedEvent) -> tuple[datetime | None, 
         ExternalSignalEvent,
         LifecycleEvent,
         OrderBookEvent,
+        OwnFillEvent,
+        OwnOrderRejectEvent,
+        OwnOrderUpdateEvent,
         QuoteEvent,
         SettlementResolvedEvent,
         TimerEvent,
@@ -189,8 +203,13 @@ def _extract_event_timestamps(event: NormalizedEvent) -> tuple[datetime | None, 
         return event.exchange_ts, event.received_at
     if isinstance(event, TimerEvent):
         return event.timestamp, event.timestamp
-    # Own-* events carry timestamps inside the wrapped object.
-    return None, _utc_microsecond(datetime.now(tz=timezone.utc))  # type: ignore[return-value]
+    if isinstance(event, OwnFillEvent):
+        return event.fill.exchange_ts, event.fill.filled_at
+    if isinstance(event, OwnOrderUpdateEvent):
+        return None, event.order.updated_at
+    if isinstance(event, OwnOrderRejectEvent):
+        return None, event.reject.rejected_at
+    raise TypeError(f"unsupported event variant: {type(event).__name__}")
 
 
 class ParquetEventStore(EventStore, NormalizedEventStore):
@@ -234,7 +253,7 @@ class ParquetEventStore(EventStore, NormalizedEventStore):
         # Group rows by partition.
         by_partition: dict[tuple[Venue | None, str, date], list[EventEnvelope]] = {}
         for env in self._raw_buffer:
-            day = env.received_at.astimezone(timezone.utc).date()
+            day = env.received_at.astimezone(UTC).date()
             by_partition.setdefault((env.venue, env.source, day), []).append(env)
         for (venue, source, day), envelopes in by_partition.items():
             rows = [_envelope_to_row(e) for e in envelopes]
@@ -249,7 +268,7 @@ class ParquetEventStore(EventStore, NormalizedEventStore):
         by_partition: dict[tuple[str, date], list[NormalizedEvent]] = {}
         for event in self._normalized_buffer:
             ts = _extract_event_timestamps(event)[1]
-            day = ts.astimezone(timezone.utc).date() if ts.tzinfo else ts.date()
+            day = ts.astimezone(UTC).date() if ts.tzinfo else ts.date()
             kind = event_kind(event)
             by_partition.setdefault((kind, day), []).append(event)
         for (kind, day), events in by_partition.items():
@@ -306,9 +325,9 @@ class ParquetEventStore(EventStore, NormalizedEventStore):
                 ex_ts = row.get("exchange_ts")
                 rx_ts = row["received_at"]
                 if isinstance(ex_ts, datetime) and ex_ts.tzinfo is None:
-                    ex_ts = ex_ts.replace(tzinfo=timezone.utc)
+                    ex_ts = ex_ts.replace(tzinfo=UTC)
                 if isinstance(rx_ts, datetime) and rx_ts.tzinfo is None:
-                    rx_ts = rx_ts.replace(tzinfo=timezone.utc)
+                    rx_ts = rx_ts.replace(tzinfo=UTC)
                 rows.append((ex_ts or rx_ts, rx_ts, row["kind"], payload))
         rows.sort(key=lambda t: (t[0], t[1], t[3].get("event_id", "")))
         for _ex_ts, _rx_ts, kind, payload in rows:
@@ -323,12 +342,24 @@ def _deserialize_normalized(kind: str, payload: dict[str, Any]) -> NormalizedEve
         ExternalSignalEvent,
         LifecycleEvent,
         OrderBookEvent,
+        OwnFillEvent,
+        OwnOrderRejectEvent,
+        OwnOrderUpdateEvent,
         QuoteEvent,
         SettlementResolvedEvent,
         TimerEvent,
         TradeEvent,
     )
-    from eventcontracts.domain.ids import EventId
+    from eventcontracts.domain.fills import Fill
+    from eventcontracts.domain.ids import (
+        ClientOrderId,
+        CorrelationId,
+        EventId,
+        FillId,
+        SleeveId,
+        StrategyId,
+        VenueOrderId,
+    )
     from eventcontracts.domain.lifecycle import (
         MarketLifecycleEvent,
         MarketLifecycleKind,
@@ -340,8 +371,21 @@ def _deserialize_normalized(kind: str, payload: dict[str, Any]) -> NormalizedEve
         OutcomeSide,
         Quote,
         Trade,
+    )
+    from eventcontracts.domain.models import (
         OrderBook as DomainOrderBook,
+    )
+    from eventcontracts.domain.models import (
         Venue as DomainVenue,
+    )
+    from eventcontracts.domain.orders import (
+        Liquidity,
+        Order,
+        OrderReject,
+        OrderSide,
+        OrderStatus,
+        OrderType,
+        TimeInForce,
     )
 
     if kind not in EVENT_KINDS:
@@ -377,7 +421,7 @@ def _deserialize_normalized(kind: str, payload: dict[str, Any]) -> NormalizedEve
             quantity=_parse_decimal(trade_data["quantity"], "trade.quantity"),
             trade_id=trade_data.get("trade_id"),
             exchange_ts=_parse_datetime(trade_data["exchange_ts"], "trade.exchange_ts"),
-            received_at=_parse_datetime(trade_data["received_at"], "trade.received_at"),
+            received_at=_parse_required_datetime(trade_data["received_at"], "trade.received_at"),
             aggressor_side=OutcomeSide(trade_data["aggressor_side"]) if trade_data.get("aggressor_side") else None,
         )
         return TradeEvent(event_id=event_id, trade=trade, provenance=provenance)
@@ -386,13 +430,29 @@ def _deserialize_normalized(kind: str, payload: dict[str, Any]) -> NormalizedEve
         quote_data = payload["quote"]
         bid = quote_data.get("bid")
         ask = quote_data.get("ask")
+        bid_level = (
+            OrderBookLevel(
+                price=_parse_decimal(bid["price"], "bid"),
+                quantity=_parse_decimal(bid["quantity"], "bid"),
+            )
+            if bid
+            else None
+        )
+        ask_level = (
+            OrderBookLevel(
+                price=_parse_decimal(ask["price"], "ask"),
+                quantity=_parse_decimal(ask["quantity"], "ask"),
+            )
+            if ask
+            else None
+        )
         quote = Quote(
             instrument_id=_instr(quote_data["instrument_id"]),
             side=OutcomeSide(quote_data["side"]),
-            bid=OrderBookLevel(price=_parse_decimal(bid["price"], "bid"), quantity=_parse_decimal(bid["quantity"], "bid")) if bid else None,
-            ask=OrderBookLevel(price=_parse_decimal(ask["price"], "ask"), quantity=_parse_decimal(ask["quantity"], "ask")) if ask else None,
+            bid=bid_level,
+            ask=ask_level,
             exchange_ts=_parse_datetime(quote_data["exchange_ts"], "quote.exchange_ts"),
-            received_at=_parse_datetime(quote_data["received_at"], "quote.received_at"),
+            received_at=_parse_required_datetime(quote_data["received_at"], "quote.received_at"),
         )
         return QuoteEvent(event_id=event_id, quote=quote, provenance=provenance)
 
@@ -414,7 +474,7 @@ def _deserialize_normalized(kind: str, payload: dict[str, Any]) -> NormalizedEve
             no_bids=_levels(book_data["no_bids"]),
             no_asks=_levels(book_data["no_asks"]),
             exchange_ts=_parse_datetime(book_data["exchange_ts"], "book.exchange_ts"),
-            received_at=_parse_datetime(book_data["received_at"], "book.received_at"),
+            received_at=_parse_required_datetime(book_data["received_at"], "book.received_at"),
         )
         return OrderBookEvent(event_id=event_id, book=book, provenance=provenance)
 
@@ -424,7 +484,7 @@ def _deserialize_normalized(kind: str, payload: dict[str, Any]) -> NormalizedEve
             instrument_id=_instr(lc["instrument_id"]),
             kind=MarketLifecycleKind(lc["kind"]),
             exchange_ts=_parse_datetime(lc["exchange_ts"], "lifecycle.exchange_ts"),
-            received_at=_parse_datetime(lc["received_at"], "lifecycle.received_at"),
+            received_at=_parse_required_datetime(lc["received_at"], "lifecycle.received_at"),
             reason=lc.get("reason"),
             metadata=lc.get("metadata", {}),
         )
@@ -437,7 +497,7 @@ def _deserialize_normalized(kind: str, payload: dict[str, Any]) -> NormalizedEve
             resolved_side=OutcomeSide(st["resolved_side"]) if st.get("resolved_side") else None,
             payout_per_contract=_parse_decimal(st["payout_per_contract"], "settlement.payout"),
             currency=st["currency"],
-            settled_at=_parse_datetime(st["settled_at"], "settlement.settled_at"),
+            settled_at=_parse_required_datetime(st["settled_at"], "settlement.settled_at"),
             source=st["source"],
             metadata=st.get("metadata", {}),
         )
@@ -448,7 +508,7 @@ def _deserialize_normalized(kind: str, payload: dict[str, Any]) -> NormalizedEve
             event_id=event_id,
             source=payload["source"],
             exchange_ts=_parse_datetime(payload["exchange_ts"], "external.exchange_ts"),
-            received_at=_parse_datetime(payload["received_at"], "external.received_at"),
+            received_at=_parse_required_datetime(payload["received_at"], "external.received_at"),
             schema_version=payload["schema_version"],
             payload=payload.get("payload", {}),
             provenance=provenance,
@@ -457,9 +517,80 @@ def _deserialize_normalized(kind: str, payload: dict[str, Any]) -> NormalizedEve
     if kind == "timer":
         return TimerEvent(
             event_id=event_id,
-            timestamp=_parse_datetime(payload["timestamp"], "timer.timestamp"),
+            timestamp=_parse_required_datetime(payload["timestamp"], "timer.timestamp"),
             label=payload["label"],
             provenance=provenance,
         )
+
+    if kind == "own_fill":
+        fill_data = payload["fill"]
+        filled_at = _parse_datetime(fill_data["filled_at"], "fill.filled_at")
+        assert filled_at is not None  # required field
+        fill = Fill(
+            fill_id=FillId(fill_data["fill_id"]),
+            venue_order_id=VenueOrderId(fill_data["venue_order_id"]),
+            client_order_id=ClientOrderId(fill_data["client_order_id"]),
+            instrument_id=_instr(fill_data["instrument_id"]),
+            outcome_side=OutcomeSide(fill_data["outcome_side"]),
+            order_side=OrderSide(fill_data["order_side"]),
+            price=_parse_decimal(fill_data["price"], "fill.price"),
+            quantity=_parse_decimal(fill_data["quantity"], "fill.quantity"),
+            liquidity=Liquidity(fill_data["liquidity"]),
+            fee_amount=_parse_decimal(fill_data["fee_amount"], "fill.fee_amount"),
+            fee_currency=fill_data["fee_currency"],
+            filled_at=filled_at,
+            exchange_ts=_parse_datetime(fill_data.get("exchange_ts"), "fill.exchange_ts"),
+            correlation_id=CorrelationId(fill_data["correlation_id"]),
+            strategy_id=StrategyId(fill_data["strategy_id"]),
+            sleeve_id=SleeveId(fill_data["sleeve_id"]),
+            metadata=fill_data.get("metadata", {}),
+        )
+        return OwnFillEvent(event_id=event_id, fill=fill, provenance=provenance)
+
+    if kind == "own_order_update":
+        order_data = payload["order"]
+        created_at = _parse_datetime(order_data["created_at"], "order.created_at")
+        updated_at = _parse_datetime(order_data["updated_at"], "order.updated_at")
+        assert created_at is not None and updated_at is not None
+        venue_order_id_value = order_data.get("venue_order_id")
+        order = Order(
+            client_order_id=ClientOrderId(order_data["client_order_id"]),
+            venue_order_id=VenueOrderId(venue_order_id_value) if venue_order_id_value else None,
+            instrument_id=_instr(order_data["instrument_id"]),
+            outcome_side=OutcomeSide(order_data["outcome_side"]),
+            order_side=OrderSide(order_data["order_side"]),
+            order_type=OrderType(order_data["order_type"]),
+            time_in_force=TimeInForce(order_data["time_in_force"]),
+            price=(
+                _parse_decimal(order_data["price"], "order.price")
+                if order_data.get("price") is not None
+                else None
+            ),
+            quantity=_parse_decimal(order_data["quantity"], "order.quantity"),
+            filled_quantity=_parse_decimal(
+                order_data["filled_quantity"], "order.filled_quantity"
+            ),
+            status=OrderStatus(order_data["status"]),
+            created_at=created_at,
+            updated_at=updated_at,
+            correlation_id=CorrelationId(order_data["correlation_id"]),
+            strategy_id=StrategyId(order_data["strategy_id"]),
+            sleeve_id=SleeveId(order_data["sleeve_id"]),
+            expires_at=_parse_datetime(order_data.get("expires_at"), "order.expires_at"),
+            metadata=order_data.get("metadata", {}),
+        )
+        return OwnOrderUpdateEvent(event_id=event_id, order=order, provenance=provenance)
+
+    if kind == "own_order_reject":
+        reject_data = payload["reject"]
+        rejected_at = _parse_datetime(reject_data["rejected_at"], "reject.rejected_at")
+        assert rejected_at is not None
+        reject = OrderReject(
+            client_order_id=ClientOrderId(reject_data["client_order_id"]),
+            reason=reject_data["reason"],
+            rejected_at=rejected_at,
+            venue_code=reject_data.get("venue_code"),
+        )
+        return OwnOrderRejectEvent(event_id=event_id, reject=reject, provenance=provenance)
 
     raise ValueError(f"deserialization not implemented for kind={kind}")

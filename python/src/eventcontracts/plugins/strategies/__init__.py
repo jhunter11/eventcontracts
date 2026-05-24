@@ -1,10 +1,6 @@
 """Concrete strategy implementations.
 
 Each module here defines one strategy and registers it via ``@register``.
-Importing this package eagerly imports every strategy module so the registry
-is populated as a side effect.
+Startup discovery imports every module in this package through
+``eventcontracts.strategy.load_package_strategies``.
 """
-
-from eventcontracts.plugins.strategies import example_threshold
-
-__all__ = ["example_threshold"]

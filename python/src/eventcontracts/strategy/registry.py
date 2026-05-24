@@ -13,6 +13,7 @@ call :func:`load_entry_points` once at startup to import them.
 from __future__ import annotations
 
 import importlib
+import pkgutil
 from collections.abc import Callable
 from importlib import metadata
 
@@ -20,6 +21,10 @@ from eventcontracts.domain.spec import StrategySpec
 from eventcontracts.strategy.base import Strategy, StrategyFactory
 
 ENTRY_POINT_GROUP = "eventcontracts.strategies"
+BUILTIN_STRATEGY_PACKAGE = "eventcontracts.plugins.strategies"
+BUILTIN_STRATEGIES: dict[str, str] = {
+    "example_threshold": "eventcontracts.plugins.strategies.example_threshold",
+}
 
 
 class StrategyRegistry:
@@ -64,8 +69,32 @@ def known() -> tuple[str, ...]:
     return registry.known()
 
 
+def load_package_strategies(package_name: str = BUILTIN_STRATEGY_PACKAGE) -> tuple[str, ...]:
+    """Import every strategy module in an installed package.
+
+    This makes repository-local strategies plug-and-play: add a module under
+    ``eventcontracts.plugins.strategies``, register a factory with
+    ``@register("name")``, and startup discovery imports it without requiring a
+    central list edit.
+    """
+
+    package = importlib.import_module(package_name)
+    package_path = getattr(package, "__path__", None)
+    if package_path is None:
+        return ()
+
+    loaded: list[str] = []
+    for module_info in pkgutil.iter_modules(package_path):
+        if module_info.ispkg or module_info.name.startswith("_"):
+            continue
+        module_name = f"{package_name}.{module_info.name}"
+        importlib.import_module(module_name)
+        loaded.append(module_info.name)
+    return tuple(sorted(loaded))
+
+
 def load_entry_points() -> tuple[str, ...]:
-    """Import every module advertised under ``eventcontracts.strategies``.
+    """Import built-in and installed modules advertised as strategies.
 
     Importing the module triggers any ``@register(...)`` decorators it
     defines. Returns the names of the entry points that were loaded so
@@ -73,7 +102,35 @@ def load_entry_points() -> tuple[str, ...]:
     """
 
     loaded: list[str] = []
+    for name in load_package_strategies():
+        if name not in loaded:
+            loaded.append(name)
+    for name, module in BUILTIN_STRATEGIES.items():
+        importlib.import_module(module)
+        if name not in loaded:
+            loaded.append(name)
     for ep in metadata.entry_points(group=ENTRY_POINT_GROUP):
         importlib.import_module(ep.value)
-        loaded.append(ep.name)
+        if ep.name not in loaded:
+            loaded.append(ep.name)
     return tuple(loaded)
+
+
+def ensure_registered(name: str) -> None:
+    """Load known strategy plug-ins and fail clearly if `name` is unavailable."""
+
+    if name not in registry.known():
+        load_entry_points()
+    if name not in registry.known():
+        raise KeyError(
+            f"strategy not registered: {name}; add a module under "
+            f"{BUILTIN_STRATEGY_PACKAGE} with @register({name!r}) or install an "
+            f"{ENTRY_POINT_GROUP} entry point"
+        )
+
+
+def create_from_spec(spec: StrategySpec) -> Strategy:
+    """Create a strategy after loading local and installed plug-ins."""
+
+    ensure_registered(spec.name)
+    return create(spec.name, spec)

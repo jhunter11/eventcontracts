@@ -15,13 +15,20 @@ inside the runner.
 from __future__ import annotations
 
 import argparse
-import json
+import hashlib
 from pathlib import Path
+from typing import Any
 
 from eventcontracts.config import load_sleeve_spec, load_strategy_spec
+from eventcontracts.contracts import (
+    validate_json_contract_file,
+    validate_toml_contract_file,
+)
+
+ZERO_SHA256 = "0" * 64
 
 
-def register(subparsers: argparse._SubParsersAction) -> None:
+def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     parser = subparsers.add_parser(
         "validate-bundle",
         help="Validate an artifact bundle directory against contracts/.",
@@ -65,31 +72,67 @@ def _handle(args: argparse.Namespace) -> int:
 
 
 def _check_manifest(path: Path) -> None:
-    import tomllib
-
-    data = tomllib.loads(path.read_text())
-    for required_key in ("schema_version", "bundle_id", "strategy", "features", "files"):
-        if required_key not in data:
-            raise ValueError(f"missing top-level key: {required_key}")
-    if data["schema_version"] != "1":
-        raise ValueError(f"unsupported schema_version: {data['schema_version']}")
+    data = validate_toml_contract_file(path, "manifest.schema.json")
+    _validate_manifest_references(path.parent, data)
 
 
 def _check_strategy_spec(path: Path) -> None:
+    validate_toml_contract_file(path, "strategy_spec.schema.json")
     load_strategy_spec(path)
 
 
 def _check_sleeve_spec(path: Path) -> None:
+    validate_toml_contract_file(path, "sleeve_spec.schema.json")
     load_sleeve_spec(path)
 
 
 def _check_feature_schema(path: Path) -> None:
-    data = json.loads(path.read_text())
-    for required_key in ("schema_id", "schema_version", "features"):
-        if required_key not in data:
-            raise ValueError(f"missing top-level key: {required_key}")
-    if not isinstance(data["features"], list) or not data["features"]:
-        raise ValueError("features must be a non-empty list")
-    for i, feature in enumerate(data["features"]):
-        if "name" not in feature or "dtype" not in feature:
-            raise ValueError(f"feature[{i}] missing name or dtype")
+    validate_json_contract_file(path, "feature_schema.schema.json")
+
+
+def _validate_manifest_references(bundle: Path, manifest: dict[str, Any]) -> None:
+    for entry in manifest["files"]:
+        _validate_file_reference(bundle, entry["path"], entry["sha256"])
+
+    feature_path = manifest["features"]["schema"]
+    _validate_file_reference(bundle, feature_path, manifest["features"]["sha256"])
+
+    model = manifest.get("model")
+    if isinstance(model, dict) and model.get("path"):
+        _validate_file_reference(bundle, model["path"], model.get("sha256", ""))
+
+    parity = manifest.get("parity")
+    if isinstance(parity, dict) and int(parity.get("expected_rows", 0)) > 0:
+        _validate_file_reference(bundle, parity["cases"], parity["sha256"])
+
+
+def _validate_file_reference(bundle: Path, relative_path: str, expected_sha256: str) -> None:
+    target = (bundle / relative_path).resolve()
+    if not _is_relative_to(target, bundle.resolve()):
+        raise ValueError(f"file reference escapes bundle: {relative_path}")
+    if not target.exists():
+        raise ValueError(f"referenced file missing: {relative_path}")
+    if relative_path == "manifest.toml":
+        return
+    if expected_sha256 and expected_sha256 != ZERO_SHA256:
+        actual = _sha256_file(target)
+        if actual != expected_sha256:
+            raise ValueError(
+                f"checksum mismatch for {relative_path}: expected {expected_sha256}, got {actual}"
+            )
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()

@@ -1,11 +1,23 @@
-# Rust workspace stub.
+# Rust workspace for low-latency runtime scaffolds.
 #
-# Crates are added under rust/crates/ when the first low-latency
-# component is implemented. Planned members per docs/architecture.md:
-# online feature builder, sleeve runner, gateway, allocator, and
-# bus-facing services. The cross-language contract is file formats
-# under contracts/, not Python imports.
+# The cross-language contract is file formats under ../contracts/, not Python
+# imports. Runtime crates should preserve externally visible decimals,
+# timestamps, IDs, and checksums exactly until parity tests prove parsing
+# behavior.
 
 [workspace]
 resolver = "2"
-members = []
+members = [
+    "crates/allocator",
+    "crates/bus",
+    "crates/contracts",
+    "crates/feature-builder",
+    "crates/gateway",
+    "crates/parity",
+    "crates/runner",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Proprietary"
+publish = false

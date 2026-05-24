@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from eventcontracts.domain import (
@@ -11,8 +11,8 @@ from eventcontracts.domain import (
     CancelOrder,
     ClientOrderId,
     EventId,
-    InstrumentId,
     ExecutionPriority,
+    InstrumentId,
     LatencyTier,
     Liquidity,
     MarketLifecycleEvent,
@@ -38,6 +38,7 @@ from eventcontracts.domain import (
     decision_priority,
     event_kind,
 )
+from eventcontracts.domain.events import NormalizedEvent
 
 
 def _instrument() -> InstrumentId:
@@ -45,9 +46,9 @@ def _instrument() -> InstrumentId:
 
 
 def test_event_kind_covers_every_variant() -> None:
-    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
     inst = _instrument()
-    cases = {
+    cases: dict[NormalizedEvent, str] = {
         QuoteEvent(
             event_id=EventId("q"),
             quote=Quote(
@@ -101,7 +102,7 @@ def test_event_kind_covers_every_variant() -> None:
 
 
 def test_lifecycle_event_kind() -> None:
-    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
     lifecycle = MarketLifecycleEvent(
         instrument_id=_instrument(),
         kind=MarketLifecycleKind.PAUSED,

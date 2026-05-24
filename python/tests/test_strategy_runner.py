@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from eventcontracts.domain import (
@@ -23,7 +23,10 @@ from eventcontracts.domain import (
     TradeEvent,
     Venue,
 )
+from eventcontracts.plugins.strategies import example_threshold  # noqa: F401 — registers
 from eventcontracts.runner import StrategyRunner
+from eventcontracts.strategy import create, known
+from eventcontracts.strategy.lifecycle import StrategyState
 from eventcontracts.testing import (
     AllowAllRiskGate,
     InMemoryClock,
@@ -32,9 +35,6 @@ from eventcontracts.testing import (
     InMemoryIntentSink,
     StaticContextProvider,
 )
-from eventcontracts.plugins.strategies import example_threshold  # noqa: F401 — registers
-from eventcontracts.strategy import create, known
-from eventcontracts.strategy.lifecycle import StrategyState
 
 
 def _spec() -> StrategySpec:
@@ -81,7 +81,7 @@ def _trade(price: str, instrument: InstrumentId) -> TradeEvent:
             quantity=Decimal("1"),
             trade_id=None,
             exchange_ts=None,
-            received_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            received_at=datetime(2026, 1, 1, tzinfo=UTC),
         ),
     )
 

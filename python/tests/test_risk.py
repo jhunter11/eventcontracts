@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
-
-import pytest
 
 from eventcontracts.domain.decisions import (
     CancelOrder,
@@ -33,8 +31,7 @@ from eventcontracts.risk import (
 )
 from eventcontracts.testing import InMemoryContext
 
-
-NOW = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
 
 
 def _profile(**overrides: object) -> RiskProfile:
@@ -214,3 +211,41 @@ def test_daily_loss_only_records_negative_pnl() -> None:
     ledger.record_realized_pnl(Decimal("-30"), NOW)
     ledger.record_realized_pnl(Decimal("-20"), NOW)
     assert ledger.loss_for(NOW) == Decimal("50")
+
+
+def test_pretrade_policy_service_rejects_oversize_intent() -> None:
+    from eventcontracts.execution.simulator import OrderIntent
+    from eventcontracts.risk.policy import PreTradePolicyService
+
+    sleeve = _sleeve(_profile(max_order_notional=Decimal("10")))
+    service = PreTradePolicyService(sleeve)
+    intent = OrderIntent(
+        instrument_id=InstrumentId(venue=Venue.KALSHI, market_id="M-1"),
+        side=OutcomeSide.YES,
+        order_side=OrderSide.BUY,
+        price=Decimal("0.50"),
+        quantity=Decimal("100"),
+        order_type="limit",
+    )
+    decision = service.evaluate(intent)
+    assert not decision.allowed
+    assert decision.reasons == ("max_order_notional",)
+
+
+def test_pretrade_policy_service_accepts_within_limit() -> None:
+    from eventcontracts.execution.simulator import OrderIntent
+    from eventcontracts.risk.policy import PreTradePolicyService
+
+    sleeve = _sleeve()
+    service = PreTradePolicyService(sleeve)
+    intent = OrderIntent(
+        instrument_id=InstrumentId(venue=Venue.KALSHI, market_id="M-1"),
+        side=OutcomeSide.YES,
+        order_side=OrderSide.BUY,
+        price=Decimal("0.50"),
+        quantity=Decimal("10"),
+        order_type="limit",
+    )
+    decision = service.evaluate(intent)
+    assert decision.allowed
+    assert decision.reasons == ()

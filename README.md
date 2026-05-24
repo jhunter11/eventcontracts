@@ -78,11 +78,25 @@ All Python source lives under `python/src/eventcontracts/`:
 - `replay`: deterministic event-time replay boundary.
 - `execution`: paper execution, fill simulation, and queue modeling boundary.
 - `risk`: pre-trade policy, limits, and compliance boundary.
+- `features`: offline/online feature schema, builder, and feature-store contracts.
+- `models`: Python-first training, export, inference, and model-registry contracts.
+- `artifacts`: immutable strategy/model bundle writer, loader, validator, and promotion contracts.
+- `bus`: typed IPC topic, message, codec, publisher, and subscriber contracts.
+- `gateway`: live-shaped venue command, idempotency, priority scheduling, dry-run gateway, and reconciliation contracts.
+- `oms`: order ticket, transition, state-machine, and reconciliation contracts.
+- `ledger`: ledger, cash keeper, position keeper, and settlement accounting contracts.
+- `allocation`: sleeve registry and capital allocation contracts.
+- `observability`: structured logging, metrics, tracing, alerts, and health-check contracts.
+- `external`: point-in-time weather, crypto, macro, and other provider contracts.
+- `contracts`: dependency-free validation helpers for the cross-language schema files in top-level `contracts/`.
+- `markets`: subscription-based market detection and in-memory reference catalog for paper/dry-run mode.
 
 Other top-level directories:
 
 - `python/tests`: pytest suite.
-- `rust/`: Rust workspace stub. Crates land here when low-latency components are built.
+- `rust/`: Rust workspace with compileable low-latency scaffold crates:
+  `contracts`, `feature-builder`, `runner`, `gateway`, `bus`, `allocator`,
+  and `parity`.
 - `contracts/`: cross-language file-format contracts (JSON schemas, TOML examples, parity cases).
 - `configs/`: non-secret config examples for venues, storage, and research programs.
 - `docs/`: architecture, contracts, roadmap, research programs, and development notes.

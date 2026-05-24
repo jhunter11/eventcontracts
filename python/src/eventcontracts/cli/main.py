@@ -10,6 +10,7 @@ import argparse
 from collections.abc import Callable
 from pathlib import Path
 from pprint import pprint
+from typing import cast
 
 from eventcontracts.cli import backtest as backtest_cmd
 from eventcontracts.cli import replay as replay_cmd
@@ -22,11 +23,10 @@ from eventcontracts.config import (
     load_venue_config,
 )
 
-
 CommandHandler = Callable[[argparse.Namespace], int]
 
 
-def _register_check_config(subparsers: argparse._SubParsersAction) -> None:
+def _register_check_config(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     parser = subparsers.add_parser("check-config", help="Load and print a TOML config.")
     parser.add_argument("path", type=Path)
     parser.set_defaults(handler=_handle_check_config)
@@ -37,7 +37,7 @@ def _handle_check_config(args: argparse.Namespace) -> int:
     return 0
 
 
-def _register_validate_config(subparsers: argparse._SubParsersAction) -> None:
+def _register_validate_config(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     parser = subparsers.add_parser(
         "validate-config", help="Validate a TOML config against a known schema."
     )
@@ -73,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    handler: CommandHandler = args.handler
+    handler = cast(CommandHandler, args.handler)
     return handler(args)
 
 

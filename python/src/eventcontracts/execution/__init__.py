@@ -14,7 +14,6 @@ from eventcontracts.execution.market_simulator import (
 )
 from eventcontracts.execution.paper import PaperBroker, PaperIntentSink
 from eventcontracts.execution.pnl import PnLTracker, PositionRecord
-from eventcontracts.execution.report import BacktestReport
 from eventcontracts.execution.queue import (
     DepthQueueEstimator,
     FractionalQueueEstimator,
@@ -22,6 +21,7 @@ from eventcontracts.execution.queue import (
     QueueEstimate,
     QueuePositionEstimator,
 )
+from eventcontracts.execution.report import BacktestReport
 from eventcontracts.execution.simulator import (
     ExecutionSimulator,
     ImmediateFillSimulator,

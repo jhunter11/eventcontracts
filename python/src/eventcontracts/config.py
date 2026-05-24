@@ -28,7 +28,6 @@ from eventcontracts.domain.spec import (
     StrategySpec,
 )
 
-
 ConfigModel = TypeVar("ConfigModel", bound=BaseModel)
 ParameterValue = str | int | float | bool
 

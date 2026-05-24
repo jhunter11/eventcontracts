@@ -8,8 +8,8 @@
     { "$ref": "#/$defs/trade_event" },
     { "$ref": "#/$defs/book_event" },
     { "$ref": "#/$defs/lifecycle_event" },
-    { "$ref": "#/$defs/settlement_resolved_event" },
-    { "$ref": "#/$defs/external_signal_event" },
+    { "$ref": "#/$defs/settlement_event" },
+    { "$ref": "#/$defs/external_event" },
     { "$ref": "#/$defs/timer_event" },
     { "$ref": "#/$defs/own_fill_event" },
     { "$ref": "#/$defs/own_order_update_event" },
@@ -92,22 +92,22 @@
         "provenance": { "$ref": "#/$defs/provenance" }
       }
     },
-    "settlement_resolved_event": {
+    "settlement_event": {
       "type": "object",
       "required": ["kind", "instrument", "outcome", "exchange_time", "provenance"],
       "properties": {
-        "kind": { "const": "settlement_resolved" },
+        "kind": { "const": "settlement" },
         "instrument": { "$ref": "#/$defs/instrument_id" },
         "outcome": { "type": "string" },
         "exchange_time": { "type": "string", "format": "date-time" },
         "provenance": { "$ref": "#/$defs/provenance" }
       }
     },
-    "external_signal_event": {
+    "external_event": {
       "type": "object",
       "required": ["kind", "source", "payload", "exchange_time", "provenance"],
       "properties": {
-        "kind": { "const": "external_signal" },
+        "kind": { "const": "external" },
         "source": { "type": "string" },
         "payload": { "type": "object" },
         "exchange_time": { "type": "string", "format": "date-time" },

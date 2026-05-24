@@ -49,18 +49,13 @@ class PreTradePolicyService:
         self.sleeve = sleeve
 
     def evaluate(self, order: OrderIntent) -> PolicyDecision:
-        from eventcontracts.domain.decisions import PlaceOrder
-
-        synthetic = PlaceOrder(
-            instrument_id=order.instrument_id,
-            outcome_side=order.side,
-            order_side=order.order_side,
-            quantity=order.quantity,
-            price=order.price,
-            order_type=order.order_type,
-            client_order_id=order.metadata.get("client_order_id", "synthetic"),
-        )
-        reasons = list(check_order_notional(synthetic, self.sleeve.risk))
+        # An OrderIntent has already cleared strategy-level gating; this
+        # service applies sleeve policy a second time at the gateway boundary
+        # so a misbehaving sleeve cannot send an oversized order downstream.
+        notional = order.price * order.quantity
+        reasons: list[str] = []
+        if notional > self.sleeve.risk.max_order_notional:
+            reasons.append("max_order_notional")
         return PolicyDecision(allowed=not reasons, reasons=tuple(reasons))
 
 

@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+
+import pytest
+
+pytest.importorskip("duckdb")
 
 from eventcontracts.domain.events import EventProvenance, TradeEvent
 from eventcontracts.domain.ids import EventId
 from eventcontracts.domain.models import InstrumentId, OutcomeSide, Trade, Venue
 from eventcontracts.storage import DuckDbEventStore, EventEnvelope, ParquetEventStore
 
-
-NOW = datetime(2026, 1, 15, 14, 30, tzinfo=timezone.utc)
+NOW = datetime(2026, 1, 15, 14, 30, tzinfo=UTC)
 INSTR = InstrumentId(venue=Venue.KALSHI, market_id="M-1", outcome_id=None)
 
 

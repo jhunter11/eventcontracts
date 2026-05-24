@@ -17,12 +17,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 
-from eventcontracts.domain.events import NormalizedEvent, QuoteEvent
+from eventcontracts.domain.events import NormalizedEvent, QuoteEvent, SettlementResolvedEvent
 from eventcontracts.domain.fills import Fill
+from eventcontracts.domain.lifecycle import SettlementEvent
 from eventcontracts.domain.models import InstrumentId, OutcomeSide
 from eventcontracts.domain.orders import OrderSide
 from eventcontracts.domain.positions import Position
-from eventcontracts.execution.market_simulator import FillSink
 from eventcontracts.risk.state import DailyLossLedger
 
 
@@ -109,7 +109,7 @@ class PnLTracker:
         rec.updated_at = fill.filled_at
 
     def on_event(self, event: NormalizedEvent) -> None:
-        """Update mark prices from quote events."""
+        """Update mark prices from quotes and realize PnL on settlement."""
 
         if isinstance(event, QuoteEvent):
             quote = event.quote
@@ -121,6 +121,41 @@ class PnLTracker:
             elif quote.ask is not None:
                 rec.mark_price = quote.ask.price
             rec.updated_at = quote.received_at
+        elif isinstance(event, SettlementResolvedEvent):
+            self.on_settlement(event.settlement)
+
+    def on_settlement(self, settlement: SettlementEvent) -> None:
+        """Realize PnL for any open position in a resolved instrument.
+
+        Event-contract settlement is the dominant PnL realization for any
+        held-to-expiry strategy. ``resolved_side`` names the winning outcome;
+        holders of that outcome receive ``payout_per_contract``, holders of the
+        opposite outcome receive zero. ``resolved_side`` of ``None`` (canceled
+        / disputed) does not realize — the venue's cancellation flow is
+        out-of-scope for this in-process tracker.
+        """
+
+        if settlement.resolved_side is None:
+            return
+
+        for side in (OutcomeSide.YES, OutcomeSide.NO):
+            rec = self.records.get((settlement.instrument_id, side))
+            if rec is None or rec.quantity <= 0:
+                continue
+            payout = (
+                settlement.payout_per_contract
+                if side is settlement.resolved_side
+                else Decimal("0")
+            )
+            realized = (payout - rec.average_price) * rec.quantity
+            rec.realized_pnl += realized
+            self.cumulative_realized += realized
+            if self.daily_loss_ledger is not None:
+                self.daily_loss_ledger.record_realized_pnl(realized, settlement.settled_at)
+            rec.quantity = Decimal("0")
+            rec.average_price = Decimal("0")
+            rec.mark_price = payout
+            rec.updated_at = settlement.settled_at
 
     # ---------- inspection ----------
 

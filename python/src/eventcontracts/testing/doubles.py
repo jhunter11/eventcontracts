@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from eventcontracts.domain.decisions import IntentEnvelope
@@ -58,7 +58,7 @@ class InMemoryStateStore:
 @dataclass
 class InMemoryClock:
     current: datetime = field(
-        default_factory=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc)
+        default_factory=lambda: datetime(2026, 1, 1, tzinfo=UTC)
     )
 
     def now(self) -> datetime:

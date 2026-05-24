@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
-from eventcontracts.domain.events import QuoteEvent
+from eventcontracts.domain.events import (
+    EventProvenance,
+    QuoteEvent,
+    SettlementResolvedEvent,
+)
 from eventcontracts.domain.fills import Fill
 from eventcontracts.domain.ids import (
     ClientOrderId,
@@ -16,6 +20,7 @@ from eventcontracts.domain.ids import (
     StrategyId,
     VenueOrderId,
 )
+from eventcontracts.domain.lifecycle import SettlementEvent
 from eventcontracts.domain.models import (
     InstrumentId,
     OrderBookLevel,
@@ -27,8 +32,7 @@ from eventcontracts.domain.orders import Liquidity, OrderSide
 from eventcontracts.execution import PnLTracker
 from eventcontracts.risk import DailyLossLedger
 
-
-NOW = datetime(2026, 1, 1, 9, 30, tzinfo=timezone.utc)
+NOW = datetime(2026, 1, 1, 9, 30, tzinfo=UTC)
 INSTR = InstrumentId(venue=Venue.KALSHI, market_id="M-1", outcome_id=None)
 
 
@@ -138,3 +142,66 @@ def test_total_pnl_combines_realized_and_mark() -> None:
     pnl.on_event(_quote_event("0.50", "0.52"))
     # Realized = 0, unrealized = 11.00 → total = 11.00
     assert pnl.total_pnl(now=NOW) == Decimal("11.00")
+
+
+def _settlement_event(
+    *,
+    resolved_side: OutcomeSide | None,
+    payout: str = "1.00",
+    settled_at: datetime = NOW,
+) -> SettlementResolvedEvent:
+    return SettlementResolvedEvent(
+        event_id=EventId("settle-1"),
+        settlement=SettlementEvent(
+            instrument_id=INSTR,
+            resolved_side=resolved_side,
+            payout_per_contract=Decimal(payout),
+            currency="USD",
+            settled_at=settled_at,
+            source="venue.settlement",
+        ),
+        provenance=EventProvenance(source="venue", channel="settlement", venue=Venue.KALSHI),
+    )
+
+
+def test_settlement_realizes_winning_position() -> None:
+    pnl = PnLTracker()
+    pnl.on_fill(_fill(price="0.40", qty="100", side=OrderSide.BUY))
+    pnl.on_event(_settlement_event(resolved_side=OutcomeSide.YES, payout="1.00"))
+    # Held YES at avg 0.40, payout 1.00 → realized = (1.00 - 0.40) * 100 = 60.00
+    assert pnl.cumulative_realized == Decimal("60.00")
+    assert pnl.position(INSTR, OutcomeSide.YES, now=NOW) is None
+
+
+def test_settlement_realizes_losing_position() -> None:
+    pnl = PnLTracker()
+    pnl.on_fill(_fill(price="0.40", qty="100", side=OrderSide.BUY))
+    pnl.on_event(_settlement_event(resolved_side=OutcomeSide.NO, payout="1.00"))
+    # YES position loses everything: realized = (0 - 0.40) * 100 = -40.00
+    assert pnl.cumulative_realized == Decimal("-40.00")
+    assert pnl.position(INSTR, OutcomeSide.YES, now=NOW) is None
+
+
+def test_settlement_loss_reaches_daily_loss_ledger() -> None:
+    ledger = DailyLossLedger()
+    pnl = PnLTracker(daily_loss_ledger=ledger)
+    pnl.on_fill(_fill(price="0.60", qty="100", side=OrderSide.BUY))
+    pnl.on_event(_settlement_event(resolved_side=OutcomeSide.NO))
+    # Loss = -60. Reported as +60 in the ledger.
+    assert ledger.loss_for(NOW) == Decimal("60")
+
+
+def test_unresolved_settlement_does_not_realize() -> None:
+    pnl = PnLTracker()
+    pnl.on_fill(_fill(price="0.40", qty="100", side=OrderSide.BUY))
+    pnl.on_event(_settlement_event(resolved_side=None))
+    rec = pnl.records[(INSTR, OutcomeSide.YES)]
+    assert rec.quantity == Decimal("100")
+    assert pnl.cumulative_realized == Decimal("0")
+
+
+def test_settlement_with_no_position_is_noop() -> None:
+    pnl = PnLTracker()
+    # No prior fills — settlement should be a safe no-op.
+    pnl.on_event(_settlement_event(resolved_side=OutcomeSide.YES))
+    assert pnl.cumulative_realized == Decimal("0")

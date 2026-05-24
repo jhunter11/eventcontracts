@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from eventcontracts.domain import (
@@ -17,13 +17,13 @@ from eventcontracts.domain import (
 from eventcontracts.execution import ImmediateFillSimulator, PaperBroker, PaperIntentSink
 from eventcontracts.ingestion import IngestionJob, IngestionPipeline, IterableCaptureSource
 from eventcontracts.normalization import BASIC_NORMALIZERS, EventNormalizer, NormalizationPipeline
+from eventcontracts.plugins.strategies import example_threshold  # noqa: F401 - registers strategy
 from eventcontracts.replay import NormalizedReplaySource, RawReplayEngine
 from eventcontracts.risk import SleeveRiskGate
 from eventcontracts.runner import StrategyRunner
 from eventcontracts.storage import EventEnvelope, InMemoryEventStore
-from eventcontracts.testing import InMemoryClock, InMemoryContext, StaticContextProvider
-from eventcontracts.plugins.strategies import example_threshold  # noqa: F401 - registers strategy
 from eventcontracts.strategy import create
+from eventcontracts.testing import InMemoryClock, InMemoryContext, StaticContextProvider
 
 
 def _strategy_spec() -> StrategySpec:
@@ -61,7 +61,7 @@ def _sleeve() -> SleeveSpec:
 
 
 def test_raw_capture_to_paper_fill_vertical_slice() -> None:
-    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
     raw_trade = EventEnvelope(
         venue=Venue.KALSHI,
         source="fixture",

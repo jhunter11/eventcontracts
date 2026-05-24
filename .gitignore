@@ -13,6 +13,12 @@ data/raw/
 data/normalized/
 data/replay/
 notebooks/.ipynb_checkpoints/
+rust/target/
+
+# Legacy flat-layout package — kept ignored so stray pycache from older
+# branches cannot shadow python/src/eventcontracts on PYTHONPATH.
+/src/
+/tests/
 
 # Local artifact bundles produced by the (future) exporter. The
 # canonical store is documented in docs/artifact-contract.md.

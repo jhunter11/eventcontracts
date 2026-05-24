@@ -18,11 +18,23 @@ against Parquet-backed data with no other glue.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+
+pytest.importorskip("duckdb")
+
 from eventcontracts.adapters.venues.kalshi import KalshiFeeModel
+from eventcontracts.domain import (
+    EventSubscription,
+    RiskProfile,
+    SleeveId,
+    SleeveSpec,
+    StrategyId,
+    StrategySpec,
+)
 from eventcontracts.domain.decisions import IntentEnvelope, PlaceOrder
 from eventcontracts.domain.events import (
     EventProvenance,
@@ -53,17 +65,7 @@ from eventcontracts.storage import DuckDbEventStore, ParquetEventStore
 from eventcontracts.strategy import create
 from eventcontracts.testing import InMemoryClock, InMemoryContext, StaticContextProvider
 
-from eventcontracts.domain import (
-    EventSubscription,
-    RiskProfile,
-    SleeveId,
-    SleeveSpec,
-    StrategyId,
-    StrategySpec,
-)
-
-
-NOW = datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 1, 15, 10, 0, tzinfo=UTC)
 INSTR = InstrumentId(venue=Venue.KALSHI, market_id="WX-NYC-TEMP", outcome_id=None)
 
 
@@ -186,11 +188,15 @@ def test_phase1_phase2_phase3_vertical_slice(tmp_path: Path) -> None:
 
     sink = _Sink()
 
+    from collections.abc import Iterator
+
+    from eventcontracts.domain.events import NormalizedEvent
+
     # Tee normalized events into the simulator so it has book/lifecycle state.
     base_source = NormalizedReplaySource(store)
 
     class _TeeSource:
-        def stream(self):
+        def stream(self) -> Iterator[NormalizedEvent]:
             for event in base_source.stream():
                 simulator.on_event(event)
                 pnl.on_event(event)
@@ -200,8 +206,8 @@ def test_phase1_phase2_phase3_vertical_slice(tmp_path: Path) -> None:
         spec=spec,
         sleeve=sleeve,
         strategy=create(spec.name, spec),
-        events=_TeeSource(),  # type: ignore[arg-type]
-        sink=sink,  # type: ignore[arg-type]
+        events=_TeeSource(),
+        sink=sink,
         risk=SleeveRiskGate(sleeve=sleeve, daily_loss=daily_loss),
         clock=InMemoryClock(current=NOW),
         context_provider=StaticContextProvider(

@@ -1,40 +1,47 @@
 """`eventcontracts backtest` — replay normalized events through a strategy.
 
 Wires together: NormalizedEventStore → NormalizedReplaySource →
-StrategyRunner with a MarketPaperSimulator sink → PnLTracker. Prints a
-summary of events processed, decisions emitted, fills produced, and
-realized PnL at the end. Use this from the command line to validate a
-strategy spec against a known partition of data without writing any
-glue code.
+StrategyRunner with a MarketPaperSimulator sink → PnLTracker → BacktestReport.
+
+Outputs the full :class:`BacktestReport` (drawdown, fill rate, peak/trough
+equity, realized + unrealized PnL, rejection breakdown) as JSON. Pass
+``--out`` to also persist the report to disk.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Iterator
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 from eventcontracts.adapters.venues.kalshi import KalshiFeeModel
 from eventcontracts.adapters.venues.polymarket import PolymarketFeeModel
 from eventcontracts.config import load_sleeve_spec, load_strategy_spec
+from eventcontracts.domain.decisions import IntentEnvelope, PlaceOrder
+from eventcontracts.domain.events import NormalizedEvent
 from eventcontracts.domain.fees import FeeModel
+from eventcontracts.domain.fills import Fill
 from eventcontracts.domain.models import Venue
 from eventcontracts.execution import (
+    BacktestReport,
     ConstantLatency,
     FractionalQueueEstimator,
     MarketPaperSimulator,
     PnLTracker,
+    intent_to_order,
 )
 from eventcontracts.replay import NormalizedReplaySource
 from eventcontracts.risk import DailyLossLedger, SleeveRiskGate
 from eventcontracts.runner import StrategyRunner
 from eventcontracts.storage import ParquetEventStore
-from eventcontracts.strategy import create, load_entry_points, registry
+from eventcontracts.strategy import create_from_spec
 from eventcontracts.testing import InMemoryClock, InMemoryContext, StaticContextProvider
 
 
-def register(subparsers: argparse._SubParsersAction) -> None:
+def register(subparsers: Any) -> None:
     parser = subparsers.add_parser(
         "backtest",
         help="Replay normalized events through a strategy with a paper executor.",
@@ -47,6 +54,18 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         type=float,
         default=50.0,
         help="Constant submit latency in milliseconds.",
+    )
+    parser.add_argument(
+        "--starting-equity",
+        type=str,
+        default="0",
+        help="Starting equity (in sleeve currency) for drawdown calculations.",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Optional path to write the full BacktestReport as JSON.",
     )
     parser.set_defaults(handler=_handle)
 
@@ -61,11 +80,7 @@ def _handle(args: argparse.Namespace) -> int:
     spec = load_strategy_spec(args.strategy)
     sleeve = load_sleeve_spec(args.sleeve)
 
-    # Ensure plugin strategies are discoverable.
-    if spec.name not in registry.known():
-        load_entry_points()
-
-    strategy = create(spec.name, spec)
+    strategy = create_from_spec(spec)
 
     store = ParquetEventStore(args.data)
     events = NormalizedReplaySource(store)
@@ -82,11 +97,7 @@ def _handle(args: argparse.Namespace) -> int:
         fill_sink=pnl,
     )
 
-    # Build an IntentSink that routes envelopes into the simulator.
-    from eventcontracts.domain.decisions import IntentEnvelope, PlaceOrder
-    from eventcontracts.execution import intent_to_order
-
-    fills_collected: list[tuple[str, str]] = []
+    fills_collected: list[Fill] = []
 
     class _Sink:
         def emit(self, envelope: IntentEnvelope) -> None:
@@ -95,13 +106,10 @@ def _handle(args: argparse.Namespace) -> int:
             intent = intent_to_order(envelope)
             if intent is None:
                 return
-            sim_fills = simulator.submit(intent, envelope.emitted_at)
-            for fill in sim_fills:
-                fills_collected.append((str(fill.fill_id), str(fill.price)))
+            fills_collected.extend(simulator.submit(intent, envelope.emitted_at))
 
-    # Also forward events into the simulator for book/lifecycle state.
     class _TeeSource:
-        def stream(self):
+        def stream(self) -> Iterator[NormalizedEvent]:
             for event in events.stream():
                 simulator.on_event(event)
                 pnl.on_event(event)
@@ -118,25 +126,25 @@ def _handle(args: argparse.Namespace) -> int:
         spec=spec,
         sleeve=sleeve,
         strategy=strategy,
-        events=_TeeSource(),  # type: ignore[arg-type]
-        sink=_Sink(),  # type: ignore[arg-type]
+        events=_TeeSource(),
+        sink=_Sink(),
         risk=SleeveRiskGate(sleeve=sleeve, daily_loss=daily_loss),
         clock=clock,
         context_provider=StaticContextProvider(ctx),
     )
 
     summary = runner.run()
-    report = {
-        "strategy_id": summary.strategy_id,
-        "sleeve_id": summary.sleeve_id,
-        "events_processed": summary.events_processed,
-        "decisions_emitted": summary.decisions_emitted,
-        "intents_dispatched": summary.intents_dispatched,
-        "intents_rejected": summary.intents_rejected,
-        "fills": len(fills_collected),
-        "total_fees": str(pnl.total_fees_paid),
-        "realized_pnl": str(pnl.cumulative_realized),
-        "rejection_reasons": summary.rejection_reasons,
-    }
-    print(json.dumps(report, indent=2, default=str))
+    report = BacktestReport.from_run(
+        summary,
+        pnl,
+        fills=fills_collected,
+        starting_equity=Decimal(args.starting_equity),
+    )
+    payload = report.to_dict()
+    rendered = json.dumps(payload, indent=2, default=str)
+    print(rendered)
+
+    if args.out is not None:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(rendered + "\n", encoding="utf-8")
     return 0

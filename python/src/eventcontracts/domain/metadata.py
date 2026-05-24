@@ -63,7 +63,7 @@ def freeze_value(value: Any) -> Any:
     return value
 
 
-def freeze_mapping(values: Mapping[str, Any] | None) -> FrozenMap:
+def freeze_mapping(values: Mapping[Any, Any] | None) -> FrozenMap:
     return FrozenMap(values)
 
 

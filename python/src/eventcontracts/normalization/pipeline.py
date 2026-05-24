@@ -12,7 +12,6 @@ from eventcontracts.storage.interfaces import (
     NormalizedEventStore,
 )
 
-
 NormalizeFn = Callable[[EventEnvelope], NormalizedEvent]
 NormalizerKey = tuple[str, str]
 

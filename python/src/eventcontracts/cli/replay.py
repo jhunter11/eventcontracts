@@ -12,7 +12,7 @@ from eventcontracts.replay import NormalizedReplaySource
 from eventcontracts.storage import ParquetEventStore
 
 
-def register(subparsers: argparse._SubParsersAction) -> None:
+def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     parser = subparsers.add_parser(
         "replay",
         help="Stream normalized events from a parquet partition tree as JSON.",

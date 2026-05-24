@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -28,7 +28,7 @@ def _instrument() -> InstrumentId:
 
 
 def test_domain_metadata_is_frozen_and_hashable() -> None:
-    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
     event = TradeEvent(
         event_id=EventId("event-1"),
         trade=Trade(
@@ -81,7 +81,7 @@ def test_order_decision_requires_limit_price() -> None:
 
 
 def test_canonical_serialization_is_stable() -> None:
-    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
     event = TradeEvent(
         event_id=EventId("event-1"),
         trade=Trade(

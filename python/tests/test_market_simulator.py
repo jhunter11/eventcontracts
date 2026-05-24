@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -36,8 +36,7 @@ from eventcontracts.execution import (
     OrderIntent,
 )
 
-
-NOW = datetime(2026, 1, 1, 9, 30, tzinfo=timezone.utc)
+NOW = datetime(2026, 1, 1, 9, 30, tzinfo=UTC)
 INSTR = InstrumentId(venue=Venue.KALSHI, market_id="MKT-1", outcome_id=None)
 
 

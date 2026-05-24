@@ -11,7 +11,6 @@ from eventcontracts.config import (
     load_venue_config,
 )
 from eventcontracts.domain import LatencyTier, Venue
-
 from tests.conftest import REPO_ROOT
 
 CONFIGS = REPO_ROOT / "configs"

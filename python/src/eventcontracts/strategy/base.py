@@ -21,8 +21,8 @@ boundary.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
-from typing import Callable, Protocol, runtime_checkable
+from collections.abc import Callable, Sequence
+from typing import Protocol, runtime_checkable
 
 from eventcontracts.domain.decisions import StrategyDecision
 from eventcontracts.domain.events import NormalizedEvent

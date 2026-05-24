@@ -13,9 +13,9 @@ from eventcontracts.domain.metadata import FrozenMap, freeze_mapping
 from eventcontracts.domain.validation import (
     require_aware_datetime,
     require_non_empty,
+    require_optional_aware_datetime,
     require_positive_decimal,
     require_probability_decimal,
-    require_optional_aware_datetime,
 )
 
 

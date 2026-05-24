@@ -20,8 +20,7 @@ from eventcontracts.domain.fills import Fill
 from eventcontracts.domain.ids import EventId
 from eventcontracts.domain.lifecycle import MarketLifecycleEvent, SettlementEvent
 from eventcontracts.domain.metadata import FrozenMap, freeze_mapping
-from eventcontracts.domain.models import OrderBook, Quote, Trade
-from eventcontracts.domain.models import Venue
+from eventcontracts.domain.models import OrderBook, Quote, Trade, Venue
 from eventcontracts.domain.orders import Order, OrderReject
 from eventcontracts.domain.validation import (
     require_aware_datetime,

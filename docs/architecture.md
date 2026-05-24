@@ -36,9 +36,9 @@ the strategy boundary should not.
 | Storage | Persist raw envelopes, normalized events, reference data, and replay partitions. | Boundary only. |
 | Replay | Produce deterministic event-time streams from persisted data. | Clock exists; engine stubbed. |
 | Strategy | Researcher-facing protocol, lifecycle hooks, registry, and context contract. | Scaffolded. |
-| Runner | Wires strategies to events, context, state store, risk, and intent sink. | Reference synchronous runner scaffolded. |
-| Execution | Simulate fills, fees, latency, slippage, queue position, and venue pauses. | Stubs. |
-| Risk | Pre-trade gates, limits, kill switches, and compliance checks. | Boundary only. |
+| Runner | Wires strategies to events, context, state store, risk, and intent sink. | Synchronous reference runner implemented and covered by the vertical-slice and end-to-end tests. |
+| Execution | Simulate fills, fees, latency, slippage, queue position, and venue pauses. | Implemented: `MarketPaperSimulator` with queue / latency / fee models and `PnLTracker` (incl. settlement realization). |
+| Risk | Pre-trade gates, limits, kill switches, and compliance checks. | `SleeveRiskGate` and `PreTradePolicyService` implemented; eligibility/compliance still placeholder. |
 | Bus / gateway | Route typed events and intents between sleeves and the venue-facing process. | Not implemented. |
 | Observability | Structured logs, metrics, traces, dashboards, and alerts. | Not implemented. |
 

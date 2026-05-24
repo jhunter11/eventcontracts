@@ -10,7 +10,7 @@ loses too much in a single day cannot keep trading.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from eventcontracts.domain.decisions import IntentEnvelope, PlaceOrder
@@ -31,8 +31,7 @@ from eventcontracts.execution import PnLTracker
 from eventcontracts.risk import DailyLossLedger, SleeveRiskGate
 from eventcontracts.testing import InMemoryContext
 
-
-NOW = datetime(2026, 3, 1, 13, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 3, 1, 13, 0, tzinfo=UTC)
 INSTR = InstrumentId(venue=Venue.KALSHI, market_id="M-1", outcome_id=None)
 
 

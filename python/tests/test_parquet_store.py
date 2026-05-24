@@ -2,14 +2,28 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
-import pytest
-
-from eventcontracts.domain.events import EventProvenance, QuoteEvent, TradeEvent
-from eventcontracts.domain.ids import EventId
+from eventcontracts.domain.events import (
+    EventProvenance,
+    OwnFillEvent,
+    OwnOrderRejectEvent,
+    OwnOrderUpdateEvent,
+    QuoteEvent,
+    TradeEvent,
+)
+from eventcontracts.domain.fills import Fill
+from eventcontracts.domain.ids import (
+    ClientOrderId,
+    CorrelationId,
+    EventId,
+    FillId,
+    SleeveId,
+    StrategyId,
+    VenueOrderId,
+)
 from eventcontracts.domain.models import (
     InstrumentId,
     OrderBookLevel,
@@ -18,14 +32,28 @@ from eventcontracts.domain.models import (
     Trade,
     Venue,
 )
+from eventcontracts.domain.orders import (
+    Liquidity,
+    Order,
+    OrderReject,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    TimeInForce,
+)
 from eventcontracts.storage import EventEnvelope, ParquetEventStore
 
-
-NOW = datetime(2026, 1, 15, 14, 30, tzinfo=timezone.utc)
+NOW = datetime(2026, 1, 15, 14, 30, tzinfo=UTC)
 INSTR = InstrumentId(venue=Venue.KALSHI, market_id="M-1", outcome_id=None)
 
 
-def _envelope(channel: str, payload: dict, *, source: str = "kalshi-md", at: datetime = NOW) -> EventEnvelope:
+def _envelope(
+    channel: str,
+    payload: dict[str, object],
+    *,
+    source: str = "kalshi-md",
+    at: datetime = NOW,
+) -> EventEnvelope:
     return EventEnvelope(
         venue=Venue.KALSHI,
         source=source,
@@ -146,3 +174,98 @@ def test_filter_by_source(tmp_path: Path) -> None:
     kalshi_only = list(store.read(source="kalshi-md"))
     assert len(kalshi_only) == 1
     assert kalshi_only[0].source == "kalshi-md"
+
+
+def _fill_event() -> OwnFillEvent:
+    fill = Fill(
+        fill_id=FillId("f-1"),
+        venue_order_id=VenueOrderId("vo-1"),
+        client_order_id=ClientOrderId("co-1"),
+        instrument_id=INSTR,
+        outcome_side=OutcomeSide.YES,
+        order_side=OrderSide.BUY,
+        price=Decimal("0.42"),
+        quantity=Decimal("10"),
+        liquidity=Liquidity.TAKER,
+        fee_amount=Decimal("0.18"),
+        fee_currency="USD",
+        filled_at=NOW,
+        exchange_ts=NOW,
+        correlation_id=CorrelationId("c-1"),
+        strategy_id=StrategyId("s-1"),
+        sleeve_id=SleeveId("sl-1"),
+    )
+    return OwnFillEvent(
+        event_id=EventId("of-1"),
+        fill=fill,
+        provenance=EventProvenance(source="oms", channel="own_fill", venue=Venue.KALSHI),
+    )
+
+
+def _order_update_event() -> OwnOrderUpdateEvent:
+    order = Order(
+        client_order_id=ClientOrderId("co-2"),
+        venue_order_id=VenueOrderId("vo-2"),
+        instrument_id=INSTR,
+        outcome_side=OutcomeSide.YES,
+        order_side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        time_in_force=TimeInForce.GTC,
+        price=Decimal("0.40"),
+        quantity=Decimal("100"),
+        filled_quantity=Decimal("25"),
+        status=OrderStatus.PARTIALLY_FILLED,
+        created_at=NOW,
+        updated_at=NOW,
+        correlation_id=CorrelationId("c-2"),
+        strategy_id=StrategyId("s-1"),
+        sleeve_id=SleeveId("sl-1"),
+    )
+    return OwnOrderUpdateEvent(
+        event_id=EventId("ou-1"),
+        order=order,
+        provenance=EventProvenance(source="oms", channel="own_order", venue=Venue.KALSHI),
+    )
+
+
+def _order_reject_event() -> OwnOrderRejectEvent:
+    reject = OrderReject(
+        client_order_id=ClientOrderId("co-3"),
+        reason="risk: max_order_notional",
+        rejected_at=NOW,
+        venue_code="LIMIT_EXCEEDED",
+    )
+    return OwnOrderRejectEvent(
+        event_id=EventId("or-1"),
+        reject=reject,
+        provenance=EventProvenance(source="risk", channel="reject"),
+    )
+
+
+def test_own_events_round_trip(tmp_path: Path) -> None:
+    store = ParquetEventStore(tmp_path)
+    store.append_normalized(_fill_event())
+    store.append_normalized(_order_update_event())
+    store.append_normalized(_order_reject_event())
+    store.flush()
+
+    events = list(store.read_normalized())
+    kinds = {type(event).__name__ for event in events}
+    assert kinds == {"OwnFillEvent", "OwnOrderUpdateEvent", "OwnOrderRejectEvent"}
+
+    by_id = {str(event.event_id): event for event in events}
+
+    fill_event = by_id["of-1"]
+    assert isinstance(fill_event, OwnFillEvent)
+    assert fill_event.fill.price == Decimal("0.42")
+    assert fill_event.fill.fee_amount == Decimal("0.18")
+    assert fill_event.fill.liquidity is Liquidity.TAKER
+
+    order_event = by_id["ou-1"]
+    assert isinstance(order_event, OwnOrderUpdateEvent)
+    assert order_event.order.status is OrderStatus.PARTIALLY_FILLED
+    assert order_event.order.filled_quantity == Decimal("25")
+
+    reject_event = by_id["or-1"]
+    assert isinstance(reject_event, OwnOrderRejectEvent)
+    assert reject_event.reject.venue_code == "LIMIT_EXCEEDED"

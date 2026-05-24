@@ -43,15 +43,15 @@ from eventcontracts.domain.ids import (
     StrategyId,
     VenueOrderId,
 )
-from eventcontracts.domain.lifecycle import (
-    MarketLifecycleEvent,
-    MarketLifecycleKind,
-    SettlementEvent,
-)
 from eventcontracts.domain.latency import (
     DEFAULT_EXECUTION_PRIORITY,
     ExecutionPriority,
     LatencyTier,
+)
+from eventcontracts.domain.lifecycle import (
+    MarketLifecycleEvent,
+    MarketLifecycleKind,
+    SettlementEvent,
 )
 from eventcontracts.domain.metadata import FrozenMap
 from eventcontracts.domain.models import (

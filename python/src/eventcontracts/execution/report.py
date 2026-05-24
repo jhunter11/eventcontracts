@@ -9,7 +9,7 @@ rejected intents by reason.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
@@ -62,15 +62,9 @@ class BacktestReport:
         starting_equity: Decimal = Decimal("0"),
     ) -> BacktestReport:
         fills = fills or []
-        # Reconstruct equity curve from fills. Each fill is +realized_pnl -fee.
         equity = starting_equity
         peak = equity
         trough = equity
-        running_realized = Decimal("0")
-        for fill in fills:
-            # Approximation: only fees show as equity hits without sells.
-            # Realized PnL is already accounted in PnL tracker. Use that.
-            pass
         # Use cumulative_realized + total_pnl as the curve endpoints.
         when = now or summary.ended_at
         total = pnl.total_pnl(now=when)

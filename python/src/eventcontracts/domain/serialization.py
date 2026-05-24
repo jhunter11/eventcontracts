@@ -13,7 +13,6 @@ from typing import Any
 
 from eventcontracts.domain.metadata import FrozenMap, thaw_value
 
-
 JsonPrimitive = None | bool | int | float | str
 JsonValue = JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
 
@@ -28,7 +27,7 @@ def to_primitive(value: Any) -> JsonValue:
     if isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, Enum):
-        return value.value
+        return to_primitive(value.value)
     if isinstance(value, FrozenMap):
         return to_primitive(thaw_value(value))
     if isinstance(value, Mapping):

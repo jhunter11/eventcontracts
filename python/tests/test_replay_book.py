@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 
-from eventcontracts.domain.events import OrderBookEvent, QuoteEvent, TradeEvent
+from eventcontracts.domain.events import NormalizedEvent, OrderBookEvent, QuoteEvent, TradeEvent
 from eventcontracts.domain.ids import EventId
 from eventcontracts.domain.models import (
     InstrumentId,
@@ -19,8 +20,7 @@ from eventcontracts.domain.models import (
 from eventcontracts.replay import OrderBookReconstructor, reconstruct_books
 from eventcontracts.storage import FileStateStore
 
-
-NOW = datetime(2026, 1, 15, tzinfo=timezone.utc)
+NOW = datetime(2026, 1, 15, tzinfo=UTC)
 INSTR = InstrumentId(venue=Venue.KALSHI, market_id="M-1", outcome_id=None)
 
 
@@ -83,6 +83,7 @@ def test_book_event_replaces_state() -> None:
     rec.observe(_quote(OutcomeSide.YES, ("0.40", "10"), ("0.55", "20")))
     rec.observe(_book_event())
     state = rec.latest(INSTR)
+    assert state is not None
     assert Decimal("0.40") not in state.yes_bids
     assert state.yes_bids[Decimal("0.45")] == Decimal("20")
 
@@ -92,6 +93,7 @@ def test_trade_decrements_resting_level() -> None:
     rec.observe(_quote(OutcomeSide.YES, ("0.40", "10"), ("0.55", "20")))
     rec.observe(_trade("0.55", "5", aggressor=OutcomeSide.YES))
     state = rec.latest(INSTR)
+    assert state is not None
     assert state.yes_asks[Decimal("0.55")] == Decimal("15")
 
 
@@ -100,11 +102,12 @@ def test_trade_consuming_full_level_removes_it() -> None:
     rec.observe(_quote(OutcomeSide.YES, ("0.40", "10"), ("0.55", "20")))
     rec.observe(_trade("0.55", "20", aggressor=OutcomeSide.YES))
     state = rec.latest(INSTR)
+    assert state is not None
     assert Decimal("0.55") not in state.yes_asks
 
 
 def test_reconstruct_books_interleaves_synthetic_events() -> None:
-    src = [
+    src: list[NormalizedEvent] = [
         _quote(OutcomeSide.YES, ("0.40", "10"), ("0.55", "20")),
         _trade("0.55", "5", aggressor=OutcomeSide.YES),
     ]
@@ -115,7 +118,7 @@ def test_reconstruct_books_interleaves_synthetic_events() -> None:
     assert isinstance(output[3], OrderBookEvent)
 
 
-def test_file_state_store_round_trip(tmp_path) -> None:
+def test_file_state_store_round_trip(tmp_path: Path) -> None:
     from eventcontracts.domain.ids import StrategyId
 
     store = FileStateStore(tmp_path)

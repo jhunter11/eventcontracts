@@ -26,6 +26,7 @@ from eventcontracts.domain.models import (
     Trade,
     Venue,
 )
+from eventcontracts.normalization.pipeline import NormalizeFn, NormalizerKey
 from eventcontracts.storage.interfaces import EventEnvelope
 
 
@@ -159,7 +160,7 @@ def normalize_order_book(raw: EventEnvelope) -> OrderBookEvent:
     return OrderBookEvent(event_id=_event_id(raw), book=book, provenance=_provenance(raw))
 
 
-BASIC_NORMALIZERS = {
+BASIC_NORMALIZERS: dict[NormalizerKey, NormalizeFn] = {
     ("raw-event-v1", "trade"): normalize_trade,
     ("raw-event-v1", "quote"): normalize_quote,
     ("raw-event-v1", "book"): normalize_order_book,

@@ -1,3 +1,4 @@
+from datetime import UTC
 from decimal import Decimal
 
 from eventcontracts.domain.models import InstrumentId, Probability, Venue
@@ -15,13 +16,13 @@ def test_instrument_id() -> None:
 
 
 def test_replay_clock_ticks() -> None:
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
-    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    end = datetime(2026, 1, 1, 0, 2, tzinfo=timezone.utc)
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    end = datetime(2026, 1, 1, 0, 2, tzinfo=UTC)
     clock = ReplayClock(ReplayWindow(start, end), timedelta(minutes=1))
     assert clock.ticks() == [
-        datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc),
-        datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc),
-        datetime(2026, 1, 1, 0, 2, tzinfo=timezone.utc),
+        datetime(2026, 1, 1, 0, 0, tzinfo=UTC),
+        datetime(2026, 1, 1, 0, 1, tzinfo=UTC),
+        datetime(2026, 1, 1, 0, 2, tzinfo=UTC),
     ]

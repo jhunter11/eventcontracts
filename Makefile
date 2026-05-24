@@ -1,8 +1,10 @@
-.PHONY: quality test lint typecheck compile
+.PHONY: quality python-quality test lint typecheck compile rust-check
 
 PYTHON ?= python3
 
-quality: compile test lint typecheck
+quality: python-quality rust-check
+
+python-quality: compile test lint typecheck
 
 compile:
 	cd python && $(PYTHON) -m compileall -q src tests
@@ -15,3 +17,6 @@ lint:
 
 typecheck:
 	cd python && $(PYTHON) -m mypy src/eventcontracts tests
+
+rust-check:
+	cd rust && cargo check --workspace

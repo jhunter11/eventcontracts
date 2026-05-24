@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from eventcontracts.domain.decisions import IntentEnvelope
-from eventcontracts.domain.fills import Fill
 from eventcontracts.domain.fees import FeeModel
+from eventcontracts.domain.fills import Fill
 from eventcontracts.domain.lifecycle import MarketLifecycleEvent, SettlementEvent
 from eventcontracts.domain.models import InstrumentId, Market, OrderBook, Trade, Venue
 from eventcontracts.domain.orders import Order, OrderReject

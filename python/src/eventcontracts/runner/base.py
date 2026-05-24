@@ -13,7 +13,7 @@ gateway batches intents, the allocator runs in its own process.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import uuid4
 
 from eventcontracts.domain.decisions import (
@@ -25,7 +25,7 @@ from eventcontracts.domain.decisions import (
     decision_priority,
 )
 from eventcontracts.domain.events import NormalizedEvent
-from eventcontracts.domain.ids import CorrelationId, EventId
+from eventcontracts.domain.ids import CorrelationId
 from eventcontracts.domain.spec import SleeveSpec, StrategySpec
 from eventcontracts.runner.ports import (
     Clock,
@@ -157,7 +157,7 @@ class StrategyRunner:
 
 
 def utcnow() -> datetime:
-    return datetime.now(tz=timezone.utc)
+    return datetime.now(tz=UTC)
 
 
 def severity_is_fatal(alert: Alert) -> bool:
