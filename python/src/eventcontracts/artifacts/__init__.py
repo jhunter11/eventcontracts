@@ -6,7 +6,11 @@ from eventcontracts.artifacts.bundle import (
     ArtifactBundleValidator,
     ArtifactBundleWriter,
     BundleFile,
+    ParityCases,
     PromotionRegistry,
+    feature_schema_to_dict,
+    load_feature_schema,
+    sha256_file,
 )
 
 __all__ = [
@@ -15,5 +19,9 @@ __all__ = [
     "ArtifactBundleValidator",
     "ArtifactBundleWriter",
     "BundleFile",
+    "ParityCases",
     "PromotionRegistry",
+    "feature_schema_to_dict",
+    "load_feature_schema",
+    "sha256_file",
 ]

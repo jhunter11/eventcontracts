@@ -1,15 +1,15 @@
 # Event Contracts Research Framework
 
-This repository is the Python scaffold for an execution-aware event-contract
-research stack covering Kalshi, Polymarket global, and future venue adapters.
-It is intentionally built around typed data contracts first: strategies consume
-normalized events, read state through a context, and emit typed decisions that a
-runner can route through risk, paper execution, or a live gateway later.
+This repository is an execution-aware event-contract research stack covering
+Kalshi, Polymarket global, and future venue adapters. It is intentionally built
+around typed data contracts first: strategies consume normalized events, read
+state through a context, and emit typed decisions that a runner can route
+through risk, paper execution, or a live gateway later.
 
-The project is not a live trading bot yet. Venue clients, storage, replay, paper
-execution, and risk are still mostly stubs. The important foundation now in
-place is the object model that lets strategy code plug into a runner without
-knowing how data capture, replay, risk, storage, or execution are implemented.
+The project is not a live trading bot yet. The current production-shaped use
+case is market-edge research: capture real venue data, normalize it, replay it
+through strategy specs, and estimate fills with book/trade-based paper
+execution before any live order path exists.
 
 ## Repository Layout
 
@@ -117,6 +117,43 @@ raw venue/external payload
 Strategies do not call venue clients, storage, the bus, or execution APIs
 directly. They return values. The runner owns lifecycle, provenance,
 state restore/save, risk evaluation, and dispatch.
+
+## REST-Based Predictive Edge Tests
+
+For predictive edges that do not depend on sub-second latency, start with Kalshi
+REST polling. This captures repeated order-book snapshots and deduped recent
+trades, then normalizes them into the same replay path used by backtests.
+
+```bash
+eventcontracts capture \
+  --venue kalshi \
+  --transport rest \
+  --patterns "KXHIGHNY-*" \
+  --max-polls 120 \
+  --poll-interval-seconds 30 \
+  --trades-limit 100 \
+  --normalize \
+  --out data/edge-tests/kalshi-highny-rest
+
+eventcontracts inspect-data \
+  --data data/edge-tests/kalshi-highny-rest \
+  --source kalshi-rest
+
+eventcontracts backtest \
+  --strategy configs/strategies/weather-temperature-arbitrage.toml \
+  --sleeve configs/sleeves/weather-kalshi-paper-a.toml \
+  --data data/edge-tests/kalshi-highny-rest \
+  --latency-ms 250 \
+  --queue-fraction 1.0 \
+  --starting-equity 10000 \
+  --out artifacts/reports/weather-rest-edge.json
+```
+
+Fill realism in this mode is deliberately conservative: marketable orders walk
+the captured opposite book, while passive orders join a configurable fraction
+of visible same-price depth and only fill when later captured trades consume
+that queue. Repeated REST trade polls are deduped so fill volume is not
+artificially multiplied.
 
 ## Strategy Plug-In Contract
 

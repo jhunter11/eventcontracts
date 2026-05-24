@@ -56,6 +56,12 @@ def register(subparsers: Any) -> None:
         help="Constant submit latency in milliseconds.",
     )
     parser.add_argument(
+        "--queue-fraction",
+        type=str,
+        default="1.0",
+        help="Fraction of visible same-price depth assumed ahead of passive orders.",
+    )
+    parser.add_argument(
         "--starting-equity",
         type=str,
         default="0",
@@ -91,7 +97,7 @@ def _handle(args: argparse.Namespace) -> int:
     simulator = MarketPaperSimulator(
         fee_model=fee_model,
         latency=ConstantLatency(submit_ms=args.latency_ms),
-        queue_estimator=FractionalQueueEstimator(),
+        queue_estimator=FractionalQueueEstimator(fraction=Decimal(args.queue_fraction)),
         strategy_id=spec.strategy_id,
         sleeve_id=sleeve.sleeve_id,
         fill_sink=pnl,

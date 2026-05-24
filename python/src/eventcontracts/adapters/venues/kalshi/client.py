@@ -358,6 +358,7 @@ def rest_envelope(
     payload: Mapping[str, Any],
     received_at: datetime | None = None,
     exchange_ts: datetime | None = None,
+    metadata: Mapping[str, Any] | None = None,
 ) -> EventEnvelope:
     return EventEnvelope(
         venue=Venue.KALSHI,
@@ -367,6 +368,7 @@ def rest_envelope(
         exchange_ts=exchange_ts,
         payload=payload,
         schema_version="kalshi-rest-v1",
+        metadata=metadata or {},
     )
 
 

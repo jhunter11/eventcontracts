@@ -41,6 +41,14 @@
         "optional": { "type": "boolean" }
       }
     },
+    "sleeve": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sleeve_spec"],
+      "properties": {
+        "sleeve_spec": { "type": "string", "description": "Relative path to sleeve_spec.toml within the bundle." }
+      }
+    },
     "features": {
       "type": "object",
       "additionalProperties": false,
@@ -71,7 +79,8 @@
         "required": ["path", "sha256"],
         "properties": {
           "path": { "type": "string", "minLength": 1 },
-          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "size_bytes": { "type": "integer", "minimum": 0 }
         }
       }
     }

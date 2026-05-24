@@ -30,9 +30,15 @@ Already implemented:
 - `eventcontracts capture` for Kalshi raw capture.
 - `eventcontracts normalize` for raw-to-normalized event-lake conversion.
 - `eventcontracts capture --normalize` for one-shot capture plus normalization.
+- `eventcontracts capture --transport rest --max-polls ...` for predictive,
+  non-latency-sensitive edge tests using repeated order-book snapshots and
+  deduped recent trades.
 - `eventcontracts inspect-data` for raw, normalized, reject, and partition
   counts.
 - Normalization reject Parquet partitions and capture run manifests.
+- Book/trade-driven paper fills: taker orders walk captured book depth; passive
+  orders join configurable visible queue depth and fill only from later trade
+  prints.
 - Subscription planning from active `StrategySpec` values.
 - Rust workspace scaffolds for contracts, runner, gateway, bus, feature builder,
   allocator, and parity.

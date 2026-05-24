@@ -37,6 +37,9 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     parser.add_argument("--status", default="open", help="Market status filter for REST discovery.")
     parser.add_argument("--channels", default="", help="Comma-separated Kalshi WS channels.")
     parser.add_argument("--max-messages", type=int, default=None, help="Stop after N WS messages.")
+    parser.add_argument("--max-polls", type=int, default=1, help="Stop REST capture after N polling rounds.")
+    parser.add_argument("--poll-interval-seconds", type=float, default=0.0, help="Delay between REST polling rounds.")
+    parser.add_argument("--trades-limit", type=int, default=100, help="Recent trades fetched per REST market poll.")
     parser.add_argument("--normalize", action="store_true", help="Normalize captured raw envelopes after capture.")
     parser.add_argument(
         "--fixture-jsonl",
@@ -104,6 +107,9 @@ def _handle_capture(args: argparse.Namespace) -> int:
             out=args.out,
             status=args.status,
             max_messages=args.max_messages,
+            max_polls=args.max_polls,
+            poll_interval_seconds=args.poll_interval_seconds,
+            trades_limit=args.trades_limit,
         )
     )
     source = f"kalshi-{args.transport}"
@@ -118,6 +124,9 @@ def _handle_capture(args: argparse.Namespace) -> int:
             "channels": tuple(channels),
             "status": args.status,
             "max_messages": args.max_messages,
+            "max_polls": args.max_polls,
+            "poll_interval_seconds": args.poll_interval_seconds,
+            "trades_limit": args.trades_limit,
             "captured": count,
             "strategy_configs": tuple(str(path) for path in strategy_paths),
             "normalization": normalization,
@@ -139,6 +148,9 @@ async def _capture_kalshi_live(
     out: Path,
     status: str,
     max_messages: int | None,
+    max_polls: int,
+    poll_interval_seconds: float,
+    trades_limit: int,
 ) -> int:
     rest = KalshiPublicClient.from_env()
     tickers = await resolve_kalshi_tickers(rest, patterns=patterns, status=status)
@@ -146,7 +158,14 @@ async def _capture_kalshi_live(
         raise ValueError(f"no Kalshi markets matched patterns: {patterns}")
     store = ParquetEventStore(out)
     if transport == "rest":
-        count = await capture_kalshi_rest_snapshot(rest, store=store, tickers=tickers)
+        count = await capture_kalshi_rest_polls(
+            rest,
+            store=store,
+            tickers=tickers,
+            max_polls=max_polls,
+            poll_interval_seconds=poll_interval_seconds,
+            trades_limit=trades_limit,
+        )
     else:
         ws = KalshiWebSocketClient.from_env()
         count = 0
@@ -182,16 +201,70 @@ async def capture_kalshi_rest_snapshot(
     store: ParquetEventStore,
     tickers: Sequence[str],
 ) -> int:
+    return await capture_kalshi_rest_polls(
+        client,
+        store=store,
+        tickers=tickers,
+        max_polls=1,
+        poll_interval_seconds=0.0,
+        trades_limit=100,
+    )
+
+
+async def capture_kalshi_rest_polls(
+    client: KalshiPublicClient,
+    *,
+    store: ParquetEventStore,
+    tickers: Sequence[str],
+    max_polls: int,
+    poll_interval_seconds: float,
+    trades_limit: int,
+) -> int:
+    """Capture repeated REST book snapshots and deduped recent trades.
+
+    This is the capture mode for predictive, non-latency-sensitive research:
+    every poll records the latest book, while trades are only appended once so
+    repeated `/markets/trades` calls do not inflate passive fill volume.
+    """
+
+    if max_polls <= 0:
+        raise ValueError("max_polls must be positive")
+    if poll_interval_seconds < 0:
+        raise ValueError("poll_interval_seconds must be non-negative")
+    if trades_limit <= 0:
+        raise ValueError("trades_limit must be positive")
+
     count = 0
-    for ticker in tickers:
-        orderbook = await client.get_order_book_payload(ticker)
-        store.append(rest_envelope(channel="book", payload={"market_ticker": ticker, **orderbook}))
-        count += 1
-        trades = await client.get_trades_payload(ticker=ticker, limit=100)
-        for item in trades.get("trades", []):
-            if isinstance(item, dict):
-                store.append(rest_envelope(channel="trade", payload={"market_ticker": ticker, **item}))
+    seen_trades: set[str] = set()
+    for poll_index in range(max_polls):
+        for ticker in tickers:
+            orderbook = await client.get_order_book_payload(ticker)
+            store.append(
+                rest_envelope(
+                    channel="book",
+                    payload={"market_ticker": ticker, **orderbook},
+                    metadata={"poll_index": poll_index},
+                )
+            )
+            count += 1
+            trades = await client.get_trades_payload(ticker=ticker, limit=trades_limit)
+            for item in trades.get("trades", []):
+                if not isinstance(item, dict):
+                    continue
+                trade_key = _rest_trade_key(ticker, item)
+                if trade_key in seen_trades:
+                    continue
+                seen_trades.add(trade_key)
+                store.append(
+                    rest_envelope(
+                        channel="trade",
+                        payload={"market_ticker": ticker, **item},
+                        metadata={"poll_index": poll_index, "trade_key": trade_key},
+                    )
+                )
                 count += 1
+        if poll_index + 1 < max_polls and poll_interval_seconds > 0:
+            await asyncio.sleep(poll_interval_seconds)
     store.flush()
     return count
 
@@ -217,6 +290,21 @@ def _json_object(line: str) -> dict[str, Any]:
     if not isinstance(decoded, dict):
         raise ValueError("fixture JSONL entries must be objects")
     return decoded
+
+
+def _rest_trade_key(ticker: str, trade: dict[str, Any]) -> str:
+    explicit = trade.get("trade_id")
+    if isinstance(explicit, str) and explicit:
+        return f"{ticker}:trade_id:{explicit}"
+    fields = (
+        ticker,
+        str(trade.get("ts_ms") or trade.get("ts") or ""),
+        str(trade.get("yes_price_dollars") or trade.get("yes_price") or trade.get("price") or ""),
+        str(trade.get("no_price_dollars") or trade.get("no_price") or ""),
+        str(trade.get("count_fp") or trade.get("count") or trade.get("quantity") or ""),
+        str(trade.get("taker_side") or trade.get("side") or ""),
+    )
+    return ":".join(fields)
 
 
 def _patterns_from_args(raw: str) -> tuple[str, ...]:

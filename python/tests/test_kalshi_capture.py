@@ -13,7 +13,7 @@ from typing import Any
 import httpx
 
 from eventcontracts.adapters.venues.kalshi import KalshiPublicClient, KalshiWebSocketClient
-from eventcontracts.cli.capture import capture_kalshi_fixture, resolve_kalshi_tickers
+from eventcontracts.cli.capture import capture_kalshi_fixture, capture_kalshi_rest_polls, resolve_kalshi_tickers
 from eventcontracts.cli.main import main as cli
 from eventcontracts.config import load_strategy_spec
 from eventcontracts.domain import LifecycleEvent, OrderBookEvent, QuoteEvent, TradeEvent
@@ -173,6 +173,60 @@ def test_capture_fixture_writes_raw_parquet(tmp_path: Path) -> None:
     assert count == 5
     assert len(envelopes) == 5
     assert (tmp_path / "raw" / "venue=kalshi" / "source=kalshi-ws").exists()
+
+
+def test_rest_poll_capture_records_books_and_dedupes_recent_trades(tmp_path: Path) -> None:
+    async def run() -> None:
+        store = ParquetEventStore(tmp_path)
+        count = await capture_kalshi_rest_polls(
+            _mock_rest_client(),
+            store=store,
+            tickers=("KXHIGHNY-26MAY24-B75",),
+            max_polls=2,
+            poll_interval_seconds=0,
+            trades_limit=100,
+        )
+
+        envelopes = list(store.read(source="kalshi-rest"))
+
+        assert count == 3
+        assert [event.channel for event in envelopes].count("book") == 2
+        assert [event.channel for event in envelopes].count("trade") == 1
+        assert [event.metadata["poll_index"] for event in envelopes if event.channel == "book"] == [0, 1]
+        assert any(
+            event.metadata.get("trade_key") == "KXHIGHNY-26MAY24-B75:trade_id:trade-rest-1"
+            for event in envelopes
+        )
+
+    asyncio.run(run())
+
+
+def test_rest_poll_capture_normalizes_for_backtest_replay(
+    capsys: Any,
+    tmp_path: Path,
+) -> None:
+    async def capture() -> None:
+        await capture_kalshi_rest_polls(
+            _mock_rest_client(),
+            store=ParquetEventStore(tmp_path),
+            tickers=("KXHIGHNY-26MAY24-B75",),
+            max_polls=2,
+            poll_interval_seconds=0,
+            trades_limit=100,
+        )
+
+    asyncio.run(capture())
+
+    rc = cli(["normalize", "--data", str(tmp_path), "--source", "kalshi-rest", "--normalizer", "kalshi"])
+
+    assert rc == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["processed"] == 3
+    assert summary["accepted"] == 3
+    events = list(ParquetEventStore(tmp_path).read_normalized())
+    assert len(events) == 3
+    assert sum(isinstance(event, OrderBookEvent) for event in events) == 2
+    assert sum(isinstance(event, TradeEvent) for event in events) == 1
 
 
 def test_capture_cli_fixture_mode_writes_parquet(

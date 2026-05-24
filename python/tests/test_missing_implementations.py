@@ -12,7 +12,6 @@ EXPECTED_NOT_IMPLEMENTED = {
     "src/eventcontracts/adapters/venues/kalshi/client.py": 2,
     "src/eventcontracts/adapters/venues/polymarket/client.py": 4,
     "src/eventcontracts/allocation/capital.py": 6,
-    "src/eventcontracts/artifacts/bundle.py": 11,
     "src/eventcontracts/audit.py": 4,
     "src/eventcontracts/bus/contracts.py": 13,
     "src/eventcontracts/execution/simulator.py": 1,
