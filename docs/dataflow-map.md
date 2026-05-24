@@ -1,27 +1,31 @@
 # Dataflow Map
 
-This document names the current partial implementation path and the data type
-that crosses each layer. It is intentionally narrow: these functions exist to
-make the first end-to-end loop testable before real venue clients, data lake
-writers, and market-realistic execution are implemented.
+This document names the implementation path and the data type that
+crosses each layer. After the Phase 1-3 vertical slice, every link
+shown below has a real implementation that runs end-to-end.
 
 ## Raw Capture To Storage
 
 Producer boundary:
 
 - `eventcontracts.ingestion.CaptureSource.capture(job) -> Iterable[EventEnvelope]`
-- `eventcontracts.ingestion.IterableCaptureSource` is the local/test producer.
+- `eventcontracts.ingestion.IterableCaptureSource` is the local/test
+  producer; venue adapters in `eventcontracts.adapters.venues.*` are the
+  production producers.
 
 Persistence boundary:
 
 - `eventcontracts.ingestion.IngestionPipeline.run(job) -> int`
 - Input type: `IngestionJob`
 - Stored type: `storage.EventEnvelope`
-- Store port: `storage.EventStore.append(event)`
+- Store ports:
+  - `storage.InMemoryEventStore` (tests, local)
+  - `storage.ParquetEventStore` (durable: partitions under `raw/venue=.../source=.../date=...`)
 
-`EventEnvelope` is the raw persisted object. It carries venue/source/channel,
-exchange time, receipt time, raw payload, schema version, and metadata. Raw
-payloads should be stored before normalization.
+`EventEnvelope` is the raw persisted object. It carries
+venue/source/channel, exchange time, receipt time, raw payload, schema
+version, and metadata. Raw payloads are always stored before
+normalization.
 
 ## Raw Storage To Normalized Events
 
@@ -31,7 +35,7 @@ Normalizer boundary:
 - Input type: `storage.EventEnvelope`
 - Output type: `domain.NormalizedEvent | None`
 
-Current parser functions:
+Parser functions:
 
 - `normalization.normalize_trade(raw) -> TradeEvent`
 - `normalization.normalize_quote(raw) -> QuoteEvent`
@@ -53,21 +57,39 @@ Strategy replay:
 
 - `replay.NormalizedReplaySource.stream() -> Iterator[NormalizedEvent]`
 - Implements the runner `EventSource` port.
+- Backed by either `InMemoryEventStore` or `ParquetEventStore` — same
+  contract, deterministic ordering by `(exchange_ts, received_at, event_id)`.
+
+Order book reconstruction (optional, for top-of-book venues):
+
+- `replay.OrderBookReconstructor` maintains running ladders from quote
+  and trade events.
+- `replay.reconstruct_books(events)` is the generator that interleaves
+  synthetic `OrderBookEvent` values into a stream.
+
+Analytical read path:
+
+- `storage.DuckDbEventStore` exposes the same Parquet partitions as SQL
+  views (`raw_events`, `normalized_events`) for ad-hoc queries and
+  parity case generation.
 
 Runner handoff:
 
-- `runner.StrategyRunner.run()`
+- `runner.StrategyRunner.run() -> RunSummary`
 - Calls: `Strategy.on_event(event: NormalizedEvent, ctx: StrategyContext)`
 - Strategy returns: `Sequence[StrategyDecision]`
 - Runner wraps each decision as: `domain.IntentEnvelope`
+- Strategy snapshots persist through `storage.FileStateStore` (binary
+  blobs, one file per strategy id, atomic rename on write).
 
 ## Risk To Paper Execution
 
 Risk boundary:
 
 - `risk.SleeveRiskGate.evaluate(envelope, ctx) -> RiskDecision`
-- Input type: `domain.IntentEnvelope`
-- Context type: `strategy.StrategyContext`
+  - per-order notional, projected position notional, open-order count,
+    sleeve gross exposure, daily realized loss, kill switch
+- Stateful inputs: `risk.DailyLossLedger`, `risk.KillSwitch`
 
 Execution translation:
 
@@ -77,30 +99,51 @@ Execution translation:
 
 Paper execution:
 
-- `execution.PaperIntentSink.emit(envelope) -> None`
-- `execution.PaperBroker.submit(order) -> list[SimulatedFill]`
-- `execution.ImmediateFillSimulator.submit(order) -> list[SimulatedFill]`
+- `execution.MarketPaperSimulator.submit(intent, now) -> list[Fill]`
+  - taker fills walk the opposite book
+  - passive fills queue with a `QueuePositionEstimator`
+  - cancel/replace, post-only, market lifecycle handling
+- Fee model: venue-specific via `adapters.venues.<venue>.<Venue>FeeModel`
+  (Kalshi, Polymarket).
+- Latency: `execution.ConstantLatency` / `LognormalLatency` /
+  `LookupLatency` — seeded for replay determinism.
+- Queue position: `execution.DepthQueueEstimator`,
+  `FractionalQueueEstimator`, `FrontOfQueueEstimator`.
 
-`ImmediateFillSimulator` is a deterministic placeholder. It fills at the order
-price with zero fees so the data path is executable while fee, queue, slippage,
-latency, and lifecycle models are still pending.
+Position keeping and PnL:
+
+- `execution.PnLTracker` implements `FillSink`. Buys update weighted-
+  average cost; sells realize PnL; quotes mark positions to mid.
+- `execution.BacktestReport.from_run(summary, pnl)` aggregates the
+  runner summary and PnL state into one serializable report
+  (realized + unrealized PnL, drawdown, fill rate, fees,
+  rejection-reason counts).
 
 ## Current Test Path
 
-`tests/test_vertical_dataflow.py` runs:
+The Phase 1-3 vertical slice in `tests/test_end_to_end.py` runs:
 
 ```text
-EventEnvelope
-  -> IngestionPipeline
-  -> InMemoryEventStore.raw_events
-  -> EventNormalizer / NormalizationPipeline
-  -> InMemoryEventStore.normalized_events
-  -> NormalizedReplaySource
+synthetic NormalizedEvent stream
+  -> ParquetEventStore.append_normalized   (durable)
+  -> DuckDbEventStore.normalized_count     (verifies partition layout)
+  -> NormalizedReplaySource.stream         (replay, deterministic)
   -> StrategyRunner
-  -> IntentEnvelope
-  -> SleeveRiskGate
-  -> PaperIntentSink
-  -> OrderIntent
-  -> PaperBroker
-  -> SimulatedFill
+       -> Strategy.on_event(event, ctx)
+       -> IntentEnvelope
+       -> SleeveRiskGate (limits + daily loss + kill switch)
+       -> PaperIntentSink
+            -> intent_to_order
+            -> MarketPaperSimulator.submit
+                 -> KalshiFeeModel
+                 -> FractionalQueueEstimator
+                 -> ConstantLatency
+            -> Fill
+            -> PnLTracker.on_fill
+       -> RunSummary
+  -> BacktestReport
 ```
+
+`tests/test_determinism.py` runs the same slice twice and asserts the
+serialized reports are byte-identical, which is the foundation for
+the future Python/Rust parity job.
