@@ -1,0 +1,30 @@
+strategy_id = "macro-cpi_predictor-v1"
+name = "macro_cpi_predictor"
+version = "1.0.0"
+description = "Rules-mode CPI bracket predictor combining alt-data nowcast and Cleveland Fed nowcast."
+feature_schema_id = "macro_cpi_predictor_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXCPI*", "KXINFLATION*"]
+event_kinds = ["external", "quote", "timer"]
+external_sources = ["truflation", "apify-retail-prices"]
+
+[default_execution_priority]
+tier = "relaxed"
+max_delay_ms = 5000
+expires_after_ms = 3600000
+reason = "CPI alternative data is slow-moving"
+
+[parameters]
+brackets = "KXCPI-LOW:0.001:0.002;KXCPI-MID:0.002:0.004;KXCPI-HIGH:0.004:0.006"
+venue = "kalshi"
+signal_source = "truflation"
+alpha = "0.60"
+min_shift_bps = "50"
+size = "5"
+
+[tags]
+family = "macro"
+mode = "paper"
+research_doc = "docs/strategy-specs.md#11"

@@ -1,0 +1,30 @@
+strategy_id = "politics-legislative_cascade-v1"
+name = "politics_legislative_cascade"
+version = "1.0.0"
+description = "Rules-mode legislative sentiment cascade strategy that cancels protective YES and buys NO on negative whip-score shocks."
+feature_schema_id = "politics_legislative_features"
+
+[subscription]
+venues = ["kalshi", "polymarket_global"]
+instrument_patterns = ["*BILL*", "*CONGRESS*", "*SENATE*"]
+event_kinds = ["external"]
+external_sources = ["gdelt-roberta", "propublica-congress"]
+
+[default_execution_priority]
+tier = "standard"
+max_delay_ms = 5000
+expires_after_ms = 300000
+reason = "LLM-derived political signal is urgent but not microsecond-sensitive"
+
+[parameters]
+bill_market_id = "KXBILL-PASSAGE"
+venue = "kalshi"
+signal_source = "gdelt-roberta"
+negative_threshold = "-1.5"
+protective_yes_coid = "legislative-protective-yes"
+size = "10"
+
+[tags]
+family = "politics"
+mode = "paper"
+research_doc = "docs/strategy-specs.md#9"

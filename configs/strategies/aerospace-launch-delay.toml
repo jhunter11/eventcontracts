@@ -1,0 +1,30 @@
+strategy_id = "aerospace-launch_delay-v1"
+name = "aerospace_launch_delay"
+version = "1.0.0"
+description = "Rules-mode launch delay predictor using launch window state, fueling status, and timer heartbeats."
+feature_schema_id = "aerospace_launch_delay_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXLAUNCH*", "KXSPACEX*", "KXNASA*"]
+event_kinds = ["timer", "external", "lifecycle"]
+external_sources = ["space-devs", "open-meteo"]
+
+[default_execution_priority]
+tier = "standard"
+max_delay_ms = 2000
+expires_after_ms = 300000
+reason = "launch-window signal updates on minute cadence"
+
+[parameters]
+launch_market_id = "KXLAUNCH-DELAY"
+venue = "kalshi"
+signal_source = "space-devs"
+scrub_window_mins = 120
+size_multiplier = "0.20"
+max_size = "50"
+
+[tags]
+family = "aerospace"
+mode = "paper"
+research_doc = "docs/strategy-specs.md#6"

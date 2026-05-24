@@ -1,0 +1,28 @@
+strategy_id = "politics-primary_momentum-v1"
+name = "politics_primary_momentum"
+version = "1.0.0"
+description = "Rules-mode primary-contagion strategy using settlement surprise in one state to reprice another."
+feature_schema_id = "politics_primary_momentum_features"
+
+[subscription]
+venues = ["kalshi", "polymarket_global"]
+instrument_patterns = ["*PRIMARY*", "*ELECTION*"]
+event_kinds = ["settlement", "quote"]
+external_sources = []
+
+[default_execution_priority]
+tier = "fast"
+max_delay_ms = 100
+expires_after_ms = 5000
+reason = "post-settlement political repricing can be fast"
+
+[parameters]
+primary_pairs = "KXPRIMARY-IA:KXPRIMARY-NH:0.45:0.30;KXPRIMARY-NH:KXPRIMARY-SC:0.50:0.25"
+venue = "kalshi"
+min_edge_bps = "200"
+size = "5"
+
+[tags]
+family = "politics"
+mode = "paper"
+research_doc = "docs/strategy-specs.md#8"

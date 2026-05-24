@@ -88,7 +88,9 @@ def load_package_strategies(package_name: str = BUILTIN_STRATEGY_PACKAGE) -> tup
         if module_info.ispkg or module_info.name.startswith("_"):
             continue
         module_name = f"{package_name}.{module_info.name}"
-        importlib.import_module(module_name)
+        module = importlib.import_module(module_name)
+        if module_info.name not in registry.known():
+            importlib.reload(module)
         loaded.append(module_info.name)
     return tuple(sorted(loaded))
 

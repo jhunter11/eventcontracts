@@ -1,0 +1,27 @@
+strategy_id = "microstructure-queue_evader-v1"
+name = "microstructure_queue_evader"
+version = "1.0.0"
+description = "Heuristic queue-position evader that cancels stale resting orders before adverse run-through."
+feature_schema_id = "queue_evader_features"
+
+[subscription]
+venues = ["kalshi", "polymarket_global"]
+instrument_patterns = ["*"]
+event_kinds = ["own_order_update", "book", "trade"]
+external_sources = []
+
+[default_execution_priority]
+tier = "critical"
+max_delay_ms = 20
+expires_after_ms = 250
+reason = "protective cancel path"
+
+[parameters]
+queue_evacuation_threshold = "5"
+adverse_volume_threshold = "50"
+recent_volume_window_seconds = 5
+
+[tags]
+family = "microstructure"
+mode = "paper"
+research_doc = "docs/strategy-specs.md#10"

@@ -1,0 +1,29 @@
+strategy_id = "macro-fed_gnn-v1"
+name = "macro_fed_gnn"
+version = "1.0.0"
+description = "Rules-mode front-month to back-month Fed rate probability propagation."
+feature_schema_id = "macro_fed_gnn_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXFED*"]
+event_kinds = ["trade", "quote", "external"]
+external_sources = ["fred", "apify-cme-fedwatch"]
+
+[default_execution_priority]
+tier = "fast"
+max_delay_ms = 100
+expires_after_ms = 5000
+reason = "front-month rate-market move propagation"
+
+[parameters]
+front_month_market_id = "KXFED-FRONT"
+back_month_market_id = "KXFED-BACK"
+min_edge_bps = "50"
+propagation_beta = "0.60"
+size = "10"
+
+[tags]
+family = "macro"
+mode = "paper"
+research_doc = "docs/strategy-specs.md#5"

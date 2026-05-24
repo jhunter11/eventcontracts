@@ -1,0 +1,28 @@
+strategy_id = "microstructure-obi_scalper-v1"
+name = "microstructure_obi_scalper"
+version = "1.0.0"
+description = "Rules-mode L1 order-book imbalance scalper with protective adverse-flip cancels."
+feature_schema_id = "microstructure_obi_scalper_features"
+
+[subscription]
+venues = ["kalshi", "polymarket_global"]
+instrument_patterns = ["*"]
+event_kinds = ["book", "own_order_update"]
+external_sources = []
+
+[default_execution_priority]
+tier = "fast"
+max_delay_ms = 50
+expires_after_ms = 500
+reason = "microstructure edge decays quickly"
+
+[parameters]
+imbalance_threshold = "0.70"
+cancel_threshold = "0.30"
+clip_size = "5"
+max_spread_bps = "100"
+
+[tags]
+family = "microstructure"
+mode = "paper"
+research_doc = "docs/strategy-specs.md#2"

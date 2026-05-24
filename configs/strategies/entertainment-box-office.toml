@@ -1,0 +1,33 @@
+strategy_id = "entertainment-box_office-v2"
+name = "entertainment_box_office"
+version = "2.0.0"
+description = "Rules-mode Friday-night box-office gross extrapolator using seat occupancy and ticket velocity."
+feature_schema_id = "entertainment_box_office_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXMOVIE*", "KXBOXOFFICE*"]
+event_kinds = ["external", "quote", "timer"]
+external_sources = ["apify-fandango", "tmdb"]
+
+[default_execution_priority]
+tier = "relaxed"
+max_delay_ms = 5000
+expires_after_ms = 3600000
+reason = "box-office signal half-life is hours"
+
+[parameters]
+market_id = "KXBOXOFFICE-WEEKEND"
+venue = "kalshi"
+signal_source = "apify-fandango"
+target_gross_usd = "100000000"
+baseline_gross_usd = "120000000"
+extrapolation_hours = "48"
+min_edge_bps = "500"
+size = "10"
+confidence_floor = "0.80"
+
+[tags]
+family = "entertainment"
+mode = "paper"
+research_doc = "docs/strategy-specs.md#7"

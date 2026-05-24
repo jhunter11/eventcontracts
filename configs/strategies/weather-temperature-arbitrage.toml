@@ -1,0 +1,28 @@
+strategy_id = "weather-temperature_arbitrage-v1"
+name = "weather_temperature_arbitrage"
+version = "1.0.0"
+description = "Rules-mode Kalshi temperature bracket arbitrage using point-in-time weather forecast probabilities."
+feature_schema_id = "weather_temperature_arbitrage_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXHIGH*", "WX-*"]
+event_kinds = ["quote", "external"]
+external_sources = ["open-meteo", "noaa-hrrr"]
+
+[default_execution_priority]
+tier = "standard"
+max_delay_ms = 1000
+expires_after_ms = 300000
+reason = "weather signal half-life is minutes, not milliseconds"
+
+[parameters]
+min_edge_bps = "75"
+max_size = "10"
+kelly_fraction = "0.10"
+signal_source = "open-meteo"
+
+[tags]
+family = "weather"
+mode = "paper"
+research_doc = "docs/strategy-specs.md#1"

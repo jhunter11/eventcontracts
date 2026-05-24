@@ -1,0 +1,28 @@
+strategy_id = "macro-nfp_absorber-v2"
+name = "macro_nfp_absorber"
+version = "2.0.0"
+description = "Rules-mode NFP quote widener/tightener for operator-managed resting maker orders."
+feature_schema_id = "macro_nfp_absorber_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXNFP*", "KXU3*"]
+event_kinds = ["timer", "quote"]
+external_sources = []
+
+[default_execution_priority]
+tier = "standard"
+max_delay_ms = 100
+expires_after_ms = 300000
+reason = "scheduled macro release order management"
+
+[parameters]
+managed_orders = "bid_yes:nfp-bid-yes,ask_yes:nfp-ask-yes"
+wide_bps = "300"
+tight_bps = "50"
+reference_mid = "0.50"
+
+[tags]
+family = "macro"
+mode = "paper"
+research_doc = "docs/strategy-specs.md#3"

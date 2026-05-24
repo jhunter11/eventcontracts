@@ -1,0 +1,18 @@
+sleeve_id = "macro-cpi-kalshi-paper-a"
+strategy_id = "macro-cpi_predictor-v1"
+strategy_version = "1.0.0"
+venue = "kalshi"
+capital_allocation = "12000"
+currency = "USD"
+
+[risk]
+max_order_notional = "600"
+max_position_notional = "3000"
+max_daily_loss = "600"
+max_open_orders = 20
+max_gross_exposure = "3000"
+currency = "USD"
+
+[tags]
+mode = "paper"
+family = "macro"

@@ -1,0 +1,30 @@
+strategy_id = "arbitrage-cross_venue-v1"
+name = "arbitrage_cross_venue"
+version = "1.0.0"
+description = "Deterministic quote arbitrage monitor between Kalshi and Polymarket, routing only the controlled venue leg."
+feature_schema_id = "arbitrage_cross_venue_features"
+
+[subscription]
+venues = ["kalshi", "polymarket_global"]
+instrument_patterns = ["*"]
+event_kinds = ["quote"]
+external_sources = []
+
+[default_execution_priority]
+tier = "fast"
+max_delay_ms = 100
+expires_after_ms = 1000
+reason = "cross-venue spread can vanish quickly"
+
+[parameters]
+controlled_venue = "kalshi"
+counter_venue = "polymarket_global"
+min_edge_bps = "100"
+kalshi_taker_fee_bps = "175"
+poly_taker_fee_bps = "200"
+max_clip_size = "20"
+
+[tags]
+family = "arbitrage"
+mode = "paper"
+research_doc = "docs/strategy-specs.md#4"
