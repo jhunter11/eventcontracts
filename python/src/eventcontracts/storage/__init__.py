@@ -12,6 +12,8 @@ from eventcontracts.storage.inmemory import (
 from eventcontracts.storage.interfaces import (
     EventEnvelope,
     EventStore,
+    NormalizationReject,
+    NormalizationRejectStore,
     NormalizedEventStore,
 )
 from eventcontracts.storage.state_store import FileStateStore
@@ -49,6 +51,8 @@ __all__ = [
     "EventStore",
     "FileStateStore",
     "InMemoryEventStore",
+    "NormalizationReject",
+    "NormalizationRejectStore",
     "NormalizedEventStore",
     "ParquetEventStore",
     "envelope_sort_key",

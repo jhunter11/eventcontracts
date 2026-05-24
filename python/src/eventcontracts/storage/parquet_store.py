@@ -33,7 +33,13 @@ from eventcontracts.domain.events import (
 )
 from eventcontracts.domain.models import Venue
 from eventcontracts.domain.serialization import to_primitive
-from eventcontracts.storage.interfaces import EventEnvelope, EventStore, NormalizedEventStore
+from eventcontracts.storage.interfaces import (
+    EventEnvelope,
+    EventStore,
+    NormalizationReject,
+    NormalizationRejectStore,
+    NormalizedEventStore,
+)
 
 # pyarrow does not ship strict type stubs; treat the modules as Any so the
 # rest of this file stays strict-mypy clean without scattering type:ignore.
@@ -89,6 +95,23 @@ NORMALIZED_SCHEMA = pa.schema(
 )
 
 
+REJECT_SCHEMA = pa.schema(
+    [
+        ("venue", pa.string()),
+        ("source", pa.string()),
+        ("channel", pa.string()),
+        ("received_at", pa.timestamp("us", tz="UTC")),
+        ("exchange_ts", pa.timestamp("us", tz="UTC")),
+        ("schema_version", pa.string()),
+        ("normalizer_version", pa.string()),
+        ("raw_sha256", pa.string()),
+        ("reasons_json", pa.string()),
+        ("payload_json", pa.string()),
+        ("metadata_json", pa.string()),
+    ]
+)
+
+
 def _utc_microsecond(dt: datetime | None) -> datetime | None:
     if dt is None:
         return None
@@ -104,6 +127,18 @@ def _partition_dir_raw(root: Path, venue: Venue | None, source: str, day: date) 
 
 def _partition_dir_normalized(root: Path, kind: str, day: date) -> Path:
     return root / "normalized" / f"kind={kind}" / f"date={day.isoformat()}"
+
+
+def _partition_dir_reject(root: Path, venue: Venue | None, source: str, channel: str, day: date) -> Path:
+    venue_seg = venue.value if venue is not None else "unknown"
+    return (
+        root
+        / "normalization_rejects"
+        / f"venue={venue_seg}"
+        / f"source={source}"
+        / f"channel={channel}"
+        / f"date={day.isoformat()}"
+    )
 
 
 def _next_part_path(directory: Path) -> Path:
@@ -144,6 +179,47 @@ def _row_to_envelope(row: dict[str, Any]) -> EventEnvelope:
         payload=json.loads(row["payload_json"]),
         schema_version=row["schema_version"],
         metadata=json.loads(row.get("metadata_json") or "{}"),
+    )
+
+
+def _reject_to_row(reject: NormalizationReject) -> dict[str, Any]:
+    raw = reject.raw
+    return {
+        "venue": raw.venue.value if raw.venue is not None else None,
+        "source": raw.source,
+        "channel": raw.channel,
+        "received_at": _utc_microsecond(raw.received_at),
+        "exchange_ts": _utc_microsecond(raw.exchange_ts),
+        "schema_version": raw.schema_version,
+        "normalizer_version": reject.normalizer_version,
+        "raw_sha256": reject.raw_sha256,
+        "reasons_json": json.dumps(tuple(reject.reasons), sort_keys=True),
+        "payload_json": json.dumps(to_primitive(raw.payload), sort_keys=True),
+        "metadata_json": json.dumps(to_primitive(raw.metadata), sort_keys=True),
+    }
+
+
+def _row_to_reject(row: dict[str, Any]) -> NormalizationReject:
+    raw = _row_to_envelope(
+        {
+            "venue": row.get("venue"),
+            "source": row["source"],
+            "channel": row["channel"],
+            "received_at": row["received_at"],
+            "exchange_ts": row.get("exchange_ts"),
+            "payload_json": row["payload_json"],
+            "schema_version": row["schema_version"],
+            "metadata_json": row.get("metadata_json") or "{}",
+        }
+    )
+    reasons = json.loads(row["reasons_json"])
+    if not isinstance(reasons, list):
+        raise ValueError("reject reasons_json must decode to a list")
+    return NormalizationReject(
+        raw=raw,
+        reasons=tuple(str(reason) for reason in reasons),
+        raw_sha256=str(row["raw_sha256"]),
+        normalizer_version=str(row["normalizer_version"]),
     )
 
 
@@ -212,7 +288,7 @@ def _extract_event_timestamps(event: NormalizedEvent) -> tuple[datetime | None, 
     raise TypeError(f"unsupported event variant: {type(event).__name__}")
 
 
-class ParquetEventStore(EventStore, NormalizedEventStore):
+class ParquetEventStore(EventStore, NormalizedEventStore, NormalizationRejectStore):
     """File-backed Parquet store implementing both event-store ports.
 
     Construction parameters:
@@ -230,6 +306,7 @@ class ParquetEventStore(EventStore, NormalizedEventStore):
         self.batch_size = batch_size
         self._raw_buffer: list[EventEnvelope] = []
         self._normalized_buffer: list[NormalizedEvent] = []
+        self._reject_buffer: list[NormalizationReject] = []
 
     # ---------- writes ----------
 
@@ -243,9 +320,15 @@ class ParquetEventStore(EventStore, NormalizedEventStore):
         if len(self._normalized_buffer) >= self.batch_size:
             self._flush_normalized()
 
+    def append_normalization_reject(self, reject: NormalizationReject) -> None:
+        self._reject_buffer.append(reject)
+        if len(self._reject_buffer) >= self.batch_size:
+            self._flush_rejects()
+
     def flush(self) -> None:
         self._flush_raw()
         self._flush_normalized()
+        self._flush_rejects()
 
     def _flush_raw(self) -> None:
         if not self._raw_buffer:
@@ -277,6 +360,21 @@ class ParquetEventStore(EventStore, NormalizedEventStore):
             path = _next_part_path(_partition_dir_normalized(self.root, kind, day))
             pq.write_table(table, path, compression="snappy")
         self._normalized_buffer.clear()
+
+    def _flush_rejects(self) -> None:
+        if not self._reject_buffer:
+            return
+        by_partition: dict[tuple[Venue | None, str, str, date], list[NormalizationReject]] = {}
+        for reject in self._reject_buffer:
+            raw = reject.raw
+            day = raw.received_at.astimezone(UTC).date()
+            by_partition.setdefault((raw.venue, raw.source, raw.channel, day), []).append(reject)
+        for (venue, source, channel, day), rejects in by_partition.items():
+            rows = [_reject_to_row(reject) for reject in rejects]
+            table = pa.Table.from_pylist(rows, schema=REJECT_SCHEMA)
+            path = _next_part_path(_partition_dir_reject(self.root, venue, source, channel, day))
+            pq.write_table(table, path, compression="snappy")
+        self._reject_buffer.clear()
 
     # ---------- reads ----------
 
@@ -315,6 +413,35 @@ class ParquetEventStore(EventStore, NormalizedEventStore):
             return iter(())
         files = sorted(norm_root.rglob("*.parquet"))
         return self._yield_normalized(files)
+
+    def read_normalization_rejects(self, source: str = "*") -> Iterable[NormalizationReject]:
+        self.flush()
+        reject_root = self.root / "normalization_rejects"
+        if not reject_root.exists():
+            return iter(())
+        files: list[Path] = []
+        for path in reject_root.rglob("*.parquet"):
+            if source == "*" or f"/source={source}/" in str(path):
+                files.append(path)
+        files.sort()
+        return self._yield_rejects(files)
+
+    def _yield_rejects(self, files: list[Path]) -> Iterator[NormalizationReject]:
+        rejects: list[NormalizationReject] = []
+        for path in files:
+            table = pq.ParquetFile(str(path)).read()
+            for row in table.to_pylist():
+                rejects.append(_row_to_reject(row))
+        rejects.sort(
+            key=lambda reject: (
+                reject.raw.exchange_ts or reject.raw.received_at,
+                reject.raw.received_at,
+                reject.raw.source,
+                reject.raw.channel,
+                reject.raw_sha256,
+            )
+        )
+        yield from rejects
 
     def _yield_normalized(self, files: list[Path]) -> Iterator[NormalizedEvent]:
         rows: list[tuple[datetime, datetime, str, dict[str, Any]]] = []

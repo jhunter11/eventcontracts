@@ -46,6 +46,22 @@ class EventStore(Protocol):
         """Read events for a source in deterministic order."""
 
 
+@dataclass(frozen=True)
+class NormalizationReject:
+    """Auditable record for a raw envelope that could not be normalized."""
+
+    raw: EventEnvelope
+    reasons: tuple[str, ...]
+    raw_sha256: str
+    normalizer_version: str = "normalizer-v1"
+
+    def __post_init__(self) -> None:
+        if not self.reasons:
+            raise ValueError("normalization reject requires at least one reason")
+        require_non_empty(self.raw_sha256, "raw_sha256")
+        require_non_empty(self.normalizer_version, "normalizer_version")
+
+
 class NormalizedEventStore(Protocol):
     """Persist strategy-facing events after normalization.
 
@@ -61,3 +77,13 @@ class NormalizedEventStore(Protocol):
 
     def read_normalized(self) -> Iterable[NormalizedEvent]:
         """Read normalized events in deterministic replay order."""
+
+
+class NormalizationRejectStore(Protocol):
+    """Persist raw envelopes that failed normalization."""
+
+    def append_normalization_reject(self, reject: NormalizationReject) -> None:
+        """Persist one normalization reject."""
+
+    def read_normalization_rejects(self, source: str = "*") -> Iterable[NormalizationReject]:
+        """Read normalization rejects in deterministic order."""

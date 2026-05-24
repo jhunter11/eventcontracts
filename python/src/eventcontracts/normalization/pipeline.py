@@ -6,9 +6,12 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 
 from eventcontracts.domain.events import NormalizedEvent
+from eventcontracts.domain.serialization import canonical_sha256
 from eventcontracts.storage.interfaces import (
     EventEnvelope,
     EventStore,
+    NormalizationReject,
+    NormalizationRejectStore,
     NormalizedEventStore,
 )
 
@@ -48,7 +51,16 @@ class EventNormalizer:
                 accepted=False,
                 reasons=(f"no normalizer for {key}",),
             )
-        return NormalizationResult(raw=raw, normalized=handler(raw), accepted=True)
+        try:
+            normalized = handler(raw)
+        except Exception as exc:
+            return NormalizationResult(
+                raw=raw,
+                normalized=None,
+                accepted=False,
+                reasons=(f"normalization failed: {type(exc).__name__}: {exc}",),
+            )
+        return NormalizationResult(raw=raw, normalized=normalized, accepted=True)
 
 
 class NormalizationPipeline:
@@ -59,10 +71,12 @@ class NormalizationPipeline:
         raw_store: EventStore,
         normalized_store: NormalizedEventStore,
         normalizer: EventNormalizer,
+        reject_store: NormalizationRejectStore | None = None,
     ) -> None:
         self.raw_store = raw_store
         self.normalized_store = normalized_store
         self.normalizer = normalizer
+        self.reject_store = reject_store
 
     def run(self, *, source: str = "*") -> tuple[NormalizationResult, ...]:
         results: list[NormalizationResult] = []
@@ -71,6 +85,14 @@ class NormalizationPipeline:
             results.append(result)
             if result.normalized is not None:
                 self.normalized_store.append_normalized(result.normalized)
+            elif self.reject_store is not None:
+                self.reject_store.append_normalization_reject(
+                    NormalizationReject(
+                        raw=raw,
+                        reasons=result.reasons,
+                        raw_sha256=canonical_sha256(raw),
+                    )
+                )
         return tuple(results)
 
 

@@ -28,6 +28,11 @@ Already implemented:
 - Kalshi native raw normalizer for ticker, trade, orderbook, and lifecycle
   messages.
 - `eventcontracts capture` for Kalshi raw capture.
+- `eventcontracts normalize` for raw-to-normalized event-lake conversion.
+- `eventcontracts capture --normalize` for one-shot capture plus normalization.
+- `eventcontracts inspect-data` for raw, normalized, reject, and partition
+  counts.
+- Normalization reject Parquet partitions and capture run manifests.
 - Subscription planning from active `StrategySpec` values.
 - Rust workspace scaffolds for contracts, runner, gateway, bus, feature builder,
   allocator, and parity.
@@ -943,7 +948,9 @@ CI performance gates:
 
 ## First Concrete Build Batch
 
-The next practical batch should not touch live order placement.
+Status: implemented. This batch intentionally did not touch live order
+placement. The remaining work after this batch starts with artifact bundles and
+Rust contract readers.
 
 Implement:
 

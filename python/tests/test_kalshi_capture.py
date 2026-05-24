@@ -20,7 +20,7 @@ from eventcontracts.domain import LifecycleEvent, OrderBookEvent, QuoteEvent, Tr
 from eventcontracts.domain.models import InstrumentId, Venue
 from eventcontracts.ingestion import SubscriptionPlanner
 from eventcontracts.normalization import EventNormalizer, kalshi_normalizers
-from eventcontracts.storage import ParquetEventStore
+from eventcontracts.storage import EventEnvelope, ParquetEventStore
 from tests.conftest import REPO_ROOT
 
 FIXTURES = REPO_ROOT / "python/tests/fixtures/kalshi"
@@ -194,6 +194,125 @@ def test_capture_cli_fixture_mode_writes_parquet(
     assert rc == 0
     assert "captured" in capsys.readouterr().out
     assert len(list(ParquetEventStore(tmp_path).read(source="kalshi-ws"))) == 5
+
+
+def test_normalize_cli_converts_captured_kalshi_raw_to_normalized(
+    capsys: Any,
+    tmp_path: Path,
+) -> None:
+    capture_kalshi_fixture(FIXTURES / "ws_messages.jsonl", tmp_path)
+
+    rc = cli(
+        [
+            "normalize",
+            "--data",
+            str(tmp_path),
+            "--source",
+            "kalshi-ws",
+            "--normalizer",
+            "kalshi",
+        ]
+    )
+
+    assert rc == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["processed"] == 5
+    assert summary["accepted"] == 5
+    assert summary["rejected"] == 0
+    assert len(list(ParquetEventStore(tmp_path).read_normalized())) == 5
+
+
+def test_capture_cli_fixture_can_normalize_and_write_manifest(
+    capsys: Any,
+    tmp_path: Path,
+) -> None:
+    rc = cli(
+        [
+            "capture",
+            "--venue",
+            "kalshi",
+            "--fixture-jsonl",
+            str(FIXTURES / "ws_messages.jsonl"),
+            "--out",
+            str(tmp_path),
+            "--normalize",
+        ]
+    )
+
+    assert rc == 0
+    assert "manifest" in capsys.readouterr().out
+    assert len(list(ParquetEventStore(tmp_path).read(source="kalshi-ws"))) == 5
+    assert len(list(ParquetEventStore(tmp_path).read_normalized())) == 5
+    manifests = tuple((tmp_path / "manifests").glob("capture-*.json"))
+    assert len(manifests) == 1
+    manifest = json.loads(manifests[0].read_text())
+    assert manifest["captured"] == 5
+    assert manifest["started_at"]
+    assert manifest["ended_at"]
+    assert manifest["code_version"]
+    assert manifest["output_root"] == str(tmp_path)
+    assert manifest["normalization"]["accepted"] == 5
+
+
+def test_normalize_cli_persists_reject_partition(
+    capsys: Any,
+    tmp_path: Path,
+) -> None:
+    store = ParquetEventStore(tmp_path)
+    store.append(
+        EventEnvelope(
+            venue=Venue.KALSHI,
+            source="kalshi-ws",
+            channel="unknown_channel",
+            received_at=datetime(2026, 5, 24, 12, 0, tzinfo=UTC),
+            exchange_ts=None,
+            payload={"market_ticker": "KXUNKNOWN-1"},
+            schema_version="kalshi-ws-v1",
+        )
+    )
+    store.flush()
+
+    rc = cli(
+        [
+            "normalize",
+            "--data",
+            str(tmp_path),
+            "--source",
+            "kalshi-ws",
+            "--normalizer",
+            "kalshi",
+        ]
+    )
+
+    assert rc == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["processed"] == 1
+    assert summary["accepted"] == 0
+    assert summary["rejected"] == 1
+    rejects = list(ParquetEventStore(tmp_path).read_normalization_rejects(source="kalshi-ws"))
+    assert len(rejects) == 1
+    assert rejects[0].raw.channel == "unknown_channel"
+    assert "no normalizer" in rejects[0].reasons[0]
+    assert (tmp_path / "normalization_rejects" / "venue=kalshi" / "source=kalshi-ws").exists()
+
+
+def test_inspect_data_cli_reports_raw_normalized_and_reject_counts(
+    capsys: Any,
+    tmp_path: Path,
+) -> None:
+    capture_kalshi_fixture(FIXTURES / "ws_messages.jsonl", tmp_path)
+    cli(["normalize", "--data", str(tmp_path), "--source", "kalshi-ws", "--normalizer", "kalshi"])
+    capsys.readouterr()
+
+    rc = cli(["inspect-data", "--data", str(tmp_path), "--source", "kalshi-ws"])
+
+    assert rc == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["raw_count"] == 5
+    assert summary["normalized_count"] == 5
+    assert summary["reject_count"] == 0
+    assert summary["raw_by_source"] == {"kalshi-ws": 5}
+    assert summary["normalized_by_kind"]["book"] == 2
 
 
 def _recorded_ws_envelopes(client: KalshiWebSocketClient) -> list[Any]:

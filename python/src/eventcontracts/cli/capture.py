@@ -6,7 +6,10 @@ import argparse
 import asyncio
 import fnmatch
 import json
+import os
+import subprocess
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from pprint import pprint
 from typing import Any
@@ -16,6 +19,7 @@ from eventcontracts.adapters.venues.kalshi.client import (
     KalshiWebSocketClient,
     rest_envelope,
 )
+from eventcontracts.cli.normalize import normalize_event_lake
 from eventcontracts.config import load_strategy_spec
 from eventcontracts.ingestion.subscriptions import SubscriptionPlanner
 from eventcontracts.storage import ParquetEventStore
@@ -33,6 +37,7 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     parser.add_argument("--status", default="open", help="Market status filter for REST discovery.")
     parser.add_argument("--channels", default="", help="Comma-separated Kalshi WS channels.")
     parser.add_argument("--max-messages", type=int, default=None, help="Stop after N WS messages.")
+    parser.add_argument("--normalize", action="store_true", help="Normalize captured raw envelopes after capture.")
     parser.add_argument(
         "--fixture-jsonl",
         type=Path,
@@ -45,9 +50,36 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
 def _handle_capture(args: argparse.Namespace) -> int:
     if args.venue != "kalshi":
         raise ValueError(f"unsupported venue: {args.venue}")
+    started_at = datetime.now(UTC)
     if args.fixture_jsonl is not None:
         count = capture_kalshi_fixture(args.fixture_jsonl, args.out)
-        pprint({"captured": count, "out": str(args.out), "source": "fixture"})
+        normalization = (
+            normalize_event_lake(args.out, source="kalshi-ws", normalizer_name="kalshi") if args.normalize else None
+        )
+        manifest = _write_capture_manifest(
+            args.out,
+            {
+                "venue": "kalshi",
+                "transport": "fixture",
+                "source": "kalshi-ws",
+                "fixture_jsonl": str(args.fixture_jsonl),
+                "captured": count,
+                "patterns": (),
+                "channels": (),
+                "strategy_configs": (),
+                "normalization": normalization,
+            },
+            started_at=started_at,
+        )
+        summary: dict[str, Any] = {
+            "captured": count,
+            "out": str(args.out),
+            "source": "kalshi-ws",
+            "manifest": str(manifest),
+        }
+        if normalization is not None:
+            summary["normalization"] = normalization
+        pprint(summary)
         return 0
 
     patterns = _patterns_from_args(args.patterns)
@@ -74,7 +106,28 @@ def _handle_capture(args: argparse.Namespace) -> int:
             max_messages=args.max_messages,
         )
     )
-    pprint({"captured": count, "out": str(args.out), "source": f"kalshi-{args.transport}"})
+    source = f"kalshi-{args.transport}"
+    normalization = normalize_event_lake(args.out, source=source, normalizer_name="kalshi") if args.normalize else None
+    manifest = _write_capture_manifest(
+        args.out,
+        {
+            "venue": "kalshi",
+            "transport": args.transport,
+            "source": source,
+            "patterns": tuple(patterns),
+            "channels": tuple(channels),
+            "status": args.status,
+            "max_messages": args.max_messages,
+            "captured": count,
+            "strategy_configs": tuple(str(path) for path in strategy_paths),
+            "normalization": normalization,
+        },
+        started_at=started_at,
+    )
+    summary = {"captured": count, "out": str(args.out), "source": source, "manifest": str(manifest)}
+    if normalization is not None:
+        summary["normalization"] = normalization
+    pprint(summary)
     return 0
 
 
@@ -190,3 +243,33 @@ def _channels_for_event_kinds(event_kinds: Sequence[str]) -> tuple[str, ...]:
 
 def _has_glob(pattern: str) -> bool:
     return any(char in pattern for char in "*?[]")
+
+
+def _write_capture_manifest(out: Path, payload: dict[str, Any], *, started_at: datetime) -> Path:
+    ended_at = datetime.now(UTC)
+    manifest = {
+        "started_at": started_at.isoformat(),
+        "ended_at": ended_at.isoformat(),
+        "env": os.environ.get("EVENTCONTRACTS_ENV", "unknown"),
+        "code_version": os.environ.get("EVENTCONTRACTS_CODE_VERSION") or _git_head_sha() or "unknown",
+        "output_root": str(out),
+        **payload,
+    }
+    manifest_dir = out / "manifests"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    path = manifest_dir / f"capture-{ended_at.strftime('%Y%m%dT%H%M%S%fZ')}.json"
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    return path
+
+
+def _git_head_sha() -> str | None:
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if completed.returncode != 0:
+        return None
+    sha = completed.stdout.strip()
+    return sha or None

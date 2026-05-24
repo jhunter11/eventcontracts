@@ -18,6 +18,7 @@ from eventcontracts.normalization.pipeline import (
     NormalizationResult,
     normalize_all,
 )
+from eventcontracts.storage.interfaces import NormalizationReject
 
 __all__ = [
     "BASIC_NORMALIZERS",
@@ -26,6 +27,7 @@ __all__ = [
     "ContractNormalizer",
     "EventNormalizer",
     "KalshiNormalizer",
+    "NormalizationReject",
     "NormalizationPipeline",
     "NormalizationResult",
     "normalize_all",
