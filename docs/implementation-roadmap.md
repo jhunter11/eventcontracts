@@ -1,5 +1,10 @@
 # Live Readiness Roadmap
 
+For the detailed no-shortcuts production plan with a Rust hot path, see
+`docs/live-rust-runner-roadmap.md`. This file remains the broader historical
+roadmap; the Rust-live document is the implementation plan for taking the
+system to live.
+
 This roadmap starts from the current scaffold on the
 `claude/codebase-structure-audit-rJ4xO` branch. The repository now has a typed
 Python research scaffold, a dependency-light Rust workspace scaffold,
