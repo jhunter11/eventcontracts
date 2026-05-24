@@ -14,9 +14,12 @@ from typing import cast
 
 from eventcontracts.cli import backtest as backtest_cmd
 from eventcontracts.cli import capture as capture_cmd
+from eventcontracts.cli import gen_windows as gen_windows_cmd
 from eventcontracts.cli import inspect_data as inspect_data_cmd
 from eventcontracts.cli import normalize as normalize_cmd
+from eventcontracts.cli import rank as rank_cmd
 from eventcontracts.cli import replay as replay_cmd
+from eventcontracts.cli import sweep as sweep_cmd
 from eventcontracts.cli import validate_bundle as validate_bundle_cmd
 from eventcontracts.config import (
     load_sleeve_spec,
@@ -71,6 +74,9 @@ def build_parser() -> argparse.ArgumentParser:
     normalize_cmd.register(subparsers)
     inspect_data_cmd.register(subparsers)
     replay_cmd.register(subparsers)
+    sweep_cmd.register(subparsers)
+    gen_windows_cmd.register(subparsers)
+    rank_cmd.register(subparsers)
     validate_bundle_cmd.register(subparsers)
 
     return parser
