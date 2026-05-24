@@ -1,0 +1,15 @@
+{
+  "trades": [
+    {
+      "trade_id": "trade-rest-1",
+      "market_ticker": "KXHIGHNY-26MAY24-B75",
+      "yes_price_dollars": "0.4700",
+      "no_price_dollars": "0.5300",
+      "count_fp": "4.00",
+      "taker_side": "yes",
+      "ts": 1779631200,
+      "ts_ms": 1779631200000
+    }
+  ],
+  "cursor": ""
+}

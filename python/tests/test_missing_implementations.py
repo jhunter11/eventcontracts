@@ -9,7 +9,7 @@ from __future__ import annotations
 from tests.conftest import REPO_ROOT
 
 EXPECTED_NOT_IMPLEMENTED = {
-    "src/eventcontracts/adapters/venues/kalshi/client.py": 4,
+    "src/eventcontracts/adapters/venues/kalshi/client.py": 2,
     "src/eventcontracts/adapters/venues/polymarket/client.py": 4,
     "src/eventcontracts/allocation/capital.py": 6,
     "src/eventcontracts/artifacts/bundle.py": 11,

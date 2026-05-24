@@ -1,0 +1,13 @@
+{
+  "markets": [
+    {
+      "ticker": "KXFED-26JUN-T4.50",
+      "title": "Fed target range after June meeting",
+      "category": "Economics",
+      "status": "active",
+      "open_time": "2026-05-01T10:00:00Z",
+      "close_time": "2026-06-17T18:00:00Z"
+    }
+  ],
+  "cursor": ""
+}

@@ -1,0 +1,5 @@
+{"type":"ticker","sid":11,"seq":1,"msg":{"market_ticker":"KXHIGHNY-26MAY24-B75","market_id":"m-weather","price_dollars":"0.480","yes_bid_dollars":"0.450","yes_ask_dollars":"0.530","yes_bid_size_fp":"300.00","yes_ask_size_fp":"150.00","last_trade_size_fp":"25.00","ts_ms":1779631200000,"time":"2026-05-24T12:00:00Z"}}
+{"type":"orderbook_snapshot","sid":2,"seq":2,"msg":{"market_ticker":"KXHIGHNY-26MAY24-B75","market_id":"m-weather","yes_dollars_fp":[["0.4500","12.00"]],"no_dollars_fp":[["0.5200","9.00"]]}}
+{"type":"orderbook_delta","sid":2,"seq":3,"msg":{"market_ticker":"KXHIGHNY-26MAY24-B75","market_id":"m-weather","price_dollars":"0.4500","delta_fp":"5.00","side":"yes","ts":"2026-05-24T12:00:01Z","ts_ms":1779631201000}}
+{"type":"trade","sid":12,"seq":1,"msg":{"trade_id":"trade-ws-1","market_ticker":"KXHIGHNY-26MAY24-B75","yes_price_dollars":"0.4700","no_price_dollars":"0.5300","count_fp":"4.00","taker_side":"yes","ts":1779631202,"ts_ms":1779631202000}}
+{"type":"market_lifecycle_v2","sid":13,"seq":1,"msg":{"market_ticker":"KXHIGHNY-26MAY24-B75","event_type":"deactivated","open_ts":1779620000,"close_ts":1779667140}}

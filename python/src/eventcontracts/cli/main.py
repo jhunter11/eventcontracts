@@ -13,6 +13,7 @@ from pprint import pprint
 from typing import cast
 
 from eventcontracts.cli import backtest as backtest_cmd
+from eventcontracts.cli import capture as capture_cmd
 from eventcontracts.cli import replay as replay_cmd
 from eventcontracts.cli import validate_bundle as validate_bundle_cmd
 from eventcontracts.config import (
@@ -64,6 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     _register_check_config(subparsers)
     _register_validate_config(subparsers)
     backtest_cmd.register(subparsers)
+    capture_cmd.register(subparsers)
     replay_cmd.register(subparsers)
     validate_bundle_cmd.register(subparsers)
 

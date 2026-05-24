@@ -12,3 +12,4 @@ duckdb>=1.0
 # Networking (venue REST + WebSocket clients)
 httpx>=0.27
 websockets>=12.0
+cryptography>=42.0

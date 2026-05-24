@@ -1,0 +1,192 @@
+"""Capture raw venue data into the Parquet event lake."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import fnmatch
+import json
+from collections.abc import Sequence
+from pathlib import Path
+from pprint import pprint
+from typing import Any
+
+from eventcontracts.adapters.venues.kalshi.client import (
+    KalshiPublicClient,
+    KalshiWebSocketClient,
+    rest_envelope,
+)
+from eventcontracts.config import load_strategy_spec
+from eventcontracts.ingestion.subscriptions import SubscriptionPlanner
+from eventcontracts.storage import ParquetEventStore
+
+DEFAULT_WS_CHANNELS = ("ticker", "trade", "orderbook_delta", "market_lifecycle_v2")
+
+
+def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = subparsers.add_parser("capture", help="Capture raw venue data to Parquet.")
+    parser.add_argument("--venue", choices=("kalshi",), required=True)
+    parser.add_argument("--patterns", default="", help="Comma-separated market ticker glob patterns.")
+    parser.add_argument("--strategy", action="append", type=Path, default=[], help="Strategy TOML to include.")
+    parser.add_argument("--transport", choices=("ws", "rest"), default="ws")
+    parser.add_argument("--out", type=Path, required=True, help="Event lake root.")
+    parser.add_argument("--status", default="open", help="Market status filter for REST discovery.")
+    parser.add_argument("--channels", default="", help="Comma-separated Kalshi WS channels.")
+    parser.add_argument("--max-messages", type=int, default=None, help="Stop after N WS messages.")
+    parser.add_argument(
+        "--fixture-jsonl",
+        type=Path,
+        default=None,
+        help="Replay recorded Kalshi WS JSONL instead of connecting to the network.",
+    )
+    parser.set_defaults(handler=_handle_capture)
+
+
+def _handle_capture(args: argparse.Namespace) -> int:
+    if args.venue != "kalshi":
+        raise ValueError(f"unsupported venue: {args.venue}")
+    if args.fixture_jsonl is not None:
+        count = capture_kalshi_fixture(args.fixture_jsonl, args.out)
+        pprint({"captured": count, "out": str(args.out), "source": "fixture"})
+        return 0
+
+    patterns = _patterns_from_args(args.patterns)
+    strategy_paths = tuple(Path(path) for path in args.strategy)
+    if strategy_paths:
+        plan = SubscriptionPlanner().plan(tuple(load_strategy_spec(path) for path in strategy_paths))
+        patterns = tuple(sorted(set(patterns).union(plan.instrument_patterns)))
+        if not args.channels:
+            channels = _channels_for_event_kinds(plan.event_kinds)
+        else:
+            channels = _channels_from_args(args.channels)
+    else:
+        channels = _channels_from_args(args.channels) if args.channels else DEFAULT_WS_CHANNELS
+    if not patterns:
+        raise ValueError("capture requires --patterns or at least one --strategy")
+
+    count = asyncio.run(
+        _capture_kalshi_live(
+            patterns=patterns,
+            channels=channels,
+            transport=args.transport,
+            out=args.out,
+            status=args.status,
+            max_messages=args.max_messages,
+        )
+    )
+    pprint({"captured": count, "out": str(args.out), "source": f"kalshi-{args.transport}"})
+    return 0
+
+
+async def _capture_kalshi_live(
+    *,
+    patterns: Sequence[str],
+    channels: Sequence[str],
+    transport: str,
+    out: Path,
+    status: str,
+    max_messages: int | None,
+) -> int:
+    rest = KalshiPublicClient.from_env()
+    tickers = await resolve_kalshi_tickers(rest, patterns=patterns, status=status)
+    if not tickers:
+        raise ValueError(f"no Kalshi markets matched patterns: {patterns}")
+    store = ParquetEventStore(out)
+    if transport == "rest":
+        count = await capture_kalshi_rest_snapshot(rest, store=store, tickers=tickers)
+    else:
+        ws = KalshiWebSocketClient.from_env()
+        count = 0
+        async for envelope in ws.stream(channels=channels, market_tickers=tickers, max_messages=max_messages):
+            store.append(envelope)
+            count += 1
+    store.flush()
+    return count
+
+
+async def resolve_kalshi_tickers(
+    client: KalshiPublicClient,
+    *,
+    patterns: Sequence[str],
+    status: str | None = "open",
+) -> tuple[str, ...]:
+    exact = tuple(pattern for pattern in patterns if not _has_glob(pattern))
+    glob_patterns = tuple(pattern for pattern in patterns if _has_glob(pattern))
+    payloads = await client.list_market_payloads(status=status)
+    matched: set[str] = set(exact)
+    for payload in payloads:
+        ticker = payload.get("ticker") or payload.get("market_ticker")
+        if not isinstance(ticker, str):
+            continue
+        if any(fnmatch.fnmatchcase(ticker, pattern) for pattern in glob_patterns):
+            matched.add(ticker)
+    return tuple(sorted(matched))
+
+
+async def capture_kalshi_rest_snapshot(
+    client: KalshiPublicClient,
+    *,
+    store: ParquetEventStore,
+    tickers: Sequence[str],
+) -> int:
+    count = 0
+    for ticker in tickers:
+        orderbook = await client.get_order_book_payload(ticker)
+        store.append(rest_envelope(channel="book", payload={"market_ticker": ticker, **orderbook}))
+        count += 1
+        trades = await client.get_trades_payload(ticker=ticker, limit=100)
+        for item in trades.get("trades", []):
+            if isinstance(item, dict):
+                store.append(rest_envelope(channel="trade", payload={"market_ticker": ticker, **item}))
+                count += 1
+    store.flush()
+    return count
+
+
+def capture_kalshi_fixture(path: Path, out: Path) -> int:
+    store = ParquetEventStore(out)
+    client = KalshiWebSocketClient()
+    count = 0
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        payload = _json_object(line)
+        envelope = client.message_to_envelope(payload)
+        if envelope is not None:
+            store.append(envelope)
+            count += 1
+    store.flush()
+    return count
+
+
+def _json_object(line: str) -> dict[str, Any]:
+    decoded = json.loads(line)
+    if not isinstance(decoded, dict):
+        raise ValueError("fixture JSONL entries must be objects")
+    return decoded
+
+
+def _patterns_from_args(raw: str) -> tuple[str, ...]:
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
+def _channels_from_args(raw: str) -> tuple[str, ...]:
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
+def _channels_for_event_kinds(event_kinds: Sequence[str]) -> tuple[str, ...]:
+    channels: set[str] = set()
+    for kind in event_kinds:
+        if kind == "quote":
+            channels.add("ticker")
+        elif kind == "trade":
+            channels.add("trade")
+        elif kind == "book":
+            channels.add("orderbook_delta")
+        elif kind in {"lifecycle", "settlement"}:
+            channels.add("market_lifecycle_v2")
+    return tuple(sorted(channels)) if channels else DEFAULT_WS_CHANNELS
+
+
+def _has_glob(pattern: str) -> bool:
+    return any(char in pattern for char in "*?[]")
