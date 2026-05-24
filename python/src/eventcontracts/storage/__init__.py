@@ -12,11 +12,13 @@ from eventcontracts.storage.interfaces import (
     NormalizedEventStore,
 )
 from eventcontracts.storage.parquet_store import ParquetEventStore
+from eventcontracts.storage.state_store import FileStateStore
 
 __all__ = [
     "DuckDbEventStore",
     "EventEnvelope",
     "EventStore",
+    "FileStateStore",
     "InMemoryEventStore",
     "NormalizedEventStore",
     "ParquetEventStore",
