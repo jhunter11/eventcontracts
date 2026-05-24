@@ -44,6 +44,10 @@ from eventcontracts.features import (
     InMemoryFeatureStore,
     OnlineFeatureState,
 )
+from eventcontracts.models import (
+    InProcessModelRunner,
+    ModelArtifact,
+)
 from eventcontracts.replay import NormalizedReplaySource
 from eventcontracts.risk import DailyLossLedger, SleeveRiskGate
 from eventcontracts.runner import StrategyRunner
@@ -96,6 +100,17 @@ def register(subparsers: Any) -> None:
         type=Path,
         default=None,
         help="Optional path to write the full BacktestReport as JSON.",
+    )
+    parser.add_argument(
+        "--model",
+        type=Path,
+        default=None,
+        action="append",
+        help=(
+            "Path to a model artifact JSON (as produced by `eventcontracts "
+            "train`). Pass multiple times to load several models; strategies "
+            "select by name via ctx.predict(model_name, ...)."
+        ),
     )
     parser.set_defaults(handler=_handle)
 
@@ -154,6 +169,7 @@ def run_backtest(
     end: datetime | None = None,
     feature_builder: DeterministicFeatureBuilder | None = None,
     feature_store: InMemoryFeatureStore | None = None,
+    model_runner: InProcessModelRunner | None = None,
 ) -> tuple[BacktestReport, RunSummary]:
     """Run one backtest in-process. Returns the report and run summary.
 
@@ -204,6 +220,7 @@ def run_backtest(
         strategy_id_value=strategy_spec.strategy_id,
         sleeve_id_value=sleeve_spec.sleeve_id,
         clock_now=clock.current,
+        model_runner=model_runner,
     )
 
     # Feature wiring: each emitted vector is persisted to the store and
@@ -266,9 +283,56 @@ def _parse_optional_datetime(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def _load_model_runner(model_paths: list[Path] | None) -> InProcessModelRunner | None:
+    """Build a runner from `--model` artifact paths.
+
+    Each artifact is verified against its on-disk sha256 before being
+    registered. Returns `None` when no model paths were passed.
+    """
+
+    if not model_paths:
+        return None
+    import json
+
+    runner = InProcessModelRunner()
+    for path in model_paths:
+        raw = path.read_text(encoding="utf-8").strip()
+        digest_bytes = raw.encode("utf-8")
+        from hashlib import sha256
+
+        digest = sha256(digest_bytes).hexdigest()
+        payload = json.loads(raw)
+        from eventcontracts.audit import audit_stamp_for
+        from eventcontracts.domain.ids import ModelName as _ModelName
+        from eventcontracts.domain.ids import ModelVersion as _ModelVersion
+
+        created_at = datetime.fromisoformat(
+            str(payload["created_at"]).replace("Z", "+00:00")
+        )
+        artifact = ModelArtifact(
+            name=_ModelName(str(payload["model_name"])),
+            version=_ModelVersion(str(payload["model_version"])),
+            uri=str(path.resolve()),
+            sha256=digest,
+            format=str(payload["kind"]),
+            created_at=created_at,
+            audit=audit_stamp_for(
+                payload,
+                object_id=f"model-artifact:{payload['model_name']}:{payload['model_version']}",
+                object_kind="model_artifact",
+                schema_version="model-artifact-v1",
+                produced_at=created_at,
+                producer="backtest_cli",
+            ),
+        )
+        runner.load(artifact)
+    return runner
+
+
 def _handle(args: argparse.Namespace) -> int:
     spec = load_strategy_spec(args.strategy)
     sleeve = load_sleeve_spec(args.sleeve)
+    model_runner = _load_model_runner(args.model)
     report, _summary = run_backtest(
         spec,
         sleeve,
@@ -278,6 +342,7 @@ def _handle(args: argparse.Namespace) -> int:
         starting_equity=args.starting_equity,
         start=_parse_optional_datetime(args.start),
         end=_parse_optional_datetime(args.end),
+        model_runner=model_runner,
     )
     payload = report.to_dict()
     rendered = json.dumps(payload, indent=2, default=str)

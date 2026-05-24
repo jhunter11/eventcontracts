@@ -24,6 +24,7 @@ from eventcontracts.domain.ids import (
 from eventcontracts.domain.models import InstrumentId, OutcomeSide
 from eventcontracts.domain.orders import Order
 from eventcontracts.domain.positions import CashBalance, Exposure, Position
+from eventcontracts.models.pipeline import ModelRunner
 from eventcontracts.runner.ports import RiskDecision
 from eventcontracts.strategy.context import StrategyContext
 
@@ -95,6 +96,7 @@ class InMemoryContext:
     open_order_list: list[Order] = field(default_factory=list)
     features: FeatureVector | None = None
     exposure_snapshot: Exposure | None = None
+    model_runner: ModelRunner | None = None
 
     @property
     def now(self) -> datetime:
@@ -153,8 +155,14 @@ class InMemoryContext:
         return self.features
 
     def predict(self, model_name: str, features: FeatureVector) -> Prediction:
-        # In-process placeholder: returns a constant prediction so that tests
-        # can wire the full path. Real contexts call the model loader.
+        """Delegate to the configured `model_runner`, if any.
+
+        When no runner is wired (legacy/test setups), returns a zero
+        prediction so callers can still exercise the code path.
+        """
+
+        if self.model_runner is not None:
+            return self.model_runner.predict(ModelName(model_name), features)
         return Prediction(
             model_name=ModelName(model_name),
             model_version=ModelVersion("inmemory"),

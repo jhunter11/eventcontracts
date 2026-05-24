@@ -20,6 +20,7 @@ from eventcontracts.cli import normalize as normalize_cmd
 from eventcontracts.cli import rank as rank_cmd
 from eventcontracts.cli import replay as replay_cmd
 from eventcontracts.cli import sweep as sweep_cmd
+from eventcontracts.cli import train as train_cmd
 from eventcontracts.cli import validate_bundle as validate_bundle_cmd
 from eventcontracts.config import (
     load_sleeve_spec,
@@ -77,6 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_cmd.register(subparsers)
     gen_windows_cmd.register(subparsers)
     rank_cmd.register(subparsers)
+    train_cmd.register(subparsers)
     validate_bundle_cmd.register(subparsers)
 
     return parser

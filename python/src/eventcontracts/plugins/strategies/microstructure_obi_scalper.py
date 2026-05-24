@@ -7,10 +7,24 @@ listens to `OrderBookEvent`, computes the L1 imbalance ratio, and emits a
 threshold. A `CancelOrder` with `CRITICAL` priority is emitted when an open
 order is on the wrong side of an adverse imbalance flip.
 
-Implementation note: the spec lists a LightGBM classifier. The model pipeline
-is still scaffolded, so this module runs in **rules mode**: imbalance ratio
-threshold drives the decision directly. Swap for `ctx.predict(...)` once the
-runner is implemented; decision shape (PlaceOrder/CancelOrder) is unchanged.
+Two operating modes are supported:
+
+* **Rules mode** (default): the L1 imbalance ratio compared against
+  ``imbalance_threshold`` / ``cancel_threshold`` drives the decision.
+  Useful before a model is trained, and as the determinism baseline.
+* **Model mode**: when ``StrategySpec.model`` is set and
+  ``StrategyContext.feature_vector()`` returns a vector, the strategy
+  calls ``ctx.predict(model_name, vector).value`` and routes:
+
+  - logistic-regression style predictions (output in ``[0, 1]``) above
+    ``model_long_threshold`` trigger a BUY, below ``model_cancel_threshold``
+    trigger a cancel.
+  - regression-style predictions (any sign) above
+    ``model_long_bps_threshold`` trigger a BUY, below the negative of the
+    same trigger a cancel.
+
+  The selection between the two is via the ``model_kind`` parameter
+  (``classification`` or ``regression``).
 """
 
 from __future__ import annotations
@@ -49,6 +63,17 @@ class MicrostructureObiScalperStrategy(StrategyBase):
         )
         self.clip_size = Decimal(str(spec.parameters.get("clip_size", "5")))
         self.max_spread_bps = Decimal(str(spec.parameters.get("max_spread_bps", "100")))
+        # Model-mode parameters; only used if spec.model is set.
+        self.model_kind = str(spec.parameters.get("model_kind", "classification"))
+        self.model_long_threshold = Decimal(
+            str(spec.parameters.get("model_long_threshold", "0.60"))
+        )
+        self.model_cancel_threshold = Decimal(
+            str(spec.parameters.get("model_cancel_threshold", "0.40"))
+        )
+        self.model_long_bps_threshold = Decimal(
+            str(spec.parameters.get("model_long_bps_threshold", "5"))
+        )
         self._open_buy_orders: dict[InstrumentId, ClientOrderId] = {}
 
     def on_event(
@@ -71,42 +96,86 @@ class MicrostructureObiScalperStrategy(StrategyBase):
         if spread_bps > self.max_spread_bps:
             return (NoAction(reason="ignored:spread_too_wide"),)
 
-        decisions: list[StrategyDecision] = []
+        # Prefer model mode if the spec declares a model and the context
+        # has a current feature vector; fall back to rules otherwise so a
+        # missing/unwarmed model never silently halts trading.
+        prediction = self._maybe_predict(ctx)
+        if prediction is not None:
+            return self._decide_from_prediction(book, prediction)
+        return self._decide_from_rules(book, imbalance)
+
+    def _maybe_predict(self, ctx: StrategyContext) -> float | None:
+        if self.spec.model is None:
+            return None
+        vector = ctx.feature_vector()
+        if vector is None:
+            return None
+        try:
+            return float(ctx.predict(str(self.spec.model.name), vector).value)
+        except KeyError:
+            # Model declared in spec but runner doesn't have it loaded —
+            # safer to fall back to rules than emit decisions on stale state.
+            return None
+
+    def _decide_from_rules(
+        self, book: OrderBook, imbalance: Decimal
+    ) -> Sequence[StrategyDecision]:
         existing = self._open_buy_orders.get(book.instrument_id)
-
         if imbalance >= self.imbalance_threshold:
-            best_bid = book.yes_bids[0].price if book.yes_bids else None
-            if best_bid is None:
-                return (NoAction(reason="censored:no_bid_for_placement"),)
-            coid = ClientOrderId(uuid4().hex)
-            self._open_buy_orders[book.instrument_id] = coid
-            decisions.append(
-                PlaceOrder(
-                    client_order_id=coid,
-                    instrument_id=book.instrument_id,
-                    outcome_side=OutcomeSide.YES,
-                    order_side=OrderSide.BUY,
-                    order_type=OrderType.LIMIT,
-                    time_in_force=TimeInForce.IOC,
-                    quantity=self.clip_size,
-                    price=best_bid,
-                    reason=f"obi_buy_imbalance_{imbalance:.2f}",
-                    priority=ExecutionPriority(tier=LatencyTier.FAST),
-                )
-            )
-        elif existing is not None and imbalance <= self.cancel_threshold:
-            decisions.append(
-                CancelOrder(
-                    client_order_id=existing,
-                    reason=f"obi_flip_imbalance_{imbalance:.2f}",
-                    priority=ExecutionPriority(tier=LatencyTier.CRITICAL),
-                )
-            )
-            self._open_buy_orders.pop(book.instrument_id, None)
+            return self._buy(book, reason=f"obi_buy_imbalance_{imbalance:.2f}")
+        if existing is not None and imbalance <= self.cancel_threshold:
+            return self._cancel(book, existing, reason=f"obi_flip_imbalance_{imbalance:.2f}")
+        return (NoAction(reason=f"no_signal_imbalance_{imbalance:.2f}"),)
 
-        if not decisions:
-            return (NoAction(reason=f"no_signal_imbalance_{imbalance:.2f}"),)
-        return tuple(decisions)
+    def _decide_from_prediction(
+        self, book: OrderBook, prediction: float
+    ) -> Sequence[StrategyDecision]:
+        existing = self._open_buy_orders.get(book.instrument_id)
+        if self.model_kind == "classification":
+            if Decimal(str(prediction)) >= self.model_long_threshold:
+                return self._buy(book, reason=f"model_p={prediction:.3f}")
+            if existing is not None and Decimal(str(prediction)) <= self.model_cancel_threshold:
+                return self._cancel(book, existing, reason=f"model_p={prediction:.3f}")
+            return (NoAction(reason=f"model_idle_p={prediction:.3f}"),)
+        # Regression: prediction is in bps; positive = up, negative = down.
+        if Decimal(str(prediction)) >= self.model_long_bps_threshold:
+            return self._buy(book, reason=f"model_bps={prediction:.1f}")
+        if existing is not None and Decimal(str(prediction)) <= -self.model_long_bps_threshold:
+            return self._cancel(book, existing, reason=f"model_bps={prediction:.1f}")
+        return (NoAction(reason=f"model_idle_bps={prediction:.1f}"),)
+
+    def _buy(self, book: OrderBook, *, reason: str) -> Sequence[StrategyDecision]:
+        best_bid = book.yes_bids[0].price if book.yes_bids else None
+        if best_bid is None:
+            return (NoAction(reason="censored:no_bid_for_placement"),)
+        coid = ClientOrderId(uuid4().hex)
+        self._open_buy_orders[book.instrument_id] = coid
+        return (
+            PlaceOrder(
+                client_order_id=coid,
+                instrument_id=book.instrument_id,
+                outcome_side=OutcomeSide.YES,
+                order_side=OrderSide.BUY,
+                order_type=OrderType.LIMIT,
+                time_in_force=TimeInForce.IOC,
+                quantity=self.clip_size,
+                price=best_bid,
+                reason=reason,
+                priority=ExecutionPriority(tier=LatencyTier.FAST),
+            ),
+        )
+
+    def _cancel(
+        self, book: OrderBook, existing: ClientOrderId, *, reason: str
+    ) -> Sequence[StrategyDecision]:
+        self._open_buy_orders.pop(book.instrument_id, None)
+        return (
+            CancelOrder(
+                client_order_id=existing,
+                reason=reason,
+                priority=ExecutionPriority(tier=LatencyTier.CRITICAL),
+            ),
+        )
 
 
 def _l1_quantities(book: OrderBook) -> tuple[Decimal, Decimal]:

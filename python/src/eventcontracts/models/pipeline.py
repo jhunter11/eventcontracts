@@ -68,18 +68,13 @@ class ModelArtifact:
         require_aware_datetime(self.created_at, "created_at")
 
 
-class ModelTrainer:
-    """Train financial/ML models from point-in-time features."""
-
-    def prepare_dataset(self, vectors: Sequence[FeatureVector]) -> TrainingDataset:
-        raise NotImplementedError
-
-    def train(self, dataset: TrainingDataset) -> TrainingRun:
-        raise NotImplementedError
-
-
 class ModelExporter:
-    """Export trained models to runtime artifacts and parity cases."""
+    """Export trained models to non-JSON runtime artifacts (e.g. ONNX).
+
+    Kept as a scaffold while the JSON artifact path in
+    :mod:`eventcontracts.models.artifacts` handles the common case. An
+    ONNX exporter is the next promotion step once Rust inference exists.
+    """
 
     def export_onnx(self, run: TrainingRun) -> ModelArtifact:
         raise NotImplementedError
@@ -89,7 +84,10 @@ class ModelExporter:
 
 
 class ModelRunner:
-    """Runtime inference boundary used by strategy contexts."""
+    """Runtime inference boundary used by strategy contexts.
+
+    Concrete implementation lives in :class:`eventcontracts.models.runner.InProcessModelRunner`.
+    """
 
     def load(self, artifact: ModelArtifact) -> None:
         raise NotImplementedError
@@ -99,7 +97,12 @@ class ModelRunner:
 
 
 class ModelRegistry:
-    """Track immutable model artifacts and promotion state."""
+    """Track immutable model artifacts and promotion state.
+
+    Concrete implementations live in
+    :class:`eventcontracts.models.registry.InMemoryModelRegistry` and
+    :class:`eventcontracts.models.registry.LocalFileModelRegistry`.
+    """
 
     def register(self, artifact: ModelArtifact) -> None:
         raise NotImplementedError
@@ -108,4 +111,10 @@ class ModelRegistry:
         raise NotImplementedError
 
     def promote(self, artifact: ModelArtifact, stage: str) -> None:
+        raise NotImplementedError
+
+    def current(self, name: ModelName, stage: str) -> ModelArtifact | None:
+        raise NotImplementedError
+
+    def list_versions(self, name: ModelName) -> Sequence[ModelVersion]:
         raise NotImplementedError
