@@ -1,0 +1,32 @@
+strategy_id = "sports-hole_by_hole_pin-v1"
+name = "sports_hole_by_hole_pin"
+version = "1.0.0"
+description = "Live in-play birdie taker: cross-references pin difficulty + drive yardage."
+feature_schema_id = "sports_hole_by_hole_features"
+
+[subscription]
+venues = ["polymarket_global", "kalshi"]
+instrument_patterns = ["*BIRDIE-HOLE*", "*NEXT-HOLE-BIRDIE*"]
+event_kinds = ["external", "quote"]
+external_sources = ["shotlink"]
+
+[default_execution_priority]
+tier = "fast"
+max_delay_ms = 20
+reason = "must beat manual bookmaker spread updates"
+
+[parameters]
+signal_source = "shotlink"
+min_edge_bps = "200"
+static_clip_size = "3"
+rules_distance_coef = "0.012"
+rules_sg_coef = "0.20"
+rules_pin_coef = "0.80"
+rules_lie_penalty = "0.15"
+venue = "polymarket_global"
+feature_schema_version = "v1"
+
+[tags]
+family = "sports"
+mode = "paper"
+research_doc = "docs/golf-strategy-specs.md#4"

@@ -65,6 +65,10 @@ STRATEGY_CONFIGS: tuple[str, ...] = (
     "politics-legislative-cascade.toml",
     "microstructure-queue-evader.toml",
     "macro-cpi-predictor.toml",
+    "sports-player-cut-lgbm.toml",
+    "sports-cut-line-shifter.toml",
+    "sports-frl-weather-arb.toml",
+    "sports-hole-by-hole-pin.toml",
 )
 
 SLEEVE_CONFIGS: tuple[str, ...] = (
@@ -79,6 +83,10 @@ SLEEVE_CONFIGS: tuple[str, ...] = (
     "politics-legislative-kalshi-paper-a.toml",
     "microstructure-queue-kalshi-paper-a.toml",
     "macro-cpi-kalshi-paper-a.toml",
+    "sports-kalshi-paper-a.toml",
+    "sports-cut-line-kalshi-paper-a.toml",
+    "sports-polymarket-paper-a.toml",
+    "sports-hole-by-hole-polymarket-paper-a.toml",
 )
 
 
@@ -397,6 +405,222 @@ def _cpi(strategy: Strategy, ctx: InMemoryContext) -> Sequence[StrategyDecision]
     return _dispatch(
         strategy,
         TimerEvent(event_id=EventId("cpi-timer"), timestamp=NOW, label="cpi_recompute"),
+        ctx,
+    )
+
+
+_GolfScenarioFn = Callable[[Strategy, InMemoryContext], Sequence[StrategyDecision]]
+_GolfScenario = tuple[str, dict[str, str], _GolfScenarioFn]
+
+
+GOLF_SCENARIOS: tuple[_GolfScenario, ...] = (
+    (
+        "sports-player-cut-lgbm.toml",
+        {"player_market_map": "scheffler:KX-PGA-SCHEFFLER-CUT"},
+        lambda strategy, ctx: _player_cut(strategy, ctx),
+    ),
+    (
+        "sports-cut-line-shifter.toml",
+        {
+            "bracket_market_map": (
+                "-2:KX-PGA-CUT-NEG2;-1:KX-PGA-CUT-NEG1;0:KX-PGA-CUT-ZERO"
+            ),
+        },
+        lambda strategy, ctx: _cut_line(strategy, ctx),
+    ),
+    (
+        "sports-frl-weather-arb.toml",
+        {"player_market_map": "scheffler:POLY-FRL-SCHEFFLER"},
+        lambda strategy, ctx: _frl_weather(strategy, ctx),
+    ),
+    (
+        "sports-hole-by-hole-pin.toml",
+        {},
+        lambda strategy, ctx: _hole_by_hole(strategy, ctx),
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("config_name", "param_overrides", "scenario"),
+    GOLF_SCENARIOS,
+    ids=[config_name for config_name, _, _ in GOLF_SCENARIOS],
+)
+def test_golf_strategy_specs_emit_smoke_decisions(
+    config_name: str,
+    param_overrides: dict[str, str],
+    scenario: Callable[[Strategy, InMemoryContext], Sequence[StrategyDecision]],
+) -> None:
+    """Golf strategies ship with empty operator-supplied maps; we inject
+    a minimal roster here so the smoke scenario can fire."""
+
+    import dataclasses
+
+    spec = load_strategy_spec(CONFIGS / "strategies" / config_name)
+    if param_overrides:
+        merged = dict(spec.parameters)
+        merged.update(param_overrides)
+        spec = dataclasses.replace(spec, parameters=merged)
+    strategy = create_from_spec(spec)
+    ctx = InMemoryContext(
+        strategy_id_value=spec.strategy_id,
+        sleeve_id_value=SleeveId("test-sleeve"),
+        clock_now=NOW,
+    )
+
+    decisions = scenario(strategy, ctx)
+
+    assert decisions
+    assert not all(isinstance(decision, NoAction) for decision in decisions)
+
+
+def _player_cut(strategy: Strategy, ctx: InMemoryContext) -> Sequence[StrategyDecision]:
+    market_id = "KX-PGA-SCHEFFLER-CUT"
+    _dispatch(strategy, _quote_event(_instrument(market_id), bid="0.40", ask="0.42"), ctx)
+    _dispatch(
+        strategy,
+        ExternalSignalEvent(
+            event_id=EventId("cut-signal"),
+            source="datagolf",
+            exchange_ts=NOW,
+            received_at=NOW,
+            schema_version="datagolf-sg-v1",
+            payload={
+                "player_id": "scheffler",
+                "strokes_to_cut": "-1",
+                "sg_approach": "2.0",
+                "sg_putting": "-1.5",
+                "wave_weather_delta": "0.1",
+            },
+        ),
+        ctx,
+    )
+    return _dispatch(
+        strategy,
+        TimerEvent(
+            event_id=EventId("cut-timer"),
+            timestamp=NOW,
+            label="player_round_complete",
+        ),
+        ctx,
+    )
+
+
+def _cut_line(strategy: Strategy, ctx: InMemoryContext) -> Sequence[StrategyDecision]:
+    for market_id, bid, ask in (
+        ("KX-PGA-CUT-NEG2", "0.05", "0.07"),
+        ("KX-PGA-CUT-NEG1", "0.10", "0.12"),
+        ("KX-PGA-CUT-ZERO", "0.15", "0.17"),
+    ):
+        _dispatch(
+            strategy,
+            _quote_event(_instrument(market_id), bid=bid, ask=ask, event_id=f"q-{market_id}"),
+            ctx,
+        )
+    _dispatch(
+        strategy,
+        ExternalSignalEvent(
+            event_id=EventId("cut-line-signal"),
+            source="pga-tour",
+            exchange_ts=NOW,
+            received_at=NOW,
+            schema_version="pga-aggregate-v1",
+            payload={
+                "field_scoring_avg_delta_vs_par": "1.0",
+                "afternoon_wind_forecast_mph": "18",
+                "top_65_current_score": "-2",
+            },
+        ),
+        ctx,
+    )
+    return _dispatch(
+        strategy,
+        TimerEvent(
+            event_id=EventId("cut-line-timer"),
+            timestamp=NOW,
+            label="cut_line_recompute",
+        ),
+        ctx,
+    )
+
+
+def _frl_weather(strategy: Strategy, ctx: InMemoryContext) -> Sequence[StrategyDecision]:
+    market_id = "POLY-FRL-SCHEFFLER"
+    _dispatch(
+        strategy,
+        QuoteEvent(
+            event_id=EventId("frl-quote"),
+            quote=Quote(
+                instrument_id=InstrumentId(venue=Venue.POLYMARKET_GLOBAL, market_id=market_id),
+                side=OutcomeSide.YES,
+                bid=OrderBookLevel(price=Decimal("0.005"), quantity=Decimal("100")),
+                ask=OrderBookLevel(price=Decimal("0.007"), quantity=Decimal("100")),
+                exchange_ts=NOW,
+                received_at=NOW,
+            ),
+        ),
+        ctx,
+    )
+    return _dispatch(
+        strategy,
+        ExternalSignalEvent(
+            event_id=EventId("frl-signal"),
+            source="weather_tee_combined",
+            exchange_ts=NOW,
+            received_at=NOW,
+            schema_version="frl-wave-v1",
+            payload={
+                "am_wave_wind_mph": "5",
+                "pm_wave_wind_mph": "25",
+                "players": [
+                    {
+                        "player_id": "scheffler",
+                        "market_id": market_id,
+                        "wave": "am",
+                        "wind_sg_baseline": "1.2",
+                    }
+                ],
+            },
+        ),
+        ctx,
+    )
+
+
+def _hole_by_hole(strategy: Strategy, ctx: InMemoryContext) -> Sequence[StrategyDecision]:
+    market_id = "POLY-BIRDIE-HOLE7-MORIKAWA"
+    _dispatch(
+        strategy,
+        QuoteEvent(
+            event_id=EventId("hbh-quote"),
+            quote=Quote(
+                instrument_id=InstrumentId(venue=Venue.POLYMARKET_GLOBAL, market_id=market_id),
+                side=OutcomeSide.YES,
+                bid=OrderBookLevel(price=Decimal("0.10"), quantity=Decimal("100")),
+                ask=OrderBookLevel(price=Decimal("0.12"), quantity=Decimal("100")),
+                exchange_ts=NOW,
+                received_at=NOW,
+            ),
+        ),
+        ctx,
+    )
+    return _dispatch(
+        strategy,
+        ExternalSignalEvent(
+            event_id=EventId("shotlink-drive"),
+            source="shotlink",
+            exchange_ts=NOW,
+            received_at=NOW,
+            schema_version="shotlink-shot-v1",
+            payload={
+                "player_id": "morikawa",
+                "market_id": market_id,
+                "hole_event_token": "shot-12345",
+                "distance_to_pin_yards": 110,
+                "pin_difficulty_index": 0.35,
+                "player_sg_approach_from_distance": 1.5,
+                "lie": "fairway",
+            },
+        ),
         ctx,
     )
 

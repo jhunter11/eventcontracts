@@ -1,0 +1,18 @@
+sleeve_id = "sports-kalshi-paper-a"
+strategy_id = "sports-player_cut_lgbm-v1"
+strategy_version = "1.0.0"
+venue = "kalshi"
+capital_allocation = "10000"
+currency = "USD"
+
+[risk]
+max_order_notional = "500"
+max_position_notional = "2500"
+max_daily_loss = "500"
+max_open_orders = 30
+max_gross_exposure = "5000"
+currency = "USD"
+
+[tags]
+mode = "paper"
+family = "sports"

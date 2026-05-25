@@ -1,0 +1,34 @@
+strategy_id = "sports-cut_line_shifter-v1"
+name = "sports_cut_line_shifter"
+version = "1.0.0"
+description = "Bayesian cut-line PMF strategy that fades stale brackets late Friday."
+feature_schema_id = "sports_cut_line_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KX-PGA-*-CUT-*"]
+event_kinds = ["external", "timer", "quote"]
+external_sources = ["pga-tour", "open-meteo"]
+
+[default_execution_priority]
+tier = "standard"
+
+[parameters]
+# `bracket_market_map`: semicolon-separated `cut_line:market_id` pairs.
+bracket_market_map = ""
+signal_source = "pga-tour"
+timer_label = "cut_line_recompute"
+min_edge_bps = "150"
+size = "5"
+max_orders_per_timer = 3
+historical_course_cut_avg = "-1.2"
+field_alpha = "1.0"
+wind_beta = "0.04"
+pmf_stddev = "1.2"
+venue = "kalshi"
+feature_schema_version = "v1"
+
+[tags]
+family = "sports"
+mode = "paper"
+research_doc = "docs/golf-strategy-specs.md#2"

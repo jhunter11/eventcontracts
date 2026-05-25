@@ -1,0 +1,32 @@
+strategy_id = "sports-frl_weather_arb-v1"
+name = "sports_frl_weather_arb"
+version = "1.0.0"
+description = "First-Round Leader wave arbitrage exploiting morning/afternoon wind asymmetry."
+feature_schema_id = "sports_frl_weather_features"
+
+[subscription]
+venues = ["polymarket_global", "kalshi"]
+instrument_patterns = ["*FRL*", "*FIRST-ROUND-LEADER*"]
+event_kinds = ["external", "quote"]
+external_sources = ["weather_tee_combined", "open-meteo"]
+
+[default_execution_priority]
+tier = "relaxed"
+reason = "fired once Thursday morning; long realization window"
+
+[parameters]
+# `player_market_map`: semicolon-separated `player_id:market_id` pairs.
+player_market_map = ""
+signal_source = "weather_tee_combined"
+field_size = 156
+wind_penalty_strokes_per_mph = "0.05"
+wind_sg_baseline_weight = "0.02"
+min_edge_bps = "150"
+size = "5"
+venue = "polymarket_global"
+feature_schema_version = "v1"
+
+[tags]
+family = "sports"
+mode = "paper"
+research_doc = "docs/golf-strategy-specs.md#3"

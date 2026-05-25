@@ -1,0 +1,18 @@
+sleeve_id = "sports-hole-by-hole-polymarket-paper-a"
+strategy_id = "sports-hole_by_hole_pin-v1"
+strategy_version = "1.0.0"
+venue = "polymarket_global"
+capital_allocation = "3000"
+currency = "USD"
+
+[risk]
+max_order_notional = "100"
+max_position_notional = "500"
+max_daily_loss = "150"
+max_open_orders = 100
+max_gross_exposure = "1000"
+currency = "USD"
+
+[tags]
+mode = "paper"
+family = "sports"
