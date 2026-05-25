@@ -1,0 +1,32 @@
+strategy_id = "crypto-terminal_drift_tracker-v1"
+name = "crypto_terminal_drift_tracker"
+version = "1.0.0"
+description = "Terminal-window stale-quote pickoff on Kalshi 15-min crypto markets."
+feature_schema_id = "crypto_terminal_drift_tracker_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXBTCD*", "KXETHD*", "KXSOLD*"]
+event_kinds = ["quote", "external", "timer"]
+external_sources = ["binance"]
+
+[default_execution_priority]
+tier = "fast"
+max_delay_ms = 50
+expires_after_ms = 300
+reason = "stale-quote pickoff inside the terminal window"
+
+[parameters]
+strike_market_map = ""
+terminal_window_seconds = "60"
+min_terminal_edge = "0.05"
+min_realized_samples = "30"
+size = "5"
+spot_source = "binance"
+timer_label = "crypto_terminal_check"
+venue = "kalshi"
+
+[tags]
+family = "crypto"
+mode = "paper"
+research_doc = "docs/strategy-specs.md#crypto-15min"

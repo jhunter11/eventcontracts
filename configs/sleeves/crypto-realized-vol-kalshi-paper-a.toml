@@ -1,0 +1,18 @@
+sleeve_id = "crypto-realized-vol-kalshi-paper-a"
+strategy_id = "crypto-realized_vol_regime-v1"
+strategy_version = "1.0.0"
+venue = "kalshi"
+capital_allocation = "5000"
+currency = "USD"
+
+[risk]
+max_order_notional = "200"
+max_position_notional = "2000"
+max_daily_loss = "400"
+max_open_orders = 50
+max_gross_exposure = "2500"
+currency = "USD"
+
+[tags]
+mode = "paper"
+family = "crypto"

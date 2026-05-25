@@ -1,0 +1,33 @@
+strategy_id = "crypto-vol_surface_mispricer-v1"
+name = "crypto_vol_surface_mispricer"
+version = "1.0.0"
+description = "Black-Scholes mispricing using Deribit ATM IV vs Kalshi 15-min crypto strikes."
+feature_schema_id = "crypto_vol_surface_mispricer_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXBTCD*", "KXETHD*", "KXSOLD*"]
+event_kinds = ["quote", "external"]
+external_sources = ["binance", "deribit"]
+
+[default_execution_priority]
+tier = "standard"
+max_delay_ms = 250
+expires_after_ms = 60000
+reason = "model-driven sized entries; passive resting acceptable"
+
+[parameters]
+# Operator-supplied per-strike roster; semicolon-separated
+# `market_id:strike` entries. Strike in same units as spot.
+strike_market_map = ""
+twap_window_seconds = "60"
+min_edge_bps = "75"
+size = "5"
+spot_source = "binance"
+vol_source = "deribit"
+venue = "kalshi"
+
+[tags]
+family = "crypto"
+mode = "paper"
+research_doc = "docs/strategy-specs.md#crypto-15min"

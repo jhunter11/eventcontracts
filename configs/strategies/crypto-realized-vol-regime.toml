@@ -1,0 +1,34 @@
+strategy_id = "crypto-realized_vol_regime-v1"
+name = "crypto_realized_vol_regime"
+version = "1.0.0"
+description = "Trade Kalshi 15-min wide-tail brackets when realized vol diverges from Kalshi-implied."
+feature_schema_id = "crypto_realized_vol_regime_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXBTCD*", "KXETHD*", "KXSOLD*"]
+event_kinds = ["quote", "external"]
+external_sources = ["binance"]
+
+[default_execution_priority]
+tier = "standard"
+max_delay_ms = 250
+expires_after_ms = 60000
+reason = "regime trade; passive resting acceptable"
+
+[parameters]
+# Tail brackets the strategy directionally trades.
+tail_market_map = ""
+# ATM bracket used to back out Kalshi-implied vol.
+atm_strike = "100000"
+atm_market_id = ""
+min_vol_edge = "0.10"
+rv_window_samples = "600"
+size = "3"
+spot_source = "binance"
+venue = "kalshi"
+
+[tags]
+family = "crypto"
+mode = "paper"
+research_doc = "docs/strategy-specs.md#crypto-15min"

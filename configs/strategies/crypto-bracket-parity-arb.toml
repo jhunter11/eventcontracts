@@ -1,0 +1,37 @@
+strategy_id = "crypto-bracket_parity_arb-v1"
+name = "crypto_bracket_parity_arb"
+version = "1.0.0"
+description = "Sum-of-brackets parity arbitrage on Kalshi 15-min crypto markets."
+feature_schema_id = "crypto_bracket_parity_arb_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXBTCD*", "KXETHD*", "KXSOLD*"]
+event_kinds = ["quote"]
+external_sources = []
+
+[default_execution_priority]
+tier = "standard"
+max_delay_ms = 200
+expires_after_ms = 30000
+reason = "multi-leg arb; passive resting acceptable"
+
+[parameters]
+# Operator-supplied bracket roster; semicolon-separated
+# `market_id:lower_strike:upper_strike` entries that together form a
+# disjoint, exhaustive partition for one expiry. Use `-inf` / `inf` for
+# the unbounded tails. Example for BTC 14:15 UTC on 2026-01-15:
+#   KXBTCD-26JAN1514-T100K:-inf:100000;\
+#   KXBTCD-26JAN1514-100K-105K:100000:105000;\
+#   KXBTCD-26JAN1514-105K-110K:105000:110000;\
+#   KXBTCD-26JAN1514-T110K:110000:inf
+bracket_market_ids = ""
+min_parity_edge = "0.015"
+size = "5"
+max_spread_bps = "500"
+venue = "kalshi"
+
+[tags]
+family = "crypto"
+mode = "paper"
+research_doc = "docs/strategy-specs.md#crypto-15min"

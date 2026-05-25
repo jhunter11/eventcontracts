@@ -1,0 +1,29 @@
+strategy_id = "crypto-cross_strike_skew_arb-v1"
+name = "crypto_cross_strike_skew_arb"
+version = "1.0.0"
+description = "Butterfly violation hunter across Kalshi 15-min crypto strike grid."
+feature_schema_id = "crypto_cross_strike_skew_arb_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXBTCD*", "KXETHD*", "KXSOLD*"]
+event_kinds = ["quote"]
+external_sources = []
+
+[default_execution_priority]
+tier = "standard"
+max_delay_ms = 200
+expires_after_ms = 30000
+reason = "two-leg arb; passive resting acceptable"
+
+[parameters]
+strike_market_map = ""
+min_skew_edge = "0.01"
+max_spread_bps = "500"
+size = "3"
+venue = "kalshi"
+
+[tags]
+family = "crypto"
+mode = "paper"
+research_doc = "docs/strategy-specs.md#crypto-15min"

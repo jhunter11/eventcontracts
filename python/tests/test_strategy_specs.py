@@ -69,6 +69,11 @@ STRATEGY_CONFIGS: tuple[str, ...] = (
     "sports-cut-line-shifter.toml",
     "sports-frl-weather-arb.toml",
     "sports-hole-by-hole-pin.toml",
+    "crypto-bracket-parity-arb.toml",
+    "crypto-vol-surface-mispricer.toml",
+    "crypto-terminal-drift-tracker.toml",
+    "crypto-realized-vol-regime.toml",
+    "crypto-cross-strike-skew-arb.toml",
 )
 
 SLEEVE_CONFIGS: tuple[str, ...] = (
@@ -87,6 +92,11 @@ SLEEVE_CONFIGS: tuple[str, ...] = (
     "sports-cut-line-kalshi-paper-a.toml",
     "sports-polymarket-paper-a.toml",
     "sports-hole-by-hole-polymarket-paper-a.toml",
+    "crypto-bracket-parity-kalshi-paper-a.toml",
+    "crypto-vol-surface-kalshi-paper-a.toml",
+    "crypto-terminal-drift-kalshi-paper-a.toml",
+    "crypto-realized-vol-kalshi-paper-a.toml",
+    "crypto-skew-arb-kalshi-paper-a.toml",
 )
 
 
@@ -441,6 +451,93 @@ GOLF_SCENARIOS: tuple[_GolfScenario, ...] = (
 )
 
 
+CRYPTO_SCENARIOS: tuple[_GolfScenario, ...] = (
+    (
+        "crypto-bracket-parity-arb.toml",
+        {
+            "bracket_market_ids": (
+                "BTCD-LO:-inf:100000;BTCD-MID:100000:105000;BTCD-HI:105000:inf"
+            ),
+            # Mids that sum to 1.05 → triggers a sell-all action.
+            "min_parity_edge": "0.03",
+            "max_spread_bps": "1000",
+        },
+        lambda strategy, ctx: _crypto_parity(strategy, ctx),
+    ),
+    (
+        "crypto-vol-surface-mispricer.toml",
+        {
+            "strike_market_map": "BTCD-K100K:100000",
+            "twap_window_seconds": "60",
+            "min_edge_bps": "100",
+        },
+        lambda strategy, ctx: _crypto_vol_surface(strategy, ctx),
+    ),
+    (
+        "crypto-terminal-drift-tracker.toml",
+        {
+            "strike_market_map": "BTCD-K100K:100000",
+            "terminal_window_seconds": "120",
+            "min_realized_samples": "5",
+            "min_terminal_edge": "0.05",
+        },
+        lambda strategy, ctx: _crypto_terminal(strategy, ctx),
+    ),
+    (
+        "crypto-realized-vol-regime.toml",
+        {
+            "tail_market_map": "BTCD-K105K:105000;BTCD-K95K:95000",
+            "atm_market_id": "BTCD-K100K",
+            "atm_strike": "100000",
+            "rv_window_samples": "5",
+            "min_vol_edge": "0.05",
+        },
+        lambda strategy, ctx: _crypto_realized_vol(strategy, ctx),
+    ),
+    (
+        "crypto-cross-strike-skew-arb.toml",
+        {
+            "strike_market_map": "BTCD-K100K:100000;BTCD-K101K:101000",
+            "min_skew_edge": "0.01",
+        },
+        lambda strategy, ctx: _crypto_skew(strategy, ctx),
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("config_name", "param_overrides", "scenario"),
+    CRYPTO_SCENARIOS,
+    ids=[config_name for config_name, _, _ in CRYPTO_SCENARIOS],
+)
+def test_crypto_strategy_specs_emit_smoke_decisions(
+    config_name: str,
+    param_overrides: dict[str, str],
+    scenario: Callable[[Strategy, InMemoryContext], Sequence[StrategyDecision]],
+) -> None:
+    """Crypto strategies ship with empty operator-supplied roster strings;
+    each scenario injects a minimal roster + tightened thresholds so the
+    smoke path actually fires a decision."""
+
+    import dataclasses
+
+    spec = load_strategy_spec(CONFIGS / "strategies" / config_name)
+    merged = dict(spec.parameters)
+    merged.update(param_overrides)
+    spec = dataclasses.replace(spec, parameters=merged)
+    strategy = create_from_spec(spec)
+    ctx = InMemoryContext(
+        strategy_id_value=spec.strategy_id,
+        sleeve_id_value=SleeveId("test-sleeve"),
+        clock_now=NOW,
+    )
+
+    decisions = scenario(strategy, ctx)
+
+    assert decisions
+    assert not all(isinstance(decision, NoAction) for decision in decisions)
+
+
 @pytest.mark.parametrize(
     ("config_name", "param_overrides", "scenario"),
     GOLF_SCENARIOS,
@@ -621,6 +718,139 @@ def _hole_by_hole(strategy: Strategy, ctx: InMemoryContext) -> Sequence[Strategy
                 "lie": "fairway",
             },
         ),
+        ctx,
+    )
+
+
+def _crypto_parity(strategy: Strategy, ctx: InMemoryContext) -> Sequence[StrategyDecision]:
+    """Quotes summing to 1.05 should force a sell-all (buy NO on each bracket)."""
+
+    _dispatch(strategy, _quote_event(_instrument("BTCD-LO"), bid="0.34", ask="0.36", event_id="lo"), ctx)
+    _dispatch(strategy, _quote_event(_instrument("BTCD-MID"), bid="0.34", ask="0.36", event_id="mid"), ctx)
+    # Final quote brings sum mid to 0.35 + 0.35 + 0.35 = 1.05 → +0.05 parity dev.
+    return _dispatch(
+        strategy,
+        _quote_event(_instrument("BTCD-HI"), bid="0.34", ask="0.36", event_id="hi"),
+        ctx,
+    )
+
+
+def _crypto_vol_surface(strategy: Strategy, ctx: InMemoryContext) -> Sequence[StrategyDecision]:
+    """Deribit IV of 60% on a 15-min ATM strike implies ~50% — well above a 30% Kalshi mid."""
+
+    from datetime import timedelta
+
+    expiry = NOW + timedelta(minutes=15)
+    _dispatch(
+        strategy,
+        ExternalSignalEvent(
+            event_id=EventId("crypto-spot"),
+            source="binance",
+            exchange_ts=NOW,
+            received_at=NOW,
+            schema_version="binance-spot-v1",
+            payload={"last_price": "100000"},
+        ),
+        ctx,
+    )
+    _dispatch(
+        strategy,
+        ExternalSignalEvent(
+            event_id=EventId("crypto-vol"),
+            source="deribit",
+            exchange_ts=NOW,
+            received_at=NOW,
+            schema_version="deribit-iv-v1",
+            payload={
+                "atm_iv": "0.60",
+                "expiry_iso": expiry.isoformat(),
+            },
+        ),
+        ctx,
+    )
+    return _dispatch(
+        strategy,
+        _quote_event(_instrument("BTCD-K100K"), bid="0.28", ask="0.32", event_id="bs-quote"),
+        ctx,
+    )
+
+
+def _crypto_terminal(strategy: Strategy, ctx: InMemoryContext) -> Sequence[StrategyDecision]:
+    """Inside the terminal window with spot well above strike → fire YES."""
+
+    from datetime import timedelta
+
+    expiry = NOW + timedelta(seconds=60)
+    # Feed 8 spot ticks well above strike to build a realized-vol history.
+    for i, price in enumerate(("101000", "101010", "101020", "101030", "101015", "101020", "101025", "101030")):
+        _dispatch(
+            strategy,
+            ExternalSignalEvent(
+                event_id=EventId(f"crypto-spot-{i}"),
+                source="binance",
+                exchange_ts=NOW,
+                received_at=NOW,
+                schema_version="binance-spot-v1",
+                payload={
+                    "last_price": price,
+                    "expiry_iso": expiry.isoformat(),
+                },
+            ),
+            ctx,
+        )
+    # Kalshi mid at 0.50 even though spot is already $1k above strike.
+    _dispatch(
+        strategy,
+        _quote_event(_instrument("BTCD-K100K"), bid="0.48", ask="0.52", event_id="terminal-quote"),
+        ctx,
+    )
+    return _dispatch(
+        strategy,
+        TimerEvent(event_id=EventId("crypto-terminal-timer"), timestamp=NOW, label="crypto_terminal_check"),
+        ctx,
+    )
+
+
+def _crypto_realized_vol(strategy: Strategy, ctx: InMemoryContext) -> Sequence[StrategyDecision]:
+    """Spot history with a large jump → high realized vol vs a calm Kalshi ATM mid."""
+
+    from datetime import timedelta
+
+    expiry = NOW + timedelta(minutes=15)
+    # Five ticks with a big jump → realized vol spikes well above any Kalshi-implied vol.
+    for i, price in enumerate(("100000", "100500", "99500", "100400", "99600")):
+        _dispatch(
+            strategy,
+            ExternalSignalEvent(
+                event_id=EventId(f"vol-spot-{i}"),
+                source="binance",
+                exchange_ts=NOW,
+                received_at=NOW,
+                schema_version="binance-spot-v1",
+                payload={
+                    "last_price": price,
+                    "expiry_iso": expiry.isoformat(),
+                },
+            ),
+            ctx,
+        )
+    # ATM bracket is calm (mid ~0.50), tail brackets are quoted.
+    _dispatch(strategy, _quote_event(_instrument("BTCD-K100K"), bid="0.49", ask="0.51", event_id="atm-q"), ctx)
+    _dispatch(strategy, _quote_event(_instrument("BTCD-K95K"), bid="0.94", ask="0.96", event_id="lo-q"), ctx)
+    return _dispatch(
+        strategy,
+        _quote_event(_instrument("BTCD-K105K"), bid="0.04", ask="0.06", event_id="hi-q"),
+        ctx,
+    )
+
+
+def _crypto_skew(strategy: Strategy, ctx: InMemoryContext) -> Sequence[StrategyDecision]:
+    """Higher strike (K101K) quoted higher than lower strike (K100K) → butterfly violation."""
+
+    _dispatch(strategy, _quote_event(_instrument("BTCD-K100K"), bid="0.40", ask="0.42", event_id="lo-strike"), ctx)
+    return _dispatch(
+        strategy,
+        _quote_event(_instrument("BTCD-K101K"), bid="0.50", ask="0.52", event_id="hi-strike"),
         ctx,
     )
 

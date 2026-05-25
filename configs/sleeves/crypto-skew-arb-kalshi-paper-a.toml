@@ -1,0 +1,18 @@
+sleeve_id = "crypto-skew-arb-kalshi-paper-a"
+strategy_id = "crypto-cross_strike_skew_arb-v1"
+strategy_version = "1.0.0"
+venue = "kalshi"
+capital_allocation = "3000"
+currency = "USD"
+
+[risk]
+max_order_notional = "100"
+max_position_notional = "500"
+max_daily_loss = "150"
+max_open_orders = 50
+max_gross_exposure = "1000"
+currency = "USD"
+
+[tags]
+mode = "paper"
+family = "crypto"

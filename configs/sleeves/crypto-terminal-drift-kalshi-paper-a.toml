@@ -1,0 +1,18 @@
+sleeve_id = "crypto-terminal-drift-kalshi-paper-a"
+strategy_id = "crypto-terminal_drift_tracker-v1"
+strategy_version = "1.0.0"
+venue = "kalshi"
+capital_allocation = "3000"
+currency = "USD"
+
+[risk]
+max_order_notional = "150"
+max_position_notional = "750"
+max_daily_loss = "200"
+max_open_orders = 25
+max_gross_exposure = "1000"
+currency = "USD"
+
+[tags]
+mode = "paper"
+family = "crypto"
