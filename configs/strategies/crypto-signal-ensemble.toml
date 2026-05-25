@@ -1,0 +1,46 @@
+strategy_id = "crypto-signal_ensemble-v1"
+name = "crypto_signal_ensemble"
+version = "1.0.0"
+description = "Confluence-based BUY/SELL/HOLD aggregator over five crypto signal sources."
+feature_schema_id = "crypto_signal_ensemble_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXBTCD*", "KXETHD*", "KXSOLD*"]
+event_kinds = ["quote", "external", "timer"]
+external_sources = ["binance", "deribit"]
+
+[default_execution_priority]
+tier = "standard"
+max_delay_ms = 250
+expires_after_ms = 30000
+reason = "confluence trade; multi-source aggregation is the edge"
+
+[parameters]
+# Operator-supplied roster strings; mirror the underlying-strategy
+# configs so all five signal sources have inputs.
+bracket_market_ids = ""
+strike_market_map = ""
+tail_market_map = ""
+atm_market_id = ""
+atm_strike = "0"
+
+enabled_sources = "parity,vol_surface,terminal,regime,skew"
+weights = "parity:1.0;vol_surface:1.0;terminal:0.8;regime:0.6;skew:1.0"
+min_combined_edge_bps = "50"
+min_confluence = "2"
+size = "5"
+max_spread_bps = "500"
+terminal_window_seconds = "60"
+terminal_min_realized_samples = "30"
+rv_window_samples = "600"
+twap_window_seconds = "60"
+timer_label = "crypto_ensemble_evaluate"
+spot_source = "binance"
+vol_source = "deribit"
+venue = "kalshi"
+
+[tags]
+family = "crypto"
+mode = "paper"
+research_doc = "docs/crypto-15min-strategies.md#ensemble"

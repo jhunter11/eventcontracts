@@ -266,6 +266,73 @@ adverse selection compounds.
 
 ---
 
+## 6. Signal Ensemble (Meta-Strategy)
+
+**Strategy ID**: `crypto-signal_ensemble-v1`
+
+**Module**: `python/src/eventcontracts/plugins/strategies/crypto_signal_ensemble.py`
+
+**Hypothesis**: Each of the five strategies above attacks a different
+mispricing regime and produces a structured signal (instrument, side,
+edge, confidence). A confluence-based aggregator that only fires when
+two or more independent sources agree on the same instrument and the
+weighted net edge clears a threshold trades less, but every trade has
+a higher Sharpe-after-fees than any single source.
+
+**Game theory**: The five underlying signal sources are deliberately
+non-overlapping in the *types* of edge they extract (no-arbitrage,
+external-data calibration, latency, regime, butterfly). Two of them
+agreeing on the same instrument is therefore strong evidence — the
+joint probability of an accidental coincidence is much lower than the
+per-source false-positive rate. The ensemble degrades gracefully when
+any one source is unavailable (no upstream data, market paused) since
+the others still contribute.
+
+**Architecture**:
+
+```
+Signal {instrument_id, side, edge_bps, confidence, source}
+  ↓
+combine_signals: weighted Σ(edge_bps × confidence × sign(side)) per instrument
+  ↓
+EnsembleVerdict {side, net_edge_bps, contributing_sources}
+  ↓
+PlaceOrder on dominant side (+ Alert with per-source breakdown)
+```
+
+**Feature inputs**: union of every underlying source — `QuoteEvent`,
+`ExternalSignalEvent(binance|deribit)`, `TimerEvent`.
+
+**Policy**:
+
+```
+for each instrument with >= min_confluence contributing sources:
+    net = Σ weight[source] * edge_bps * confidence * sign(side)
+    if |net| > min_combined_edge_bps:
+        PlaceOrder on sign(net)
+    else:
+        NoAction (HOLD verdict, Alert with breakdown)
+```
+
+**Sizing**: Constant `size` per fired order; future enhancement can
+scale by `|net_edge_bps|`.
+
+**Sleeve**: `crypto-signal-ensemble-kalshi-paper-a`.
+
+**Synthetic backtest harness**:
+:mod:`eventcontracts.crypto.synthetic` generates deterministic 15-min
+event streams with two configurable mispricings (uniform parity bump,
+single-strike skew bump). Six tests in
+`tests/test_crypto_synthetic_backtest.py` validate the ensemble's
+behavior on fair vs mispriced regimes including replay determinism.
+
+**Live Deribit demo**:
+`scripts/run_ensemble_demo.py` pulls the live BTC ATM IV from
+Deribit's public REST API, seeds the synthetic generator with it,
+and runs the ensemble end-to-end. Use the `EVENTCONTRACTS_INSECURE_TLS=1`
+env var in research VMs whose system clock is far enough in the future
+for Deribit's certificate to appear "not yet valid".
+
 ## Promotion Checklist
 
 Each crypto strategy must clear the standard researcher-guide gates

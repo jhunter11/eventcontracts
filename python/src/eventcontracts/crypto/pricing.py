@@ -33,6 +33,42 @@ def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
+def bs_above_probability_unclipped(
+    *,
+    spot: Decimal,
+    strike: Decimal,
+    sigma_annual: Decimal,
+    tau_seconds: Decimal,
+    twap_window_seconds: Decimal = Decimal("0"),
+) -> Decimal:
+    """Same as :func:`bs_above_probability` but **without** the [0.0001,
+    0.9999] clip.
+
+    Use this when you need exact bracket math (e.g. the synthetic data
+    generator computes per-bracket probabilities as the difference of
+    two CDF values, and clipping the inputs breaks parity). Strategies
+    should keep using :func:`bs_above_probability` so they never emit
+    boundary-degenerate orders.
+    """
+
+    if spot <= 0 or strike <= 0 or sigma_annual <= 0:
+        return Decimal("0.5")
+
+    spot_f = float(spot)
+    strike_f = float(strike)
+    sigma_f = float(sigma_annual)
+
+    seconds_per_year = 365.25 * 24 * 60 * 60
+    tau = max(1.0, float(tau_seconds)) / seconds_per_year
+    twap_correction = max(0.0, float(twap_window_seconds)) / 3.0 / seconds_per_year
+    effective_tau = max(tau - twap_correction, 1.0 / seconds_per_year)
+
+    vol_root = sigma_f * math.sqrt(effective_tau)
+    d2 = (math.log(spot_f / strike_f) - 0.5 * sigma_f * sigma_f * effective_tau) / vol_root
+    prob = _norm_cdf(d2)
+    return Decimal(str(prob))
+
+
 def bs_above_probability(
     *,
     spot: Decimal,
@@ -72,22 +108,15 @@ def bs_above_probability(
         degenerate orders at the boundary.
     """
 
-    if spot <= 0 or strike <= 0 or sigma_annual <= 0:
-        return Decimal("0.5")
-
-    spot_f = float(spot)
-    strike_f = float(strike)
-    sigma_f = float(sigma_annual)
-
-    seconds_per_year = 365.25 * 24 * 60 * 60
-    tau = max(1.0, float(tau_seconds)) / seconds_per_year
-    twap_correction = max(0.0, float(twap_window_seconds)) / 3.0 / seconds_per_year
-    effective_tau = max(tau - twap_correction, 1.0 / seconds_per_year)
-
-    vol_root = sigma_f * math.sqrt(effective_tau)
-    d2 = (math.log(spot_f / strike_f) - 0.5 * sigma_f * sigma_f * effective_tau) / vol_root
-    prob = _norm_cdf(d2)
-    return _clip_probability(Decimal(str(prob)))
+    return _clip_probability(
+        bs_above_probability_unclipped(
+            spot=spot,
+            strike=strike,
+            sigma_annual=sigma_annual,
+            tau_seconds=tau_seconds,
+            twap_window_seconds=twap_window_seconds,
+        )
+    )
 
 
 def _clip_probability(p: Decimal) -> Decimal:

@@ -74,6 +74,7 @@ STRATEGY_CONFIGS: tuple[str, ...] = (
     "crypto-terminal-drift-tracker.toml",
     "crypto-realized-vol-regime.toml",
     "crypto-cross-strike-skew-arb.toml",
+    "crypto-signal-ensemble.toml",
 )
 
 SLEEVE_CONFIGS: tuple[str, ...] = (
@@ -97,6 +98,7 @@ SLEEVE_CONFIGS: tuple[str, ...] = (
     "crypto-terminal-drift-kalshi-paper-a.toml",
     "crypto-realized-vol-kalshi-paper-a.toml",
     "crypto-skew-arb-kalshi-paper-a.toml",
+    "crypto-signal-ensemble-kalshi-paper-a.toml",
 )
 
 
