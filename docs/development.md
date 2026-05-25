@@ -45,7 +45,23 @@ cp .env.example .env
 ```
 
 The example includes placeholders for Kalshi, Polymarket global, and external
-data providers. Do not commit real credentials.
+data providers. Do not commit real credentials. CLI commands auto-load the
+nearest `.env`, so you do not need to `source .env` before running local
+commands.
+
+For the current sports-golf research path:
+
+```bash
+make PYTHON=.venv/bin/python sports-golf-preflight
+make PYTHON=.venv/bin/python sports-golf-smoke
+```
+
+`sports-golf-preflight` checks that the relevant keys and configs are present
+without printing secret values. `sports-golf-smoke` generates deterministic
+bar-compatible golf data, writes a Parquet event lake, and runs the player-cut
+and cut-line strategies end to end. DataGolf, PGA Tour, and ShotLink keys are
+treated as optional provider upgrades; the local smoke path does not require
+them.
 
 ## Verification Commands
 

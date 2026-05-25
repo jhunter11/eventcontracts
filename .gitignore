@@ -12,6 +12,7 @@ build/
 data/raw/
 data/normalized/
 data/replay/
+data/sports-golf-smoke/
 notebooks/.ipynb_checkpoints/
 rust/target/
 

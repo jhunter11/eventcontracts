@@ -19,6 +19,7 @@ from eventcontracts.cli import inspect_data as inspect_data_cmd
 from eventcontracts.cli import normalize as normalize_cmd
 from eventcontracts.cli import rank as rank_cmd
 from eventcontracts.cli import replay as replay_cmd
+from eventcontracts.cli import sports_golf as sports_golf_cmd
 from eventcontracts.cli import sweep as sweep_cmd
 from eventcontracts.cli import train as train_cmd
 from eventcontracts.cli import validate_bundle as validate_bundle_cmd
@@ -79,12 +80,16 @@ def build_parser() -> argparse.ArgumentParser:
     gen_windows_cmd.register(subparsers)
     rank_cmd.register(subparsers)
     train_cmd.register(subparsers)
+    sports_golf_cmd.register(subparsers)
     validate_bundle_cmd.register(subparsers)
 
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    from eventcontracts.env import load_default_env
+
+    load_default_env()
     parser = build_parser()
     args = parser.parse_args(argv)
     handler = cast(CommandHandler, args.handler)

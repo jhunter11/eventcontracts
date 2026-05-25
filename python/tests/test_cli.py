@@ -146,6 +146,69 @@ currency = "USD"
     assert "checksum mismatch" in capsys.readouterr().out
 
 
+def test_sports_golf_preflight_reports_free_key_status(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NOAA_TOKEN", "token")
+    monkeypatch.delenv("DATAGOLF_API_KEY", raising=False)
+
+    rc = cli(["sports-golf-preflight", "--strict", "--configs-root", str(REPO_ROOT / "configs")])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["required_missing"] == []
+    assert payload["free_research_keys"]["NOAA_TOKEN"] is True
+    assert payload["sports_golf_optional_provider_keys"]["DATAGOLF_API_KEY"] is False
+    assert payload["configs"]["strategy:player_cut"]["loaded"] is True
+
+
+def test_sports_golf_preflight_can_require_sports_provider(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    for key in ("DATAGOLF_API_KEY", "PGA_TOUR_API_KEY", "SHOTLINK_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+
+    rc = cli(["sports-golf-preflight", "--require-sports-provider", "--configs-root", str(REPO_ROOT / "configs")])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 2
+    assert not any(payload["sports_golf_optional_provider_keys"].values())
+
+
+def test_sports_golf_smoke_generates_reports(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    rc = cli(
+        [
+            "sports-golf-smoke",
+            "--configs-root",
+            str(REPO_ROOT / "configs"),
+            "--out",
+            str(tmp_path / "sports-smoke"),
+            "--simulations",
+            "50",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert Path(payload["manifest"]).exists()
+    assert Path(payload["player_report"]).exists()
+    assert Path(payload["cut_line_report"]).exists()
+    assert payload["player_cut_orders"] > 0
+    assert payload["cut_line_orders"] > 0
+
+
 def test_replay_streams_normalized_events(
     capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
