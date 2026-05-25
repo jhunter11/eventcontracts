@@ -21,6 +21,7 @@ from decimal import Decimal
 from eventcontracts.crypto.pricing import (
     bracket_parity_deviation,
     bs_above_probability,
+    bs_above_probability_unclipped,
     monotone_violations,
     realized_volatility,
 )
@@ -127,12 +128,110 @@ class SkewState:
 #: Default confidence values per source. Operators can override these via
 #: ensemble configuration; the defaults reflect rough reliability ranking.
 DEFAULT_CONFIDENCE: Mapping[str, Decimal] = {
-    "parity": Decimal("0.95"),       # no-arb relationship; very high confidence
-    "vol_surface": Decimal("0.70"),  # external data quality dependent
-    "terminal": Decimal("0.80"),     # latency edge; degrades with competition
-    "regime": Decimal("0.55"),       # noisier RV vs IV comparison
-    "skew": Decimal("0.85"),         # no-arb butterfly; high confidence
+    "parity": Decimal("0.95"),         # no-arb relationship; very high confidence
+    "vol_surface": Decimal("0.70"),    # external data quality dependent
+    "bracket_vol": Decimal("0.65"),    # bracket interval BS vs Kalshi mid
+    "terminal": Decimal("0.80"),       # latency edge; degrades with competition
+    "regime": Decimal("0.55"),         # noisier RV vs IV comparison
+    "skew": Decimal("0.85"),           # no-arb butterfly; high confidence
 }
+
+
+@dataclass
+class BracketVolState:
+    """Bracket-aware vol-surface state.
+
+    Unlike :class:`VolSurfaceState` (which targets "above $K" markets),
+    this source models each between-bracket as
+    ``P(lower <= S_T < upper)`` and compares to the Kalshi mid. It
+    lets the strategy run on the real Kalshi bracket layer with no
+    synthesized markets — needed when the venue only publishes
+    "T..." tails at extreme strikes.
+    """
+
+    intervals_by_market: Mapping[str, tuple[Decimal, Decimal | None]]
+    spot: Decimal | None = None
+    sigma_annual: Decimal | None = None
+    expiry_at_iso: str | None = None
+    mid_by_market: dict[str, Decimal] = field(default_factory=dict)
+
+
+def bracket_vol_signals(
+    state: BracketVolState,
+    venue,  # noqa: ANN001
+    *,
+    now_iso: str,
+    twap_window_seconds: Decimal = Decimal("60"),
+    min_edge_bps: Decimal = Decimal("75"),
+    confidence: Decimal | None = None,
+) -> Sequence[Signal]:
+    """Emit a signal per real Kalshi bracket when the BS interval
+    probability differs from the Kalshi mid by more than the edge
+    threshold.
+
+    The estimator uses
+    ``P(S in [lower, upper)) = Φ(d2(lower)) - Φ(d2(upper))``
+    against the **un-clipped** BS CDF so very small (< 1%) interval
+    probabilities still match Kalshi's $0.01 floor cleanly.
+    """
+
+    if (
+        state.spot is None
+        or state.sigma_annual is None
+        or state.expiry_at_iso is None
+    ):
+        return ()
+    tau_seconds = _seconds_between(now_iso, state.expiry_at_iso)
+    if tau_seconds is None or tau_seconds <= 0:
+        return ()
+
+    conf = confidence if confidence is not None else DEFAULT_CONFIDENCE["bracket_vol"]
+    out: list[Signal] = []
+    for market_id, (lower, upper) in state.intervals_by_market.items():
+        mid = state.mid_by_market.get(market_id)
+        if mid is None:
+            continue
+        # P(S >= lower)
+        p_above_lower = bs_above_probability_unclipped(
+            spot=state.spot,
+            strike=lower if lower > 0 else Decimal("0.0001"),
+            sigma_annual=state.sigma_annual,
+            tau_seconds=tau_seconds,
+            twap_window_seconds=twap_window_seconds,
+        )
+        # P(S >= upper); upper=None means +inf tail bracket.
+        if upper is None or upper <= 0:
+            p_above_upper = Decimal("0")
+        else:
+            p_above_upper = bs_above_probability_unclipped(
+                spot=state.spot,
+                strike=upper,
+                sigma_annual=state.sigma_annual,
+                tau_seconds=tau_seconds,
+                twap_window_seconds=twap_window_seconds,
+            )
+        bs_interval = p_above_lower - p_above_upper
+        # Clamp to a valid probability before differencing.
+        bs_interval = max(Decimal("0"), min(Decimal("1"), bs_interval))
+        edge_bps = (bs_interval - mid) * Decimal("10000")
+        if abs(edge_bps) < min_edge_bps:
+            continue
+        side = OutcomeSide.YES if edge_bps > 0 else OutcomeSide.NO
+        out.append(
+            Signal(
+                instrument_id=InstrumentId(venue=venue, market_id=market_id),
+                side=side,
+                edge_bps=abs(edge_bps),
+                confidence=conf,
+                horizon_seconds=int(tau_seconds),
+                source="bracket_vol",
+                reason=(
+                    f"bs_interval={bs_interval:.4f}_mid={mid:.4f}"
+                    f"_sigma={state.sigma_annual:.3f}"
+                ),
+            )
+        )
+    return tuple(out)
 
 
 def parity_signals(

@@ -62,6 +62,7 @@ from decimal import Decimal
 from uuid import uuid4
 
 from eventcontracts.crypto import (
+    BracketVolState,
     EnsembleVerdict,
     ParityState,
     RegimeState,
@@ -69,6 +70,7 @@ from eventcontracts.crypto import (
     SkewState,
     TerminalState,
     VolSurfaceState,
+    bracket_vol_signals,
     combine_signals,
     parity_signals,
     regime_signals,
@@ -98,7 +100,14 @@ from eventcontracts.strategy.base import StrategyBase
 from eventcontracts.strategy.context import StrategyContext
 from eventcontracts.strategy.registry import register
 
-_ALL_SOURCES = ("parity", "vol_surface", "terminal", "regime", "skew")
+_ALL_SOURCES = (
+    "parity",
+    "vol_surface",
+    "bracket_vol",
+    "terminal",
+    "regime",
+    "skew",
+)
 
 
 class CryptoSignalEnsembleStrategy(StrategyBase):
@@ -134,6 +143,12 @@ class CryptoSignalEnsembleStrategy(StrategyBase):
         bracket_ids = _parse_bracket_ids(
             str(spec.parameters.get("bracket_market_ids", ""))
         )
+        # Bracket source uses the real partition: each between-bracket
+        # exposes ``(lower, upper)`` so the BS-derived interval
+        # probability can be compared to the Kalshi mid.
+        bracket_intervals = _parse_bracket_intervals(
+            str(spec.parameters.get("bracket_market_ids", ""))
+        )
         strike_map = _parse_strike_map(
             str(spec.parameters.get("strike_market_map", ""))
         )
@@ -142,6 +157,7 @@ class CryptoSignalEnsembleStrategy(StrategyBase):
         atm_strike_raw = str(spec.parameters.get("atm_strike", "0"))
 
         self.parity_state = ParityState(bracket_market_ids=tuple(bracket_ids))
+        self.bracket_vol_state = BracketVolState(intervals_by_market=bracket_intervals)
         self.vol_state = VolSurfaceState(strike_by_market=strike_map)
         self.terminal_state = TerminalState(strike_by_market=strike_map)
         self.regime_state = (
@@ -194,21 +210,26 @@ class CryptoSignalEnsembleStrategy(StrategyBase):
                     if self.regime_state is not None:
                         self.regime_state.push_spot(price)
                     self.vol_state.spot = price
+                    self.bracket_vol_state.spot = price
             expiry_iso = payload.get("expiry_iso")
             if isinstance(expiry_iso, str) and expiry_iso:
                 self.vol_state.expiry_at_iso = expiry_iso
                 self.terminal_state.expiry_at_iso = expiry_iso
+                self.bracket_vol_state.expiry_at_iso = expiry_iso
                 if self.regime_state is not None:
                     self.regime_state.expiry_at_iso = expiry_iso
         if event.source == self.vol_source:
             with suppress(ValueError, ArithmeticError):
                 atm_iv = payload.get("atm_iv") or payload.get("sigma_annual")
                 if atm_iv is not None:
-                    self.vol_state.sigma_annual = Decimal(str(atm_iv))
+                    sigma = Decimal(str(atm_iv))
+                    self.vol_state.sigma_annual = sigma
+                    self.bracket_vol_state.sigma_annual = sigma
             expiry_iso = payload.get("expiry_iso")
             if isinstance(expiry_iso, str) and expiry_iso:
                 self.vol_state.expiry_at_iso = expiry_iso
                 self.terminal_state.expiry_at_iso = expiry_iso
+                self.bracket_vol_state.expiry_at_iso = expiry_iso
                 if self.regime_state is not None:
                     self.regime_state.expiry_at_iso = expiry_iso
 
@@ -226,6 +247,8 @@ class CryptoSignalEnsembleStrategy(StrategyBase):
         if market_id in self.parity_state.bracket_market_ids:
             self.parity_state.mid_by_market[market_id] = mid
             self.parity_state.spread_bps_by_market[market_id] = spread_bps
+        if market_id in self.bracket_vol_state.intervals_by_market:
+            self.bracket_vol_state.mid_by_market[market_id] = mid
         if market_id in self.vol_state.strike_by_market:
             self.vol_state.mid_by_market[market_id] = mid
         if market_id in self.terminal_state.strike_by_market:
@@ -261,6 +284,15 @@ class CryptoSignalEnsembleStrategy(StrategyBase):
             all_signals.extend(
                 vol_surface_signals(
                     self.vol_state,
+                    self.venue,
+                    now_iso=now_iso,
+                    twap_window_seconds=self.twap_window_seconds,
+                )
+            )
+        if "bracket_vol" in self.enabled_sources:
+            all_signals.extend(
+                bracket_vol_signals(
+                    self.bracket_vol_state,
                     self.venue,
                     now_iso=now_iso,
                     twap_window_seconds=self.twap_window_seconds,
@@ -407,6 +439,38 @@ def _parse_weights(raw: str) -> Mapping[str, Decimal]:
             raise ValueError("weights must be source:weight pairs separated by ;")
         out[parts[0]] = Decimal(parts[1])
     return out
+
+
+def _parse_bracket_intervals(raw: str) -> Mapping[str, tuple[Decimal, Decimal | None]]:
+    """Parse ``market_id:lower:upper`` into ``{market_id: (lower, upper)}``.
+
+    ``inf``/``-inf`` map to ``None`` on the appropriate side. The
+    bracket-vol source treats ``lower=0`` for the low-tail entry and
+    ``upper=None`` for the high-tail entry.
+    """
+
+    intervals: dict[str, tuple[Decimal, Decimal | None]] = {}
+    for item in raw.split(";"):
+        if not item.strip():
+            continue
+        parts = [p.strip() for p in item.split(":")]
+        if len(parts) != 3 or not parts[0]:
+            raise ValueError(
+                "bracket_market_ids entries must be market_id:lower:upper"
+            )
+        market_id, lower_raw, upper_raw = parts
+        lower = (
+            Decimal("0")
+            if lower_raw.lower() in ("-inf", "neg_inf", "")
+            else Decimal(lower_raw)
+        )
+        upper = (
+            None
+            if upper_raw.lower() in ("inf", "pos_inf", "")
+            else Decimal(upper_raw)
+        )
+        intervals[market_id] = (lower, upper)
+    return intervals
 
 
 def _parse_bracket_ids(raw: str) -> tuple[str, ...]:

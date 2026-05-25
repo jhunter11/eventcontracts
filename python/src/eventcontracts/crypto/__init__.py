@@ -1,9 +1,18 @@
 """Crypto-domain predictive helpers shared by 15-min crypto strategies."""
 
+from eventcontracts.crypto.backtest import (
+    CohortBacktestResult,
+    FilledTrade,
+    SizingPolicy,
+    WalkForwardReport,
+    run_cohort_backtest,
+)
 from eventcontracts.crypto.historical import (
+    CohortSettlement,
     HistoricalStream,
     KalshiMarket,
     build_historical_stream,
+    fetch_cohort_settlement,
     fetch_deribit_dvol,
     fetch_deribit_ohlc,
     fetch_kalshi_candlesticks,
@@ -16,6 +25,10 @@ from eventcontracts.crypto.pricing import (
     bs_above_probability,
     monotone_violations,
     realized_volatility,
+)
+from eventcontracts.crypto.signals import (  # noqa: I001
+    BracketVolState,
+    bracket_vol_signals,
 )
 from eventcontracts.crypto.signals import (
     DEFAULT_CONFIDENCE,
@@ -43,8 +56,13 @@ from eventcontracts.crypto.synthetic import (
 )
 
 __all__ = [
+    "BracketVolState",
+    "CohortBacktestResult",
     "DEFAULT_CONFIDENCE",
     "EnsembleVerdict",
+    "FilledTrade",
+    "SizingPolicy",
+    "WalkForwardReport",
     "ParityState",
     "RegimeState",
     "Signal",
@@ -55,13 +73,16 @@ __all__ = [
     "SyntheticScenario",
     "TerminalState",
     "VolSurfaceState",
+    "CohortSettlement",
     "HistoricalStream",
     "KalshiMarket",
     "bracket_parity_deviation",
+    "bracket_vol_signals",
     "bs_above_probability",
     "build_historical_stream",
     "combine_signals",
     "event_stream",
+    "fetch_cohort_settlement",
     "fetch_deribit_dvol",
     "fetch_deribit_ohlc",
     "fetch_kalshi_candlesticks",
@@ -73,6 +94,7 @@ __all__ = [
     "realized_volatility",
     "regime_signals",
     "replace_deribit_iv",
+    "run_cohort_backtest",
     "skew_signals",
     "terminal_signals",
     "vol_surface_signals",

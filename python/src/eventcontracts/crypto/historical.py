@@ -174,50 +174,73 @@ def list_kalshi_btc_markets(
     series_ticker: str = "KXBTC",
     expiry_hour_token: str | None = None,
     limit: int = 1000,
+    max_pages: int = 20,
 ) -> list[KalshiMarket]:
     """List Kalshi BTC markets, parse their strike layouts.
 
-    ``expiry_hour_token`` lets the caller filter to one settlement
-    hour by the embedded date+hour string from the ticker
-    (e.g. ``"26MAY2508"`` selects every bracket settling at 12:00 UTC
-    on 2026-05-25 — the cohort named "08" because Kalshi names them
-    by US Eastern hour-of-day).
+    Walks the cursor pagination on ``/markets`` up to ``max_pages``
+    pages so callers can reach cohorts older than the first page.
+    ``expiry_hour_token`` filters to one settlement hour by the
+    embedded date+hour string from the ticker (e.g. ``"26MAY2508"``
+    selects every bracket settling at 12:00 UTC on 2026-05-25 — the
+    cohort named "08" because Kalshi names them by US Eastern
+    hour-of-day). When ``expiry_hour_token`` is set the pagination
+    stops as soon as the cohort is fully captured.
     """
 
-    response = _http_get(
-        KALSHI_BASE,
-        "/markets",
-        {"series_ticker": series_ticker, "status": status, "limit": limit},
-    )
     out: list[KalshiMarket] = []
-    for raw in response.get("markets", []):
-        ticker = raw["ticker"]
-        if expiry_hour_token and expiry_hour_token not in ticker:
-            continue
-        parsed = parse_kalshi_btc_ticker(ticker)
-        if parsed is None:
-            continue
-        subtitle = raw.get("subtitle", "") or ""
-        kind = parsed.kind
-        lower = parsed.lower
-        upper = parsed.upper
-        # Subtitle disambiguates the two unbounded tails.
-        lowered = subtitle.lower()
-        if kind == "above" and "below" in lowered:
-            kind = "below"
-            upper = lower
-            lower = None
-        out.append(
-            KalshiMarket(
-                ticker=ticker,
-                subtitle=subtitle,
-                open_time=datetime.fromisoformat(raw["open_time"].replace("Z", "+00:00")),
-                close_time=datetime.fromisoformat(raw["close_time"].replace("Z", "+00:00")),
-                kind=kind,
-                lower=lower,
-                upper=upper,
+    cursor: str | None = None
+    for _ in range(max_pages):
+        params: dict[str, object] = {
+            "series_ticker": series_ticker,
+            "status": status,
+            "limit": limit,
+        }
+        if cursor:
+            params["cursor"] = cursor
+        response = _http_get(KALSHI_BASE, "/markets", params)
+        page = response.get("markets", [])
+        if not page:
+            break
+        token_hit = False
+        for raw in page:
+            ticker = raw["ticker"]
+            if expiry_hour_token and expiry_hour_token not in ticker:
+                continue
+            token_hit = bool(expiry_hour_token)
+            parsed = parse_kalshi_btc_ticker(ticker)
+            if parsed is None:
+                continue
+            subtitle = raw.get("subtitle", "") or ""
+            kind = parsed.kind
+            lower = parsed.lower
+            upper = parsed.upper
+            # Subtitle disambiguates the two unbounded tails.
+            lowered = subtitle.lower()
+            if kind == "above" and "below" in lowered:
+                kind = "below"
+                upper = lower
+                lower = None
+            out.append(
+                KalshiMarket(
+                    ticker=ticker,
+                    subtitle=subtitle,
+                    open_time=datetime.fromisoformat(raw["open_time"].replace("Z", "+00:00")),
+                    close_time=datetime.fromisoformat(raw["close_time"].replace("Z", "+00:00")),
+                    kind=kind,
+                    lower=lower,
+                    upper=upper,
+                )
             )
-        )
+        cursor = response.get("cursor")
+        if not cursor:
+            break
+        # Stop early once we've left the target cohort: tickers come
+        # ordered newest-first, so once we land in a cohort that
+        # *doesn't* match the token we know the requested cohort is
+        # complete on disk.
+        if expiry_hour_token and out and not token_hit:
+            break
     return out
 
 
@@ -383,6 +406,79 @@ def fetch_deribit_dvol(
 # ----------------------------- Stream construction -----------------------------
 
 
+@dataclass(frozen=True)
+class CohortSettlement:
+    """Ground-truth settlement information for one expiry cohort.
+
+    ``settlement_price`` is the midpoint of the unique between-bracket
+    whose Kalshi ``result`` is ``yes`` — Kalshi sets the bracket
+    width to $100 so the midpoint approximates the true TWAP within
+    $50. ``yes_market_ticker`` records which bracket actually settled
+    so the backtester can audit the chain.
+    """
+
+    yes_market_ticker: str | None
+    settlement_price: Decimal | None
+    bracket_results: dict[str, str]  # market_id → "yes" | "no"
+
+
+def fetch_cohort_settlement(
+    *,
+    expiry_hour_token: str,
+    series_ticker: str = "KXBTC",
+    limit: int = 1000,
+    max_pages: int = 20,
+) -> CohortSettlement:
+    """Pull settled bracket results for one Kalshi expiry cohort.
+
+    Paginates through ``/markets`` until the requested cohort is
+    fully captured.
+    """
+
+    results: dict[str, str] = {}
+    yes_market: str | None = None
+    settle_price: Decimal | None = None
+    cursor: str | None = None
+    for _ in range(max_pages):
+        params: dict[str, object] = {
+            "series_ticker": series_ticker,
+            "status": "settled",
+            "limit": limit,
+        }
+        if cursor:
+            params["cursor"] = cursor
+        response = _http_get(KALSHI_BASE, "/markets", params)
+        page = response.get("markets", [])
+        if not page:
+            break
+        cohort_seen = False
+        for raw in page:
+            ticker = raw["ticker"]
+            if expiry_hour_token not in ticker:
+                continue
+            cohort_seen = True
+            result = raw.get("result")
+            if not result:
+                continue
+            results[ticker] = result
+            if result == "yes" and yes_market is None:
+                parsed = parse_kalshi_btc_ticker(ticker)
+                if parsed is not None and parsed.kind == "between":
+                    yes_market = ticker
+                    if parsed.lower is not None and parsed.upper is not None:
+                        settle_price = (parsed.lower + parsed.upper) / Decimal("2")
+        cursor = response.get("cursor")
+        if not cursor:
+            break
+        if results and not cohort_seen:
+            break
+    return CohortSettlement(
+        yes_market_ticker=yes_market,
+        settlement_price=settle_price,
+        bracket_results=results,
+    )
+
+
 @dataclass
 class HistoricalStream:
     """Container for all events that drive one historical expiry."""
@@ -390,11 +486,6 @@ class HistoricalStream:
     events: list[NormalizedEvent] = field(default_factory=list)
     expiry_at: datetime | None = None
     kalshi_markets: list[KalshiMarket] = field(default_factory=list)
-    #: Synthetic ``P(S >= K)`` markets derived from cumulative bracket
-    #: sums. These tickers (``DERIVED-A-<lower>``) are appropriate
-    #: inputs for the vol_surface and skew sources because the
-    #: above-K probability *is* monotone in K by construction.
-    derived_above_markets: list[KalshiMarket] = field(default_factory=list)
 
     def sort(self) -> None:
         """Sort by ``(timestamp, kind)`` for deterministic replay."""
@@ -533,8 +624,10 @@ def build_historical_stream(
             )
         )
 
-    # Kalshi bracket candlesticks → QuoteEvents.
-    bracket_quotes_by_market: dict[str, list[QuoteEvent]] = {}
+    # Kalshi bracket candlesticks → QuoteEvents. Real prices only —
+    # no synthetic markets are derived. Sources that need monotone
+    # ``P(S>=K)`` data should use bracket-aware signal functions on
+    # the real interval probabilities instead.
     for market in markets:
         candles = fetch_kalshi_candlesticks(
             series_ticker=series_ticker,
@@ -542,107 +635,7 @@ def build_historical_stream(
             start_ts_epoch=start_ts,
             end_ts_epoch=end_ts,
         )
-        quotes = kalshi_quote_events(market, candles)
-        bracket_quotes_by_market[market.ticker] = quotes
-        stream.events.extend(quotes)
-
-    # Derive synthetic "above $K" markets from the cumulative bracket
-    # sum. For each minute and each between-bracket lower edge K, the
-    # synthetic above-K mid is the sum of bracket mids whose lower >= K.
-    # This gives vol_surface and skew a usable input layer when the
-    # real Kalshi "T..." above markets only exist at far-OTM strikes.
-    derived = _derive_above_markets(
-        markets=[m for m in markets if m.kind == "between"],
-        bracket_quotes_by_market=bracket_quotes_by_market,
-    )
-    stream.events.extend(derived)
-    stream.derived_above_markets = [
-        KalshiMarket(
-            ticker=f"DERIVED-A-{m.lower}",
-            subtitle=f"derived above ${m.lower}",
-            open_time=m.open_time,
-            close_time=m.close_time,
-            kind="above",
-            lower=m.lower,
-            upper=None,
-        )
-        for m in markets
-        if m.kind == "between"
-    ]
+        stream.events.extend(kalshi_quote_events(market, candles))
 
     stream.sort()
     return stream
-
-
-def _derive_above_markets(
-    *,
-    markets: list[KalshiMarket],
-    bracket_quotes_by_market: dict[str, list[QuoteEvent]],
-) -> list[QuoteEvent]:
-    """Synthesize ``P(S_T >= K)`` quote events from cumulative bracket mids.
-
-    For each minute and each between-bracket lower edge ``K``, sum the
-    bid/ask of every bracket with ``lower >= K`` to get the cumulative
-    tail probability. Emit one ``QuoteEvent`` with market_id
-    ``DERIVED-A-<K>`` per (minute, K) pair. Subsequent strategy
-    configuration should reference these derived tickers when building
-    ``strike_market_map``.
-    """
-
-    from collections import defaultdict
-
-    # Build a time → market → (bid, ask) index by walking the bracket quotes.
-    by_time: dict[datetime, dict[str, tuple[Decimal, Decimal]]] = defaultdict(dict)
-    for ticker, quotes in bracket_quotes_by_market.items():
-        for q in quotes:
-            by_time[q.quote.received_at][ticker] = (
-                q.quote.bid.price if q.quote.bid else Decimal("0"),
-                q.quote.ask.price if q.quote.ask else Decimal("0"),
-            )
-    market_by_ticker = {m.ticker: m for m in markets if m.lower is not None}
-
-    out: list[QuoteEvent] = []
-    sorted_markets = sorted(markets, key=lambda m: m.lower or Decimal("-1e18"))
-    sequence = 0
-    for ts, mid_map in sorted(by_time.items()):
-        for strike_market in sorted_markets:
-            K = strike_market.lower
-            if K is None:
-                continue
-            # Sum cumulative bid + ask for brackets with lower >= K.
-            cum_bid = Decimal("0")
-            cum_ask = Decimal("0")
-            for ticker, (bid, ask) in mid_map.items():
-                m = market_by_ticker.get(ticker)
-                if m is None or m.lower is None or m.lower < K:
-                    continue
-                cum_bid += bid
-                cum_ask += ask
-            cum_bid = min(cum_bid, Decimal("0.9999"))
-            cum_ask = min(cum_ask, Decimal("0.9999"))
-            cum_bid = max(cum_bid, Decimal("0"))
-            cum_ask = max(cum_ask, Decimal("0.0001"))
-            if cum_bid >= cum_ask:
-                cum_bid = max(Decimal("0"), cum_ask - Decimal("0.01"))
-            sequence += 1
-            out.append(
-                QuoteEvent(
-                    event_id=EventId(f"derived-above-{K}-{sequence:06d}"),
-                    quote=Quote(
-                        instrument_id=InstrumentId(
-                            venue=Venue.KALSHI, market_id=f"DERIVED-A-{K}"
-                        ),
-                        side=OutcomeSide.YES,
-                        bid=OrderBookLevel(price=cum_bid, quantity=Decimal("100")),
-                        ask=OrderBookLevel(price=cum_ask, quantity=Decimal("100")),
-                        exchange_ts=ts,
-                        received_at=ts,
-                    ),
-                    provenance=EventProvenance(
-                        source="kalshi-derived",
-                        channel="cumulative-above",
-                        venue=Venue.KALSHI,
-                    ),
-                )
-            )
-    return out
