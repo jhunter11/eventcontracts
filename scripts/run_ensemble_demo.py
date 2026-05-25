@@ -29,13 +29,13 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
-from collections import Counter
-from datetime import timezone
-from decimal import Decimal
-from pathlib import Path
 
 # Allow running directly from a checkout without installing.
 import sys
+from collections import Counter
+from decimal import Decimal
+from pathlib import Path
+
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "python" / "src"))
 
@@ -54,7 +54,6 @@ from eventcontracts.domain import (  # noqa: E402
 )
 from eventcontracts.strategy import create_from_spec  # noqa: E402
 from eventcontracts.testing.doubles import InMemoryClock, InMemoryContext  # noqa: E402
-
 
 CONFIGS = HERE.parent / "configs"
 

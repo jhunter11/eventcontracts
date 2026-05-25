@@ -1,5 +1,15 @@
 """Crypto-domain predictive helpers shared by 15-min crypto strategies."""
 
+from eventcontracts.crypto.historical import (
+    HistoricalStream,
+    KalshiMarket,
+    build_historical_stream,
+    fetch_deribit_dvol,
+    fetch_deribit_ohlc,
+    fetch_kalshi_candlesticks,
+    list_kalshi_btc_markets,
+    parse_kalshi_btc_ticker,
+)
 from eventcontracts.crypto.pricing import (
     StrikeBracket,
     bracket_parity_deviation,
@@ -45,13 +55,21 @@ __all__ = [
     "SyntheticScenario",
     "TerminalState",
     "VolSurfaceState",
+    "HistoricalStream",
+    "KalshiMarket",
     "bracket_parity_deviation",
     "bs_above_probability",
+    "build_historical_stream",
     "combine_signals",
     "event_stream",
+    "fetch_deribit_dvol",
+    "fetch_deribit_ohlc",
+    "fetch_kalshi_candlesticks",
     "generate_scenario",
+    "list_kalshi_btc_markets",
     "monotone_violations",
     "parity_signals",
+    "parse_kalshi_btc_ticker",
     "realized_volatility",
     "regime_signals",
     "replace_deribit_iv",
