@@ -118,7 +118,7 @@ class KalshiMarket:
 
 
 _TICKER_PATTERN = re.compile(
-    r"^(?P<series>KXBTC)-"
+    r"^(?P<series>[A-Z]+)-"
     r"(?P<expiry>[0-9A-Z]+)-"
     r"(?P<type>[TB])(?P<strike>[0-9.]+)$"
 )
@@ -566,25 +566,28 @@ def build_historical_stream(
     if atm_radius_dollars is not None and spot_series:
         opening_spot = spot_series[0].close
         radius = atm_radius_dollars
-        # Always keep the unbounded tails so the parity partition is
-        # exhaustive — otherwise Σmid < 1 by construction and parity
-        # is structurally violated.
-        tails = [m for m in markets if m.kind != "between"]
-        between_within = [
-            m
-            for m in markets
-            if m.kind == "between"
-            and (
-                (m.lower is not None and abs(m.lower - opening_spot) <= radius * 2)
-                or (m.upper is not None and abs(m.upper - opening_spot) <= radius * 2)
+
+        def _within(m: KalshiMarket) -> bool:
+            if m.lower is not None and abs(m.lower - opening_spot) <= radius * 2:
+                return True
+            if m.upper is not None and abs(m.upper - opening_spot) <= radius * 2:
+                return True
+            return False
+
+        between = [m for m in markets if m.kind == "between"]
+        above = [m for m in markets if m.kind == "above"]
+        below = [m for m in markets if m.kind == "below"]
+        # For bracket cohorts (KXBTC) we keep the unbounded tails so
+        # parity stays exhaustive. For above-K cohorts (KXBTCD) every
+        # market is "above" so we just keep those within the radius.
+        if between:
+            kept_between = [m for m in between if _within(m)]
+            markets = below + sorted(kept_between, key=lambda m: m.lower or Decimal("0")) + above
+        else:
+            markets = below + sorted(
+                (m for m in above if _within(m)),
+                key=lambda m: m.lower or Decimal("0"),
             )
-        ]
-        markets = sorted(
-            tails + between_within,
-            key=lambda m: (
-                Decimal("-1e18") if m.lower is None else m.lower,
-            ),
-        )
         stream.kalshi_markets = markets
     for i, tick in enumerate(spot_series):
         stream.events.append(

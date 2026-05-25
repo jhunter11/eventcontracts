@@ -154,6 +154,7 @@ def run_cohort_backtest(
     fee_model: KalshiFeeModel | None = None,
     apply_clock_to_ctx: bool = True,
     sizing: SizingPolicy | None = None,
+    one_fill_per_market: bool = False,
 ) -> CohortBacktestResult:
     """Run a strategy through one cohort's events and settle the resulting fills.
 
@@ -193,6 +194,7 @@ def run_cohort_backtest(
             result.decisions_counter["no_action"] += 1
 
     pending_sources: dict[str, tuple[str, ...]] = {}
+    already_filled: set[str] = set()
     for event in stream.events:
         ts = _event_time(event)
         if apply_clock_to_ctx and ts is not None and hasattr(ctx, "clock_now"):
@@ -217,6 +219,8 @@ def run_cohort_backtest(
                     s.strip() for s in d.tags.get("sources", "").split(",") if s.strip()
                 )
             if isinstance(d, PlaceOrder):
+                if one_fill_per_market and d.instrument_id.market_id in already_filled:
+                    continue
                 fill = _fill_decision(
                     decision=d,
                     decision_at=ts or stream.expiry_at,  # type: ignore[arg-type]
@@ -232,6 +236,8 @@ def run_cohort_backtest(
                 if not fill.settled:
                     result.skipped_unsettled += 1
                 result.fills.append(fill)
+                if one_fill_per_market:
+                    already_filled.add(d.instrument_id.market_id)
 
     return result
 

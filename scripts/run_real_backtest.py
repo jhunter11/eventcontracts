@@ -50,21 +50,50 @@ CONFIGS = HERE.parent / "configs"
 
 
 def _spec_strings_for(stream) -> dict[str, str]:
-    """Build the parity partition string from the cohort's real markets."""
+    """Build the operator-supplied roster strings from the real markets.
+
+    * ``bracket_market_ids`` is the parity partition. Used by KXBTC
+      (between-strike) cohorts; KXBTCD has only above-K markets so
+      this comes out empty and parity stays silent.
+    * ``strike_market_map`` is the strike grid for vol_surface and
+      skew. KXBTCD provides this directly via every above-K ticker;
+      KXBTC has only the two unbounded T-tails (far OTM, useless).
+    """
 
     between = [m for m in stream.kalshi_markets if m.kind == "between"]
     above = [m for m in stream.kalshi_markets if m.kind == "above"]
     below = [m for m in stream.kalshi_markets if m.kind == "below"]
-    parts: list[str] = []
+
+    # Parity partition: low-tail + every between-bracket + high-tail.
+    parity_parts: list[str] = []
     if below:
         m = below[0]
-        parts.append(f"{m.ticker}:-inf:{m.upper}")
+        parity_parts.append(f"{m.ticker}:-inf:{m.upper}")
     for m in sorted(between, key=lambda x: x.lower or Decimal("0")):
-        parts.append(f"{m.ticker}:{m.lower}:{m.upper}")
-    if above:
+        parity_parts.append(f"{m.ticker}:{m.lower}:{m.upper}")
+    if above and not between:
+        # KXBTCD: many above-K markets exist; treat them as a
+        # rough parity layer too so the parity gate has something
+        # to chew on. P(S>=K) decreasing in K, but each is a
+        # standalone bet — parity won't sum to 1 here.
+        pass
+    elif above:
         m = above[0]
-        parts.append(f"{m.ticker}:{m.lower}:inf")
-    return {"bracket_market_ids": ";".join(parts)}
+        parity_parts.append(f"{m.ticker}:{m.lower}:inf")
+
+    # Strike map for vol_surface and skew. Every above-K market is
+    # one (ticker, strike) entry; KXBTCD provides plenty, KXBTC
+    # provides at most one (the high tail).
+    strike_parts = [
+        f"{m.ticker}:{m.lower}"
+        for m in sorted(above, key=lambda x: x.lower or Decimal("0"))
+        if m.lower is not None
+    ]
+
+    return {
+        "bracket_market_ids": ";".join(parity_parts),
+        "strike_market_map": ";".join(strike_parts),
+    }
 
 
 def _build_ensemble(stream, args):
@@ -104,9 +133,13 @@ def _run_one(expiry: str, args, *, atm_radius: Decimal | None, sizing: SizingPol
     print(f"loading {expiry}...", file=sys.stderr)
     stream = build_historical_stream(
         expiry_hour_token=expiry,
+        series_ticker=args.series_ticker,
         atm_radius_dollars=atm_radius,
     )
-    settlement = fetch_cohort_settlement(expiry_hour_token=expiry)
+    settlement = fetch_cohort_settlement(
+        expiry_hour_token=expiry,
+        series_ticker=args.series_ticker,
+    )
     if not stream.events:
         return None, stream, settlement
     print(
@@ -128,6 +161,7 @@ def _run_one(expiry: str, args, *, atm_radius: Decimal | None, sizing: SizingPol
         strategy=strategy,
         ctx=ctx,
         sizing=sizing,
+        one_fill_per_market=args.one_fill_per_market,
     )
     return result, stream, settlement
 
@@ -136,6 +170,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--expiries", nargs="+", required=True,
                         help="One or more Kalshi expiry tokens, e.g. 26MAY2508 26MAY2509.")
+    parser.add_argument("--series-ticker", default="KXBTC",
+                        help="Kalshi series to backtest (KXBTC=bracket, KXBTCD=above-K).")
     parser.add_argument("--atm-radius", type=int, default=500,
                         help="Only fetch Kalshi brackets within this many $ of spot.")
     parser.add_argument("--enabled-sources", default="parity,bracket_vol")
@@ -154,6 +190,13 @@ def main(argv: list[str] | None = None) -> int:
         "--sizing-dollars",
         default="1",
         help="Per-trade dollar budget for fixed-premium / fixed-payout modes.",
+    )
+    parser.add_argument(
+        "--one-fill-per-market",
+        action="store_true",
+        help="Cap each cohort at the first PlaceOrder per market — avoids "
+             "signal-stacking inflation when the strategy re-fires the same "
+             "view every minute.",
     )
     args = parser.parse_args(argv)
 
