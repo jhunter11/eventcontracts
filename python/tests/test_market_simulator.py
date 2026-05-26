@@ -8,6 +8,7 @@ from decimal import Decimal
 import pytest
 
 from eventcontracts.adapters.venues.kalshi import KalshiFeeModel
+from eventcontracts.domain.decisions import IntentEnvelope, PlaceOrder
 from eventcontracts.domain.events import (
     LifecycleEvent,
     OrderBookEvent,
@@ -15,6 +16,7 @@ from eventcontracts.domain.events import (
 )
 from eventcontracts.domain.ids import (
     ClientOrderId,
+    CorrelationId,
     EventId,
     SleeveId,
     StrategyId,
@@ -28,12 +30,13 @@ from eventcontracts.domain.models import (
     Trade,
     Venue,
 )
-from eventcontracts.domain.orders import Liquidity, OrderSide
+from eventcontracts.domain.orders import Liquidity, OrderSide, OrderType, TimeInForce
 from eventcontracts.execution import (
     ConstantLatency,
     FrontOfQueueEstimator,
     MarketPaperSimulator,
     OrderIntent,
+    intent_to_order,
 )
 
 NOW = datetime(2026, 1, 1, 9, 30, tzinfo=UTC)
@@ -80,6 +83,7 @@ def _intent(
     post_only: bool = False,
     coid: str = "co-1",
     order_type: str = "limit",
+    time_in_force: TimeInForce = TimeInForce.GTC,
 ) -> OrderIntent:
     return OrderIntent(
         instrument_id=INSTR,
@@ -88,6 +92,7 @@ def _intent(
         quantity=Decimal(qty),
         order_type=order_type,
         order_side=order_side,
+        time_in_force=time_in_force,
         post_only=post_only,
         metadata={"client_order_id": coid, "correlation_id": "corr-1"},
     )
@@ -252,3 +257,49 @@ def test_marketable_with_partial_remainder_rests() -> None:
     open_now = list(sim.open_orders())
     assert len(open_now) == 1
     assert open_now[0].remaining == Decimal("20")
+
+
+def test_ioc_marketable_remainder_cancels_without_resting() -> None:
+    sim = _sim()
+    sim.on_event(_book_event(_book(yes_asks=[("0.50", "30")])))
+
+    fills = sim.submit(_intent(price="0.50", qty="50", time_in_force=TimeInForce.IOC), NOW)
+
+    assert len(fills) == 1
+    assert fills[0].quantity == Decimal("30")
+    assert list(sim.open_orders()) == []
+
+
+def test_fok_order_cancels_without_partial_fill_or_resting() -> None:
+    sim = _sim()
+    sim.on_event(_book_event(_book(yes_asks=[("0.50", "30")])))
+
+    fills = sim.submit(_intent(price="0.50", qty="50", time_in_force=TimeInForce.FOK), NOW)
+
+    assert fills == []
+    assert list(sim.open_orders()) == []
+
+
+def test_intent_to_order_preserves_time_in_force() -> None:
+    decision = PlaceOrder(
+        client_order_id=ClientOrderId("co-ioc"),
+        instrument_id=INSTR,
+        outcome_side=OutcomeSide.YES,
+        order_side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        time_in_force=TimeInForce.IOC,
+        quantity=Decimal("10"),
+        price=Decimal("0.50"),
+    )
+    envelope = IntentEnvelope(
+        decision=decision,
+        strategy_id=StrategyId("strat-1"),
+        sleeve_id=SleeveId("sleeve-1"),
+        correlation_id=CorrelationId("corr-1"),
+        emitted_at=NOW,
+    )
+
+    intent = intent_to_order(envelope)
+
+    assert intent is not None
+    assert intent.time_in_force is TimeInForce.IOC

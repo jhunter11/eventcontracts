@@ -63,6 +63,26 @@ and cut-line strategies end to end. DataGolf, PGA Tour, and ShotLink keys are
 treated as optional provider upgrades; the local smoke path does not require
 them.
 
+For the weather historical paper path:
+
+```bash
+make PYTHON=.venv/bin/python weather-preflight
+PYTHONPATH=python/src .venv/bin/python -m eventcontracts.cli weather-historical \
+  --ticker KXHIGHNY-26MAY24-B75 \
+  --threshold-f 75 \
+  --lat 40.7128 \
+  --lon -74.0060 \
+  --location-name NYC \
+  --start 2026-05-24T12:00:00Z \
+  --end 2026-05-24T21:00:00Z \
+  --target-day 2026-05-24
+```
+
+`weather-historical` is the real paper-test path: it fetches Kalshi historical
+candlesticks and historical weather forecast data, writes normalized quote and
+external-signal events, then runs the existing paper backtester. It places no
+live orders.
+
 ## Verification Commands
 
 From the repo root, `make quality` runs everything in `python/`. To invoke

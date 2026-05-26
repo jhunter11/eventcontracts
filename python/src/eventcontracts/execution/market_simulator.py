@@ -51,7 +51,7 @@ from eventcontracts.domain.models import (
     OrderBookLevel,
     OutcomeSide,
 )
-from eventcontracts.domain.orders import Liquidity, OrderSide, OrderStatus
+from eventcontracts.domain.orders import Liquidity, OrderSide, OrderStatus, TimeInForce
 from eventcontracts.execution.latency import LatencyModel
 from eventcontracts.execution.queue import QueueEstimate, QueuePositionEstimator
 from eventcontracts.execution.simulator import OrderIntent
@@ -380,6 +380,10 @@ class MarketPaperSimulator:
 
         assert state.book is not None
         opposite = _opposite_levels(state.book, intent.side, intent.order_side)
+        if intent.time_in_force is TimeInForce.FOK and (
+            self._marketable_quantity(intent, opposite) < intent.quantity
+        ):
+            return []
         fills: list[Fill] = []
         remaining = intent.quantity
         for level in opposite:
@@ -401,9 +405,14 @@ class MarketPaperSimulator:
             )
             fills.append(fill)
             remaining -= take
-        # Any unfilled remainder of a marketable limit order rests passive
-        # at its original limit price.
-        if remaining > 0 and intent.order_type != "market" and not intent.post_only:
+        # Any unfilled remainder of a marketable GTC/GTD limit order rests
+        # passive at its original limit price. IOC/FOK remainders cancel.
+        if (
+            remaining > 0
+            and intent.order_type != "market"
+            and not intent.post_only
+            and intent.time_in_force not in (TimeInForce.IOC, TimeInForce.FOK)
+        ):
             queue_est = self.queue_estimator.estimate(
                 instrument_id=intent.instrument_id,
                 side=intent.side,
@@ -420,6 +429,7 @@ class MarketPaperSimulator:
                 price=intent.price,
                 quantity=remaining,
                 order_type=intent.order_type,
+                time_in_force=intent.time_in_force,
                 post_only=intent.post_only,
                 metadata=intent.metadata,
             )
@@ -433,6 +443,23 @@ class MarketPaperSimulator:
                 status=OrderStatus.PARTIALLY_FILLED if fills else OrderStatus.OPEN,
             )
         return fills
+
+    @staticmethod
+    def _marketable_quantity(
+        intent: OrderIntent,
+        opposite: tuple[OrderBookLevel, ...],
+    ) -> Decimal:
+        quantity = Decimal("0")
+        for level in opposite:
+            if intent.order_type != "market":
+                if intent.order_side is OrderSide.BUY and intent.price < level.price:
+                    break
+                if intent.order_side is OrderSide.SELL and intent.price > level.price:
+                    break
+            quantity += level.quantity
+            if quantity >= intent.quantity:
+                return quantity
+        return quantity
 
     def cancel(self, client_order_id: ClientOrderId) -> bool:
         """Cancel a resting order. Returns True if it was open."""
@@ -491,6 +518,7 @@ class MarketPaperSimulator:
             price=new_price if new_price is not None else pending.intent.price,
             quantity=qty,
             order_type=pending.intent.order_type,
+            time_in_force=pending.intent.time_in_force,
             post_only=pending.intent.post_only,
             metadata=pending.intent.metadata,
         )

@@ -19,7 +19,7 @@ decision shape (PlaceOrder vs NoAction) is unchanged.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from decimal import Decimal
+from decimal import ROUND_FLOOR, Decimal
 from uuid import uuid4
 
 from eventcontracts.domain.decisions import (
@@ -31,6 +31,7 @@ from eventcontracts.domain.events import (
     ExternalSignalEvent,
     NormalizedEvent,
     QuoteEvent,
+    SettlementResolvedEvent,
 )
 from eventcontracts.domain.ids import ClientOrderId
 from eventcontracts.domain.models import InstrumentId, OutcomeSide
@@ -49,13 +50,45 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
         self.min_edge_bps = Decimal(str(spec.parameters.get("min_edge_bps", "75")))
         self.max_size = Decimal(str(spec.parameters.get("max_size", "10")))
         self.kelly_fraction = Decimal(str(spec.parameters.get("kelly_fraction", "0.10")))
+        self.capital_base = Decimal(str(spec.parameters.get("capital_base", "0")))
+        self.max_trade_capital_fraction = Decimal(str(spec.parameters.get("max_trade_capital_fraction", "0")))
+        self.max_ladder_capital_fraction = Decimal(str(spec.parameters.get("max_ladder_capital_fraction", "0")))
+        self.max_active_capital_fraction = Decimal(str(spec.parameters.get("max_active_capital_fraction", "0")))
         self.signal_source = str(spec.parameters.get("signal_source", "open-meteo"))
+        self.execution_mode = str(spec.parameters.get("execution_mode", "passive_mid"))
+        self.max_spread = Decimal(str(spec.parameters.get("max_spread", "1.00")))
+        self.spread_edge_multiplier = Decimal(str(spec.parameters.get("spread_edge_multiplier", "0.00")))
+        self.near_binary_price = Decimal(str(spec.parameters.get("near_binary_price", "1.00")))
+        self.near_binary_min_edge_bps = Decimal(str(spec.parameters.get("near_binary_min_edge_bps", "0")))
+        self.max_ladder_notional = Decimal(str(spec.parameters.get("max_ladder_notional", "1000000")))
+        if self.capital_base > 0 and self.max_ladder_capital_fraction > 0:
+            self.max_ladder_notional = self.capital_base * self.max_ladder_capital_fraction
+        self.max_trade_notional: Decimal | None = None
+        if self.capital_base > 0 and self.max_trade_capital_fraction > 0:
+            self.max_trade_notional = self.capital_base * self.max_trade_capital_fraction
+        self.max_active_notional: Decimal | None = None
+        if self.capital_base > 0 and self.max_active_capital_fraction > 0:
+            self.max_active_notional = self.capital_base * self.max_active_capital_fraction
+        self.max_ladder_orders = int(spec.parameters.get("max_ladder_orders", 1_000_000))
+        self.max_ticker_orders = int(spec.parameters.get("max_ticker_orders", 1_000_000))
+        self.min_retrade_price_delta = Decimal(str(spec.parameters.get("min_retrade_price_delta", "0.00")))
+        self.min_retrade_probability_delta = Decimal(str(spec.parameters.get("min_retrade_probability_delta", "0.00")))
         # Last known market mid per instrument; updated on QuoteEvent.
         self._mid_by_instrument: dict[InstrumentId, Decimal] = {}
+        self._quote_by_instrument: dict[InstrumentId, tuple[Decimal, Decimal]] = {}
+        self._submitted_notional_by_ladder: dict[str, Decimal] = {}
+        self._submitted_notional_by_instrument: dict[InstrumentId, Decimal] = {}
+        self._active_notional = Decimal("0")
+        self._submitted_orders_by_ladder: dict[str, int] = {}
+        self._submitted_orders_by_instrument: dict[InstrumentId, int] = {}
+        self._last_trade_signal_by_instrument: dict[InstrumentId, tuple[Decimal, Decimal]] = {}
 
     def on_event(
         self, event: NormalizedEvent, ctx: StrategyContext
     ) -> Sequence[StrategyDecision]:
+        if isinstance(event, SettlementResolvedEvent):
+            released = self._release_settled_notional(event.settlement.instrument_id)
+            return (NoAction(reason=f"settlement_released_notional_{released}"),)
         if isinstance(event, QuoteEvent):
             self._track_mid(event)
             return (NoAction(reason="quote_mid_updated"),)
@@ -84,20 +117,22 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
         if mid is None:
             return (NoAction(reason="warmup:no_mid_yet"),)
 
+        if self.execution_mode == "taker_if_edge":
+            decision = self._taker_decision(instrument_id, forecast_prob, event.payload)
+            if decision is None:
+                return (NoAction(reason="edge_below_executable_threshold"),)
+            return (decision,)
+
         edge_bps = (forecast_prob - mid) * Decimal("10000")
         if abs(edge_bps) < self.min_edge_bps:
             return (NoAction(reason="edge_below_threshold"),)
 
         side = OutcomeSide.YES if edge_bps > 0 else OutcomeSide.NO
         order_side = OrderSide.BUY
-        # Conservative passive sizing: scale by abs(edge) and Kelly fraction,
-        # capped by configured max_size.
-        edge_fraction = min(abs(edge_bps) / Decimal("10000"), Decimal("1"))
-        raw_size = (edge_fraction * self.kelly_fraction * self.max_size).quantize(
-            Decimal("1")
-        )
-        size = max(raw_size, Decimal("1"))
         limit_price = mid if side is OutcomeSide.YES else Decimal("1") - mid
+        size = self._size_for_edge(edge_bps=edge_bps, price=limit_price)
+        if size <= 0:
+            return (NoAction(reason="sizing_zero"),)
 
         return (
             PlaceOrder(
@@ -120,6 +155,162 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
             return
         mid = (quote.bid.price + quote.ask.price) / Decimal("2")
         self._mid_by_instrument[quote.instrument_id] = mid
+        self._quote_by_instrument[quote.instrument_id] = (quote.bid.price, quote.ask.price)
+
+    def _taker_decision(
+        self,
+        instrument_id: InstrumentId,
+        forecast_prob: Decimal,
+        payload: Mapping[str, object],
+    ) -> PlaceOrder | None:
+        quote = self._quote_by_instrument.get(instrument_id)
+        if quote is None:
+            return None
+        yes_bid, yes_ask = quote
+        spread = yes_ask - yes_bid
+        if spread > self.max_spread:
+            return None
+        yes_edge_bps = (forecast_prob - yes_ask) * Decimal("10000")
+        no_ask = Decimal("1") - yes_bid
+        no_edge_bps = ((Decimal("1") - forecast_prob) - no_ask) * Decimal("10000")
+        required_edge_bps = self._required_edge_bps(spread)
+        if yes_ask >= self.near_binary_price:
+            yes_edge_bps -= self.near_binary_min_edge_bps
+        if no_ask >= self.near_binary_price:
+            no_edge_bps -= self.near_binary_min_edge_bps
+        if yes_edge_bps < required_edge_bps and no_edge_bps < required_edge_bps:
+            return None
+        if yes_edge_bps >= no_edge_bps:
+            return self._place_order(
+                instrument_id=instrument_id,
+                side=OutcomeSide.YES,
+                price=yes_ask,
+                edge_bps=yes_edge_bps,
+                reason_price=yes_ask,
+                forecast_prob=forecast_prob,
+                ladder_key=self._ladder_key(instrument_id, payload),
+            )
+        return self._place_order(
+            instrument_id=instrument_id,
+            side=OutcomeSide.NO,
+            price=no_ask,
+            edge_bps=no_edge_bps,
+            reason_price=no_ask,
+            forecast_prob=forecast_prob,
+            ladder_key=self._ladder_key(instrument_id, payload),
+        )
+
+    def _place_order(
+        self,
+        *,
+        instrument_id: InstrumentId,
+        side: OutcomeSide,
+        price: Decimal,
+        edge_bps: Decimal,
+        reason_price: Decimal,
+        forecast_prob: Decimal,
+        ladder_key: str,
+    ) -> PlaceOrder | None:
+        if not self._can_retrade(instrument_id, price, forecast_prob):
+            return None
+        size = self._size_for_edge(edge_bps=edge_bps, price=price)
+        if size <= 0:
+            return None
+        notional = price * size
+        if not self._can_add_ladder_exposure(ladder_key, instrument_id, notional):
+            return None
+        if not self._can_add_active_exposure(notional):
+            return None
+        self._submitted_notional_by_ladder[ladder_key] = (
+            self._submitted_notional_by_ladder.get(ladder_key, Decimal("0")) + notional
+        )
+        self._submitted_notional_by_instrument[instrument_id] = (
+            self._submitted_notional_by_instrument.get(instrument_id, Decimal("0")) + notional
+        )
+        self._active_notional += notional
+        self._submitted_orders_by_ladder[ladder_key] = self._submitted_orders_by_ladder.get(ladder_key, 0) + 1
+        self._submitted_orders_by_instrument[instrument_id] = (
+            self._submitted_orders_by_instrument.get(instrument_id, 0) + 1
+        )
+        self._last_trade_signal_by_instrument[instrument_id] = (price, forecast_prob)
+        return PlaceOrder(
+            client_order_id=ClientOrderId(uuid4().hex),
+            instrument_id=instrument_id,
+            outcome_side=side,
+            order_side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            time_in_force=TimeInForce.IOC,
+            quantity=size,
+            price=price,
+            reason=f"executable_edge_{edge_bps:+.0f}bps_vs_ask_{reason_price}",
+            expected_edge_bps=edge_bps,
+            metadata={"ladder_key": ladder_key},
+        )
+
+    def _required_edge_bps(self, spread: Decimal) -> Decimal:
+        return self.min_edge_bps + (spread * Decimal("10000") * self.spread_edge_multiplier)
+
+    def _size_for_edge(self, *, edge_bps: Decimal, price: Decimal) -> Decimal:
+        if price <= 0:
+            return Decimal("0")
+        edge_fraction = min(abs(edge_bps) / Decimal("10000"), Decimal("1"))
+        if self.max_trade_notional is not None:
+            target_notional = self.max_trade_notional * edge_fraction * self.kelly_fraction
+            raw_size = (target_notional / price).to_integral_value(rounding=ROUND_FLOOR)
+        else:
+            raw_size = (edge_fraction * self.kelly_fraction * self.max_size).to_integral_value(
+                rounding=ROUND_FLOOR
+            )
+        size = max(raw_size, Decimal("1"))
+        size = min(size, self.max_size)
+        return self._cap_size_by_trade_notional(size=size, price=price)
+
+    def _cap_size_by_trade_notional(self, *, size: Decimal, price: Decimal) -> Decimal:
+        if self.max_trade_notional is None:
+            return size
+        if price <= 0:
+            return Decimal("0")
+        max_size = (self.max_trade_notional / price).to_integral_value(rounding=ROUND_FLOOR)
+        return min(size, max_size)
+
+    def _can_add_ladder_exposure(
+        self,
+        ladder_key: str,
+        instrument_id: InstrumentId,
+        notional: Decimal,
+    ) -> bool:
+        if self._submitted_orders_by_instrument.get(instrument_id, 0) >= self.max_ticker_orders:
+            return False
+        if self._submitted_orders_by_ladder.get(ladder_key, 0) >= self.max_ladder_orders:
+            return False
+        current = self._submitted_notional_by_ladder.get(ladder_key, Decimal("0"))
+        return current + notional <= self.max_ladder_notional
+
+    def _can_add_active_exposure(self, notional: Decimal) -> bool:
+        if self.max_active_notional is None:
+            return True
+        return self._active_notional + notional <= self.max_active_notional
+
+    def _release_settled_notional(self, instrument_id: InstrumentId) -> Decimal:
+        released = self._submitted_notional_by_instrument.pop(instrument_id, Decimal("0"))
+        self._active_notional = max(self._active_notional - released, Decimal("0"))
+        return released
+
+    def _can_retrade(self, instrument_id: InstrumentId, price: Decimal, forecast_prob: Decimal) -> bool:
+        previous = self._last_trade_signal_by_instrument.get(instrument_id)
+        if previous is None:
+            return True
+        previous_price, previous_prob = previous
+        return (
+            abs(price - previous_price) >= self.min_retrade_price_delta
+            or abs(forecast_prob - previous_prob) >= self.min_retrade_probability_delta
+        )
+
+    @staticmethod
+    def _ladder_key(instrument_id: InstrumentId, payload: Mapping[str, object]) -> str:
+        target_time = payload.get("target_time")
+        ticker_root = instrument_id.market_id.split("-T", maxsplit=1)[0]
+        return f"{ticker_root}:{target_time}" if isinstance(target_time, str) else ticker_root
 
     @staticmethod
     def _instrument_from_payload(payload: object) -> InstrumentId | None:

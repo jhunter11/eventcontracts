@@ -11,7 +11,7 @@ from typing import Any
 from eventcontracts.domain.decisions import IntentEnvelope, PlaceOrder
 from eventcontracts.domain.metadata import FrozenMap, freeze_mapping
 from eventcontracts.domain.models import InstrumentId, OutcomeSide
-from eventcontracts.domain.orders import OrderSide
+from eventcontracts.domain.orders import OrderSide, TimeInForce
 from eventcontracts.domain.validation import (
     require_aware_datetime,
     require_currency,
@@ -38,6 +38,7 @@ class OrderIntent:
     quantity: Decimal
     order_type: str
     order_side: OrderSide = OrderSide.BUY
+    time_in_force: TimeInForce = TimeInForce.GTC
     post_only: bool = False
     metadata: Mapping[str, Any] = field(default_factory=FrozenMap)
 
@@ -90,6 +91,7 @@ def intent_to_order(envelope: IntentEnvelope) -> OrderIntent | None:
         quantity=decision.quantity,
         order_type=decision.order_type.value,
         post_only=decision.order_type.value == "post_only",
+        time_in_force=decision.time_in_force,
         metadata={
             "client_order_id": str(decision.client_order_id),
             "strategy_id": str(envelope.strategy_id),

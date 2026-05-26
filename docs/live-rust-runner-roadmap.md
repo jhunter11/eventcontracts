@@ -7,6 +7,10 @@ separate live runtime where Python remains the research and validation
 environment, while Rust owns latency-sensitive live event processing, risk
 gating, gateway command scheduling, and deterministic runtime parity.
 
+For the current remaining implementation backlog from the verified May 26,
+2026 weather/WS baseline to no-trade live paper and tiny-live deployment, see
+`docs/live-deployment-remaining-roadmap.md`.
+
 The guiding rule is simple: no live order placement until the system can prove
 what it saw, what it decided, what risk allowed, what the venue acknowledged,
 what filled, what cash/positions changed, and how the same window replays.

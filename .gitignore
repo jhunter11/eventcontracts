@@ -1,5 +1,10 @@
 .DS_Store
 .env
+ecmodel.txt
+*.pem
+*.key
+*.p8
+*.p12
 .venv/
 __pycache__/
 *.py[cod]
@@ -13,6 +18,8 @@ data/raw/
 data/normalized/
 data/replay/
 data/sports-golf-smoke/
+data/live-ws-probes/
+data/weather-historical/
 notebooks/.ipynb_checkpoints/
 rust/target/
 

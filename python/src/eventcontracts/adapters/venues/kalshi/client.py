@@ -213,6 +213,49 @@ class KalshiPublicClient:
             params["max_ts"] = max_ts
         return await self._get("/markets/trades", params=params)
 
+    async def get_historical_candlesticks_payload(
+        self,
+        *,
+        ticker: str,
+        start_ts: int,
+        end_ts: int,
+        period_interval: int = 1,
+    ) -> dict[str, Any]:
+        if period_interval not in {1, 60, 1440}:
+            raise ValueError("period_interval must be one of 1, 60, or 1440 minutes")
+        return await self._get(
+            f"/historical/markets/{ticker}/candlesticks",
+            params={
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "period_interval": period_interval,
+            },
+        )
+
+    async def get_market_candlesticks_payload(
+        self,
+        *,
+        tickers: Sequence[str],
+        start_ts: int,
+        end_ts: int,
+        period_interval: int = 1,
+    ) -> dict[str, Any]:
+        """Fetch historical market candles from Kalshi's batch candle endpoint."""
+
+        if not tickers:
+            raise ValueError("tickers must not be empty")
+        if period_interval not in {1, 60, 1440}:
+            raise ValueError("period_interval must be one of 1, 60, or 1440 minutes")
+        return await self._get(
+            "/markets/candlesticks",
+            params={
+                "market_tickers": ",".join(tickers),
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "period_interval": period_interval,
+            },
+        )
+
     async def get_recent_trades(self, ticker: str, *, limit: int = 100) -> list[Trade]:
         payload = await self.get_trades_payload(ticker=ticker, limit=limit)
         trades = [_trade_from_payload(_as_dict(item), received_at=_utc_now()) for item in payload.get("trades", [])]

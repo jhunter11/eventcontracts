@@ -23,6 +23,7 @@ from eventcontracts.cli import sports_golf as sports_golf_cmd
 from eventcontracts.cli import sweep as sweep_cmd
 from eventcontracts.cli import train as train_cmd
 from eventcontracts.cli import validate_bundle as validate_bundle_cmd
+from eventcontracts.cli import weather as weather_cmd
 from eventcontracts.config import (
     load_sleeve_spec,
     load_storage_config,
@@ -81,6 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     rank_cmd.register(subparsers)
     train_cmd.register(subparsers)
     sports_golf_cmd.register(subparsers)
+    weather_cmd.register(subparsers)
     validate_bundle_cmd.register(subparsers)
 
     return parser

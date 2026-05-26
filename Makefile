@@ -1,4 +1,4 @@
-.PHONY: quality python-quality test lint typecheck compile rust-check sports-golf-preflight sports-golf-smoke
+.PHONY: quality python-quality test lint typecheck compile rust-check sports-golf-preflight sports-golf-smoke weather-preflight
 
 PYTHON ?= python3
 ifneq ($(findstring /,$(PYTHON)),)
@@ -31,3 +31,6 @@ sports-golf-preflight:
 
 sports-golf-smoke:
 	PYTHONPATH=python/src $(PYTHON_CMD) -m eventcontracts.cli sports-golf-smoke --out data/sports-golf-smoke
+
+weather-preflight:
+	PYTHONPATH=python/src $(PYTHON_CMD) -m eventcontracts.cli weather-preflight
