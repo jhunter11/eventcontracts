@@ -1,0 +1,26 @@
+[package]
+name = "eventcontracts-crypto-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+eventcontracts-crypto-domain = { path = "../crypto-domain" }
+eventcontracts-crypto-pricing = { path = "../crypto-pricing" }
+eventcontracts-crypto-signals = { path = "../crypto-signals" }
+eventcontracts-crypto-historical = { path = "../crypto-historical" }
+eventcontracts-crypto-backtest = { path = "../crypto-backtest" }
+
+chrono.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[[bin]]
+name = "crypto-backtest"
+path = "src/main.rs"

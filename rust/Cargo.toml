@@ -1,9 +1,23 @@
-# Rust workspace for low-latency runtime scaffolds.
+# Rust workspace.
 #
-# The cross-language contract is file formats under ../contracts/, not Python
-# imports. Runtime crates should preserve externally visible decimals,
-# timestamps, IDs, and checksums exactly until parity tests prove parsing
-# behavior.
+# Two layers coexist here:
+#
+# 1. Service-shaped scaffolds (allocator, bus, contracts, feature-builder,
+#    gateway, parity, runner) — the long-horizon plan from
+#    docs/architecture.md for the eventual Rust runtime. They hold trait
+#    surfaces only; method bodies will be implemented as their Python
+#    counterparts stabilize.
+#
+# 2. Research-grade crypto crates (crypto-domain, crypto-pricing,
+#    crypto-signals, crypto-historical, crypto-backtest, crypto-cli) —
+#    a Rust port of python/src/eventcontracts/crypto/ so the same
+#    settlement-PnL backtest can run on the same Kalshi + Deribit data
+#    from either language. These crates carry real implementations and
+#    pull from the same public REST endpoints with no API keys.
+#
+# Cross-language contract: file formats under ../contracts/ (Parquet
+# partitions, TOML specs, JSON envelopes). Rust and Python must agree
+# on bytes — not on imports.
 
 [workspace]
 resolver = "2"
@@ -15,9 +29,28 @@ members = [
     "crates/gateway",
     "crates/parity",
     "crates/runner",
+    "crates/crypto-domain",
+    "crates/crypto-pricing",
+    "crates/crypto-signals",
+    "crates/crypto-historical",
+    "crates/crypto-backtest",
+    "crates/crypto-cli",
 ]
 
 [workspace.package]
 edition = "2021"
 license = "Proprietary"
 publish = false
+
+[workspace.dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+rust_decimal = { version = "1.36", features = ["serde-with-str"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

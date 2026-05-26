@@ -1,0 +1,16 @@
+[package]
+name = "eventcontracts-crypto-signals"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+eventcontracts-crypto-domain = { path = "../crypto-domain" }
+eventcontracts-crypto-pricing = { path = "../crypto-pricing" }
+chrono.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+
+[lib]
+path = "src/lib.rs"
