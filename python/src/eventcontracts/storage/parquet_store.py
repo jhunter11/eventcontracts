@@ -385,7 +385,7 @@ class ParquetEventStore(EventStore, NormalizedEventStore, NormalizationRejectSto
             return iter(())
         files: list[Path] = []
         for path in raw_root.rglob("*.parquet"):
-            if source == "*" or f"/source={source}/" in str(path):
+            if source == "*" or f"/source={source}/" in path.as_posix():
                 files.append(path)
         files.sort()
         return self._yield_envelopes(files)
@@ -421,7 +421,7 @@ class ParquetEventStore(EventStore, NormalizedEventStore, NormalizationRejectSto
             return iter(())
         files: list[Path] = []
         for path in reject_root.rglob("*.parquet"):
-            if source == "*" or f"/source={source}/" in str(path):
+            if source == "*" or f"/source={source}/" in path.as_posix():
                 files.append(path)
         files.sort()
         return self._yield_rejects(files)

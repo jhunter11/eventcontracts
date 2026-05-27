@@ -104,10 +104,10 @@ def test_train_cli_produces_loadable_artifact(tmp_path: Path) -> None:
 model_name = "obi_v1"
 model_version = "v1"
 kind = "linear_regression"
-output = "{model_path}"
+output = "{model_path.as_posix()}"
 
 [data]
-root = "{data_root}"
+root = "{data_root.as_posix()}"
 
 [feature_builder]
 kind = "rolling_mid_vwap_imbalance"
@@ -148,10 +148,10 @@ def test_train_cli_binary_classifier_round_trip(tmp_path: Path) -> None:
 model_name = "obi_clf"
 model_version = "v1"
 kind = "logistic_regression"
-output = "{model_path}"
+output = "{model_path.as_posix()}"
 
 [data]
-root = "{data_root}"
+root = "{data_root.as_posix()}"
 
 [feature_builder]
 kind = "rolling_mid_vwap_imbalance"

@@ -36,6 +36,6 @@ def test_not_implemented_inventory_is_explicit() -> None:
     for path in sorted(src.rglob("*.py")):
         count = path.read_text().count("raise NotImplementedError")
         if count:
-            actual[str(path.relative_to(REPO_ROOT / "python"))] = count
+            actual[path.relative_to(REPO_ROOT / "python").as_posix()] = count
 
     assert actual == EXPECTED_NOT_IMPLEMENTED

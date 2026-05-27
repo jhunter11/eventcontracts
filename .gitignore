@@ -20,6 +20,9 @@ data/replay/
 data/sports-golf-smoke/
 data/live-ws-probes/
 data/weather-historical/
+data/weather-overnight/
+data/live-paper-smoke/
+data/live-paper-overnight/
 notebooks/.ipynb_checkpoints/
 rust/target/
 
