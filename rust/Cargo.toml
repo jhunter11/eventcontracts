@@ -13,7 +13,11 @@ members = [
     "crates/contracts",
     "crates/feature-builder",
     "crates/gateway",
+    "crates/kalshi",
+    "crates/live-runner",
+    "crates/oms",
     "crates/parity",
+    "crates/risk",
     "crates/runner",
 ]
 
@@ -21,3 +25,8 @@ members = [
 edition = "2021"
 license = "Proprietary"
 publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"

@@ -7,6 +7,13 @@ publish.workspace = true
 
 [dependencies]
 eventcontracts-contracts = { path = "../contracts" }
+eventcontracts-gateway = { path = "../gateway" }
+eventcontracts-oms = { path = "../oms" }
+eventcontracts-risk = { path = "../risk" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+toml = "0.8"
 
 [lib]
 path = "src/lib.rs"
