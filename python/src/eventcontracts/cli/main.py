@@ -14,8 +14,10 @@ from typing import cast
 
 from eventcontracts.cli import backtest as backtest_cmd
 from eventcontracts.cli import capture as capture_cmd
+from eventcontracts.cli import capture_weather as capture_weather_cmd
 from eventcontracts.cli import gen_windows as gen_windows_cmd
 from eventcontracts.cli import inspect_data as inspect_data_cmd
+from eventcontracts.cli import live_paper as live_paper_cmd
 from eventcontracts.cli import normalize as normalize_cmd
 from eventcontracts.cli import rank as rank_cmd
 from eventcontracts.cli import replay as replay_cmd
@@ -74,6 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
     _register_validate_config(subparsers)
     backtest_cmd.register(subparsers)
     capture_cmd.register(subparsers)
+    capture_weather_cmd.register(subparsers)
+    live_paper_cmd.register(subparsers)
     normalize_cmd.register(subparsers)
     inspect_data_cmd.register(subparsers)
     replay_cmd.register(subparsers)
