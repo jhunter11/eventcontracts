@@ -30,6 +30,25 @@ cd C:\QWS\eventcontracts
 That gives you 12 hours, re-discovering open weather markets every 10 minutes,
 with a progress line on stderr every 60s.
 
+## Fast launch for known weather series
+
+When the exact weather series is known, prefer direct series discovery. This
+avoids scanning unrelated open markets and also includes `initialized` markets,
+so the WebSocket can subscribe before the market turns active:
+
+```powershell
+.venv\Scripts\eventcontracts.exe capture-weather `
+  --out data\weather-overnight `
+  --patterns "KXTEMP*" `
+  --series-tickers "KXTEMPNYCH" `
+  --rediscover-interval-seconds 60 `
+  --max-duration-seconds 43200 `
+  --snapshot-interval-seconds 30 `
+  --idle-poll-seconds 5 `
+  --discover-timeout-seconds 45 `
+  --discover-max-pages 1
+```
+
 ## Recommended launch (overnight)
 
 ```powershell

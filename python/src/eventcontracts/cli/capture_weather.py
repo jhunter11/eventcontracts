@@ -45,6 +45,7 @@ DEFAULT_PATTERNS: tuple[str, ...] = (
     "KXWX*",
     "KXLOW*",
 )
+DEFAULT_SERIES_TICKERS: tuple[str, ...] = ()
 DEFAULT_CHANNELS: tuple[str, ...] = (
     "ticker",
     "trade",
@@ -68,6 +69,15 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         "--patterns",
         default=",".join(DEFAULT_PATTERNS),
         help=f"Comma-separated market-ticker glob patterns. Default: {','.join(DEFAULT_PATTERNS)}",
+    )
+    parser.add_argument(
+        "--series-tickers",
+        default=",".join(DEFAULT_SERIES_TICKERS),
+        help=(
+            "Optional comma-separated Kalshi series tickers to discover directly "
+            "(for example KXTEMPNYCH). This includes initialized markets so WS "
+            "can subscribe before the turn."
+        ),
     )
     parser.add_argument(
         "--channels",
@@ -133,6 +143,7 @@ class CaptureStats:
 
 def _handle(args: argparse.Namespace) -> int:
     patterns = tuple(p.strip() for p in args.patterns.split(",") if p.strip())
+    series_tickers = tuple(s.strip() for s in args.series_tickers.split(",") if s.strip())
     channels = tuple(c.strip() for c in args.channels.split(",") if c.strip())
     if not patterns:
         print("error: --patterns must include at least one entry", file=sys.stderr)
@@ -165,6 +176,7 @@ def _handle(args: argparse.Namespace) -> int:
 
     print(
         f"[capture-weather] starting; out={args.out} patterns={patterns} "
+        f"series={series_tickers or '-'} "
         f"channels={channels} rediscover={args.rediscover_interval_seconds}s "
         f"max={args.max_duration_seconds}s",
         file=sys.stderr,
@@ -177,6 +189,7 @@ def _handle(args: argparse.Namespace) -> int:
                 store=store,
                 stats=stats,
                 patterns=patterns,
+                series_tickers=series_tickers,
                 channels=channels,
                 rediscover_interval=args.rediscover_interval_seconds,
                 max_duration=args.max_duration_seconds,
@@ -189,7 +202,7 @@ def _handle(args: argparse.Namespace) -> int:
         )
     finally:
         store.flush()
-        manifest = _write_manifest(args.out, stats, patterns, channels, args)
+        manifest = _write_manifest(args.out, stats, patterns, series_tickers, channels, args)
         print(
             f"[capture-weather] done; envelopes={stats.total_envelopes} "
             f"sessions={stats.sessions} manifest={manifest}",
@@ -207,6 +220,7 @@ async def _run_loop(
     store: ParquetEventStore,
     stats: CaptureStats,
     patterns: Sequence[str],
+    series_tickers: Sequence[str],
     channels: Sequence[str],
     rediscover_interval: int,
     max_duration: int,
@@ -222,22 +236,23 @@ async def _run_loop(
     snapshot_task = asyncio.create_task(
         _snapshot_loop(stats, interval=snapshot_interval, shutdown=shutdown)
     )
+    last_tickers: tuple[str, ...] = ()
 
     try:
         while not shutdown.is_set() and datetime.now(UTC) < deadline:
             try:
                 tickers = await asyncio.wait_for(
-                    _discover(rest, patterns, max_pages=discover_max_pages),
+                    _discover(rest, patterns, series_tickers=series_tickers, max_pages=discover_max_pages),
                     timeout=discover_timeout,
                 )
             except TimeoutError:
                 print(
                     f"[capture-weather] discovery exceeded {discover_timeout}s; "
-                    f"treating as empty and re-polling",
+                    f"keeping {len(last_tickers)} previous markets",
                     file=sys.stderr,
                     flush=True,
                 )
-                tickers = tuple()
+                tickers = last_tickers
             stats.last_discovery_at = datetime.now(UTC)
             stats.last_discovered_count = len(tickers)
 
@@ -251,6 +266,7 @@ async def _run_loop(
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(shutdown.wait(), timeout=idle_poll)
                 continue
+            last_tickers = tickers
 
             stats.sessions += 1
             print(
@@ -276,7 +292,11 @@ async def _run_loop(
 
 
 async def _discover(
-    rest: KalshiPublicClient, patterns: Sequence[str], *, max_pages: int
+    rest: KalshiPublicClient,
+    patterns: Sequence[str],
+    *,
+    series_tickers: Sequence[str] = (),
+    max_pages: int,
 ) -> tuple[str, ...]:
     """Discover Kalshi markets matching weather patterns.
 
@@ -287,10 +307,32 @@ async def _discover(
     exact = {p for p in patterns if not any(c in p for c in "*?[]")}
     globs = [p for p in patterns if any(c in p for c in "*?[]")]
     matched: set[str] = set(exact)
-    cursor: str | None = None
+
+    if series_tickers:
+        for series_ticker in series_tickers:
+            series_cursor: str | None = None
+            for _ in range(max_pages):
+                payload = await rest.get_markets_payload(
+                    limit=1000, cursor=series_cursor, series_ticker=series_ticker
+                )
+                for market in payload.get("markets", []) or []:
+                    if not isinstance(market, dict) or not _is_live_or_upcoming_market(market):
+                        continue
+                    ticker = market.get("ticker") or market.get("market_ticker")
+                    if not isinstance(ticker, str):
+                        continue
+                    if ticker in exact or any(fnmatch.fnmatchcase(ticker, glob) for glob in globs):
+                        matched.add(ticker)
+                cursor_value = payload.get("cursor")
+                if not cursor_value:
+                    break
+                series_cursor = str(cursor_value)
+        return tuple(sorted(matched))
+
+    page_cursor: str | None = None
     for page_index in range(max_pages):
         payload = await rest.get_markets_payload(
-            limit=1000, cursor=cursor, status="open"
+            limit=1000, cursor=page_cursor, status="open"
         )
         markets = payload.get("markets", []) or []
         for market in markets:
@@ -304,9 +346,14 @@ async def _discover(
         cursor_value = payload.get("cursor")
         if not cursor_value:
             break
-        cursor = str(cursor_value)
+        page_cursor = str(cursor_value)
         _ = page_index  # silence ruff if unused
     return tuple(sorted(matched))
+
+
+def _is_live_or_upcoming_market(market: dict[str, object]) -> bool:
+    status = market.get("status")
+    return isinstance(status, str) and status.lower() in {"active", "initialized", "open"}
 
 
 async def _stream_session(
@@ -432,6 +479,7 @@ def _write_manifest(
     out: Path,
     stats: CaptureStats,
     patterns: Sequence[str],
+    series_tickers: Sequence[str],
     channels: Sequence[str],
     args: argparse.Namespace,
 ) -> Path:
@@ -448,6 +496,7 @@ def _write_manifest(
         "kalshi_env": os.environ.get("KALSHI_ENV", "unknown"),
         "output_root": str(out),
         "patterns": list(patterns),
+        "series_tickers": list(series_tickers),
         "channels": list(channels),
         "rediscover_interval_seconds": args.rediscover_interval_seconds,
         "max_duration_seconds": args.max_duration_seconds,
