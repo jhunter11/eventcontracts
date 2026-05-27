@@ -80,6 +80,26 @@ Both subscribe to the same markets; running them in parallel is intentional.
 The capture is the durable record (replayable, deterministic); the live-paper
 is the in-flight strategy log.
 
+## Fast launch for known weather series
+
+For the NYC hourly temperature ladder, use direct series discovery so
+`initialized` markets are included before they turn active:
+
+```powershell
+.venv\Scripts\eventcontracts.exe live-paper `
+  --strategy configs\strategies\weather-temperature-arbitrage.toml `
+  --sleeve   configs\sleeves\weather-kalshi-paper-a.toml `
+  --out      data\live-paper-nyc `
+  --patterns "KXTEMP*" `
+  --series-tickers "KXTEMPNYCH" `
+  --rediscover-interval-seconds 60 `
+  --forecast-interval-seconds 60 `
+  --snapshot-interval-seconds 30 `
+  --max-duration-seconds 43200 `
+  --discover-timeout-seconds 45 `
+  --discover-max-pages 1
+```
+
 ## Output layout
 
 ```

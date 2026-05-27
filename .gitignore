@@ -23,6 +23,8 @@ data/weather-historical/
 data/weather-overnight/
 data/live-paper-smoke/
 data/live-paper-overnight/
+data/live-paper-nyc/
+data/live-paper-nyc-smoke/
 notebooks/.ipynb_checkpoints/
 rust/target/
 

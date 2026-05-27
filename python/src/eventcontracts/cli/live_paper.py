@@ -99,6 +99,15 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         help="Comma-separated weather ticker glob patterns.",
     )
     parser.add_argument(
+        "--series-tickers",
+        default="",
+        help=(
+            "Optional comma-separated Kalshi series tickers to discover directly "
+            "(for example KXTEMPNYCH). Includes initialized markets so paper "
+            "recording can start before the market turns active."
+        ),
+    )
+    parser.add_argument(
         "--channels",
         default=",".join(DEFAULT_KALSHI_CHANNELS),
         help="Kalshi WS channels.",
@@ -195,6 +204,7 @@ def _handle(args: argparse.Namespace) -> int:
     strategy_spec = load_strategy_spec(args.strategy)
     sleeve_spec = load_sleeve_spec(args.sleeve)
     patterns = tuple(p.strip() for p in args.patterns.split(",") if p.strip())
+    series_tickers = tuple(s.strip() for s in args.series_tickers.split(",") if s.strip())
     channels = tuple(c.strip() for c in args.channels.split(",") if c.strip())
     if not patterns:
         print("error: --patterns must include at least one entry", file=sys.stderr)
@@ -237,6 +247,7 @@ def _handle(args: argparse.Namespace) -> int:
                 risk_gate=risk_gate,
                 threshold_model=threshold_model,
                 patterns=patterns,
+                series_tickers=series_tickers,
                 channels=channels,
                 files=files,
                 stats=stats,
@@ -246,7 +257,7 @@ def _handle(args: argparse.Namespace) -> int:
         )
     finally:
         manifest = _write_manifest(
-            run_dir, stats, strategy_spec, sleeve_spec, patterns, channels, args
+            run_dir, stats, strategy_spec, sleeve_spec, patterns, series_tickers, channels, args
         )
         print(
             f"[live-paper] done; decisions={stats.decisions} "
@@ -268,6 +279,7 @@ async def _run(
     risk_gate: AllowAllRiskGate,
     threshold_model: TemperatureThresholdModel,
     patterns: Sequence[str],
+    series_tickers: Sequence[str],
     channels: Sequence[str],
     files: RunFiles,
     stats: LiveStats,
@@ -295,6 +307,7 @@ async def _run(
                 catalog=catalog,
                 channels=channels,
                 patterns=patterns,
+                series_tickers=series_tickers,
                 event_queue=event_queue,
                 handlers=handlers,
                 stats=stats,
@@ -372,6 +385,7 @@ async def _ws_loop(
     catalog: WeatherMarketCatalog,
     channels: Sequence[str],
     patterns: Sequence[str],
+    series_tickers: Sequence[str],
     event_queue: asyncio.Queue[NormalizedEvent],
     handlers: dict[Any, Any],
     stats: LiveStats,
@@ -381,16 +395,27 @@ async def _ws_loop(
     discover_timeout: int,
     discover_max_pages: int,
 ) -> None:
+    last_tickers: tuple[str, ...] = ()
+    last_contracts: tuple[KalshiTemperatureContract, ...] = ()
     while not shutdown.is_set() and datetime.now(UTC) < deadline:
         try:
             tickers, contracts = await asyncio.wait_for(
-                _discover_weather_markets(rest, patterns, discover_max_pages),
+                _discover_weather_markets(
+                    rest,
+                    patterns,
+                    discover_max_pages,
+                    series_tickers=series_tickers,
+                ),
                 timeout=discover_timeout,
             )
         except TimeoutError:
-            print("[live-paper] discovery timed out; retrying in 60s", file=sys.stderr, flush=True)
-            await _wait_or_shutdown(shutdown, 60)
-            continue
+            print(
+                f"[live-paper] discovery timed out; keeping {len(last_tickers)} previous markets",
+                file=sys.stderr,
+                flush=True,
+            )
+            tickers = last_tickers
+            contracts = last_contracts
         stats.discoveries += 1
         stats.last_discovered_markets = len(tickers)
         catalog.update(contracts)
@@ -404,6 +429,8 @@ async def _ws_loop(
             )
             await _wait_or_shutdown(shutdown, rediscover_interval)
             continue
+        last_tickers = tickers
+        last_contracts = contracts
 
         print(
             f"[live-paper] subscribing to {len(tickers)} markets across "
@@ -461,7 +488,13 @@ async def _stream_ws(
             normalized = handler(envelope)
         except Exception as exc:  # noqa: BLE001
             stats.normalize_skipped += 1
-            print(f"[live-paper] normalize error on {chan}: {exc}", file=sys.stderr, flush=True)
+            if stats.normalize_skipped <= 5 or stats.normalize_skipped % 100 == 0:
+                print(
+                    f"[live-paper] normalize error on {chan}: {exc} "
+                    f"(skipped={stats.normalize_skipped})",
+                    file=sys.stderr,
+                    flush=True,
+                )
             continue
         stats.normalized_events += 1
         stats.last_event_at = datetime.now(UTC)
@@ -469,12 +502,43 @@ async def _stream_ws(
 
 
 async def _discover_weather_markets(
-    rest: KalshiPublicClient, patterns: Sequence[str], max_pages: int
+    rest: KalshiPublicClient,
+    patterns: Sequence[str],
+    max_pages: int,
+    *,
+    series_tickers: Sequence[str] = (),
 ) -> tuple[tuple[str, ...], tuple[KalshiTemperatureContract, ...]]:
     globs = [p for p in patterns if any(c in p for c in "*?[]")]
     exact = {p for p in patterns if not any(c in p for c in "*?[]")}
     matched_tickers: set[str] = set(exact)
     contracts: list[KalshiTemperatureContract] = []
+
+    if series_tickers:
+        for series_ticker in series_tickers:
+            series_cursor: str | None = None
+            for _ in range(max_pages):
+                payload = await rest.get_markets_payload(
+                    limit=1000,
+                    cursor=series_cursor,
+                    series_ticker=series_ticker,
+                )
+                for market in payload.get("markets", []) or []:
+                    if not isinstance(market, dict) or not _is_live_or_upcoming_market(market):
+                        continue
+                    ticker = market.get("ticker") or market.get("market_ticker")
+                    if not isinstance(ticker, str):
+                        continue
+                    if ticker in exact or any(fnmatch.fnmatchcase(ticker, g) for g in globs):
+                        matched_tickers.add(ticker)
+                        contract = parse_kalshi_temperature_contract(market)
+                        if contract is not None:
+                            contracts.append(contract)
+                cursor_value = payload.get("cursor")
+                if not cursor_value:
+                    break
+                series_cursor = str(cursor_value)
+        return tuple(sorted(matched_tickers)), tuple(contracts)
+
     cursor: str | None = None
     for _ in range(max_pages):
         payload = await rest.get_markets_payload(limit=1000, cursor=cursor, status="open")
@@ -495,6 +559,11 @@ async def _discover_weather_markets(
             break
         cursor = str(cursor_value)
     return tuple(sorted(matched_tickers)), tuple(contracts)
+
+
+def _is_live_or_upcoming_market(market: dict[str, object]) -> bool:
+    status = market.get("status")
+    return isinstance(status, str) and status.lower() in {"active", "initialized", "open"}
 
 
 # ---------- forecast loop ----------
@@ -780,6 +849,7 @@ def _write_manifest(
     strategy_spec: Any,
     sleeve_spec: Any,
     patterns: Sequence[str],
+    series_tickers: Sequence[str],
     channels: Sequence[str],
     args: argparse.Namespace,
 ) -> Path:
@@ -806,6 +876,7 @@ def _write_manifest(
             else str(sleeve_spec.venue),
         },
         "patterns": list(patterns),
+        "series_tickers": list(series_tickers),
         "channels": list(channels),
         "args": {
             "max_duration_seconds": args.max_duration_seconds,
