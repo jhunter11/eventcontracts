@@ -16,7 +16,7 @@ from decimal import Decimal
 
 from eventcontracts.domain.decisions import PlaceOrder
 from eventcontracts.domain.orders import Order, OrderSide
-from eventcontracts.domain.positions import Exposure, Position
+from eventcontracts.domain.positions import CashBalance, Exposure, Position
 from eventcontracts.domain.spec import RiskProfile
 
 
@@ -97,6 +97,14 @@ def check_gross_exposure(
     projected = exposure.gross_notional + order_notional(order)
     if projected > profile.max_gross_exposure:
         return ("max_gross_exposure",)
+    return ()
+
+
+def check_available_cash(order: PlaceOrder, balance: CashBalance) -> tuple[str, ...]:
+    """Reject if the order would spend more cash than is currently available."""
+
+    if order_notional(order) > balance.available:
+        return ("available_cash",)
     return ()
 
 

@@ -11,6 +11,7 @@ import pytest
 from eventcontracts.config import load_sleeve_spec, load_strategy_spec
 from eventcontracts.domain import (
     CancelOrder,
+    CashBalance,
     ClientOrderId,
     CorrelationId,
     EventId,
@@ -139,12 +140,40 @@ def test_strategy_specs_emit_smoke_decisions(
         strategy_id_value=spec.strategy_id,
         sleeve_id_value=SleeveId("test-sleeve"),
         clock_now=NOW,
+        cash_by_ccy={
+            "USD": CashBalance(
+                currency="USD",
+                total=Decimal("10000"),
+                available=Decimal("10000"),
+                held_for_orders=Decimal("0"),
+                settling=Decimal("0"),
+                updated_at=NOW,
+            )
+        },
     )
 
     decisions = scenario(strategy, ctx)
 
     assert decisions
     assert not all(isinstance(decision, NoAction) for decision in decisions)
+
+
+def test_weather_strategy_requires_available_cash_for_order_sizing() -> None:
+    spec = load_strategy_spec(CONFIGS / "strategies" / "weather-temperature-arbitrage.toml")
+    strategy = create_from_spec(spec)
+    ctx = InMemoryContext(
+        strategy_id_value=spec.strategy_id,
+        sleeve_id_value=SleeveId("test-sleeve"),
+        clock_now=NOW,
+    )
+
+    decisions = _weather(strategy, ctx)
+
+    assert all(isinstance(decision, NoAction) for decision in decisions)
+    assert any(
+        isinstance(decision, NoAction) and decision.reason == "censored:no_available_cash"
+        for decision in decisions
+    )
 
 
 def _weather(strategy: Strategy, ctx: InMemoryContext) -> Sequence[StrategyDecision]:

@@ -2,6 +2,7 @@
 
 from eventcontracts.adapters.venues.kalshi.client import (
     KalshiAuth,
+    KalshiBalanceSnapshot,
     KalshiEnvironment,
     KalshiPublicClient,
     KalshiWebSocketClient,
@@ -13,6 +14,7 @@ KalshiMarketDataClient = KalshiPublicClient
 
 __all__ = [
     "KalshiAuth",
+    "KalshiBalanceSnapshot",
     "KalshiEnvironment",
     "KalshiFeeModel",
     "KalshiMarketDataClient",

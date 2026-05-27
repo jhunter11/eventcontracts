@@ -19,7 +19,7 @@ from eventcontracts.domain.ids import (
 )
 from eventcontracts.domain.models import InstrumentId, OutcomeSide, Venue
 from eventcontracts.domain.orders import OrderSide, OrderType, TimeInForce
-from eventcontracts.domain.positions import Exposure, Position
+from eventcontracts.domain.positions import CashBalance, Exposure, Position
 from eventcontracts.domain.spec import RiskProfile, SleeveSpec
 from eventcontracts.risk import (
     DailyLossLedger,
@@ -84,6 +84,19 @@ def _envelope(decision: PlaceOrder | CancelOrder) -> IntentEnvelope:
 
 
 def _ctx(**kwargs: object) -> InMemoryContext:
+    kwargs.setdefault(
+        "cash_by_ccy",
+        {
+            "USD": CashBalance(
+                currency="USD",
+                total=Decimal("10000"),
+                available=Decimal("10000"),
+                held_for_orders=Decimal("0"),
+                settling=Decimal("0"),
+                updated_at=NOW,
+            )
+        },
+    )
     return InMemoryContext(
         strategy_id_value=StrategyId("strat-1"),
         sleeve_id_value=SleeveId("sleeve-1"),
@@ -101,6 +114,25 @@ def test_order_notional_limit_rejects() -> None:
     verdict = gate.evaluate(_envelope(big), _ctx())
     assert not verdict.allowed
     assert "max_order_notional" in verdict.reasons
+
+
+def test_available_cash_rejects_overspend() -> None:
+    gate = SleeveRiskGate(sleeve=_sleeve(_profile(max_order_notional=Decimal("1000"))))
+    ctx = _ctx(
+        cash_by_ccy={
+            "USD": CashBalance(
+                currency="USD",
+                total=Decimal("10"),
+                available=Decimal("10"),
+                held_for_orders=Decimal("0"),
+                settling=Decimal("0"),
+                updated_at=NOW,
+            )
+        }
+    )
+    verdict = gate.evaluate(_envelope(_place_order(quantity="50", price="0.5")), ctx)
+    assert not verdict.allowed
+    assert "available_cash" in verdict.reasons
 
 
 def test_max_open_orders_blocks_new_orders() -> None:

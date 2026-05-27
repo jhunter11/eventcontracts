@@ -30,6 +30,7 @@ from eventcontracts.domain.events import NormalizedEvent
 from eventcontracts.domain.fees import FeeModel
 from eventcontracts.domain.fills import Fill
 from eventcontracts.domain.models import Venue
+from eventcontracts.domain.positions import CashBalance
 from eventcontracts.domain.spec import SleeveSpec, StrategySpec
 from eventcontracts.execution import (
     BacktestReport,
@@ -216,11 +217,25 @@ def run_backtest(
             yield event
 
     clock = InMemoryClock()
+    starting_cash = Decimal(str(starting_equity))
+    if starting_cash <= 0:
+        starting_cash = sleeve_spec.capital_allocation
+
     ctx = InMemoryContext(
         strategy_id_value=strategy_spec.strategy_id,
         sleeve_id_value=sleeve_spec.sleeve_id,
         clock_now=clock.current,
         model_runner=model_runner,
+        cash_by_ccy={
+            sleeve_spec.currency: CashBalance(
+                currency=sleeve_spec.currency,
+                total=starting_cash,
+                available=starting_cash,
+                held_for_orders=Decimal("0"),
+                settling=Decimal("0"),
+                updated_at=clock.current,
+            )
+        },
     )
 
     # Feature wiring: each emitted vector is persisted to the store and

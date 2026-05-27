@@ -25,9 +25,11 @@ The runner is intended to be launched alongside
 5. **Feeds** both event streams (normalized Kalshi events + forecast signals)
    into `WeatherTemperatureArbitrageStrategy` (resolved from the spec via the
    strategy registry).
-6. **Records** every `IntentEnvelope` and risk verdict to JSONL.
-7. **Snapshots** stderr progress every N seconds (`--snapshot-interval-seconds`).
-8. **Shuts down** cleanly on Ctrl-C / SIGTERM, flushes files, writes a manifest.
+6. **Refreshes cash** from Kalshi `GET /portfolio/balance` into
+   `ctx.cash(currency).available` by default.
+7. **Records** every `IntentEnvelope` and risk verdict to JSONL.
+8. **Snapshots** stderr progress every N seconds (`--snapshot-interval-seconds`).
+9. **Shuts down** cleanly on Ctrl-C / SIGTERM, flushes files, writes a manifest.
 
 No orders are ever sent. There is no live `VenueGateway` imported by this
 module by design.
@@ -80,6 +82,19 @@ Both subscribe to the same markets; running them in parallel is intentional.
 The capture is the durable record (replayable, deterministic); the live-paper
 is the in-flight strategy log.
 
+Sizing note: the default `--cash-source account` reads Kalshi's authenticated
+`/portfolio/balance` endpoint and puts the returned available trading cash
+into `ctx.cash(currency).available`. The weather strategy sizes from that
+context cash, and `SleeveRiskGate` rejects any order intent whose notional
+exceeds available cash. For deterministic local tests without account
+credentials, use `--cash-source sleeve` to seed context cash from the sleeve's
+`capital_allocation`. If no available cash is present in context, the weather
+strategy emits no order intent.
+
+`--cash-source account` requires `KALSHI_API_KEY_ID` and
+`KALSHI_PRIVATE_KEY_PATH` to be present for the process. Without those, the
+runner exits instead of silently falling back to sleeve allocation.
+
 ## Fast launch for known weather series
 
 For the NYC hourly temperature ladder, use direct series discovery so
@@ -92,6 +107,8 @@ For the NYC hourly temperature ladder, use direct series discovery so
   --out      data\live-paper-nyc `
   --patterns "KXTEMP*" `
   --series-tickers "KXTEMPNYCH" `
+  --cash-source account `
+  --balance-refresh-seconds 60 `
   --rediscover-interval-seconds 60 `
   --forecast-interval-seconds 60 `
   --snapshot-interval-seconds 30 `

@@ -17,6 +17,7 @@ from pathlib import Path
 
 from eventcontracts.adapters.venues.kalshi import KalshiFeeModel
 from eventcontracts.domain import (
+    CashBalance,
     EventSubscription,
     RiskProfile,
     SleeveId,
@@ -170,6 +171,16 @@ def _run_one_pass(root: Path) -> BacktestReport:
                 strategy_id_value=spec.strategy_id,
                 sleeve_id_value=sleeve.sleeve_id,
                 clock_now=NOW,
+                cash_by_ccy={
+                    "USD": CashBalance(
+                        currency="USD",
+                        total=Decimal("1000"),
+                        available=Decimal("1000"),
+                        held_for_orders=Decimal("0"),
+                        settling=Decimal("0"),
+                        updated_at=NOW,
+                    )
+                },
             )
         ),
     )

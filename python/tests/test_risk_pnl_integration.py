@@ -26,6 +26,7 @@ from eventcontracts.domain.ids import (
 )
 from eventcontracts.domain.models import InstrumentId, OutcomeSide, Venue
 from eventcontracts.domain.orders import Liquidity, OrderSide, OrderType, TimeInForce
+from eventcontracts.domain.positions import CashBalance
 from eventcontracts.domain.spec import RiskProfile, SleeveSpec
 from eventcontracts.execution import PnLTracker
 from eventcontracts.risk import DailyLossLedger, SleeveRiskGate
@@ -100,6 +101,16 @@ def _ctx() -> InMemoryContext:
         strategy_id_value=StrategyId("strat-1"),
         sleeve_id_value=SleeveId("s-1"),
         clock_now=NOW,
+        cash_by_ccy={
+            "USD": CashBalance(
+                currency="USD",
+                total=Decimal("10000"),
+                available=Decimal("10000"),
+                held_for_orders=Decimal("0"),
+                settling=Decimal("0"),
+                updated_at=NOW,
+            )
+        },
     )
 
 

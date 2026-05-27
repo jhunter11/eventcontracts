@@ -11,17 +11,17 @@ here:
 
 - composes existing pieces (KalshiNormalizer, Open-Meteo client,
   TemperatureThresholdModel, WeatherTemperatureArbitrageStrategy, the
-  InMemoryContext, an allow-all risk gate) into a single async loop,
+  InMemoryContext, and SleeveRiskGate) into a single async loop,
 - discovers Kalshi weather contracts periodically,
 - polls forecasts per unique location on a schedule,
 - writes decisions / risk verdicts / forecast snapshots to a run directory,
+- refreshes authenticated Kalshi account cash into `ctx.cash(...)` by default,
 - prints stderr snapshots every N seconds,
 - shuts down cleanly on Ctrl-C / SIGTERM.
 
 Out of scope for this MVP (called out in the manifest under `limits`):
 fill simulation, sequence-gap recovery on WS reconnect, persistent state
-checkpoints, multi-strategy / multi-sleeve, real risk gate driven by the
-sleeve's `risk` block.
+checkpoints, multi-strategy / multi-sleeve.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -60,10 +61,12 @@ from eventcontracts.domain.decisions import (
 )
 from eventcontracts.domain.events import NormalizedEvent
 from eventcontracts.domain.ids import CorrelationId, SleeveId, StrategyId
+from eventcontracts.domain.positions import CashBalance
 from eventcontracts.normalization.kalshi import KalshiNormalizer
+from eventcontracts.risk.policy import SleeveRiskGate
 from eventcontracts.runner.ports import RiskDecision
 from eventcontracts.strategy.registry import create_from_spec
-from eventcontracts.testing.doubles import AllowAllRiskGate, InMemoryContext
+from eventcontracts.testing.doubles import InMemoryContext
 from eventcontracts.weather.clients import OpenMeteoClient
 from eventcontracts.weather.temperature import (
     TemperatureThresholdMarket,
@@ -147,6 +150,27 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         default=5,
         help="Max REST pages per discovery (1000 markets/page).",
     )
+    parser.add_argument(
+        "--cash-source",
+        choices=("account", "sleeve"),
+        default="account",
+        help=(
+            "Source for ctx.cash(currency).available. "
+            "Default account fetches Kalshi /portfolio/balance; sleeve uses the TOML allocation."
+        ),
+    )
+    parser.add_argument(
+        "--balance-refresh-seconds",
+        type=int,
+        default=60,
+        help="Refresh Kalshi account balance every N seconds when --cash-source=account.",
+    )
+    parser.add_argument(
+        "--kalshi-subaccount",
+        type=int,
+        default=0,
+        help="Kalshi subaccount number for /portfolio/balance. Default 0 = primary.",
+    )
     parser.set_defaults(handler=_handle)
 
 
@@ -168,6 +192,9 @@ class LiveStats:
     risk_reject_reasons: dict[str, int] = field(default_factory=dict)
     discoveries: int = 0
     last_discovered_markets: int = 0
+    cash_source: str = ""
+    cash_available: Decimal | None = None
+    cash_updated_at: datetime | None = None
     last_forecast_at: datetime | None = None
     last_event_at: datetime | None = None
     by_channel: dict[str, int] = field(default_factory=dict)
@@ -235,9 +262,10 @@ def _handle(args: argparse.Namespace) -> int:
     )
 
     strategy = create_from_spec(strategy_spec)
-    risk_gate = AllowAllRiskGate()
+    risk_gate = SleeveRiskGate(sleeve_spec)
     threshold_model = TemperatureThresholdModel()
 
+    exit_code = 0
     try:
         asyncio.run(
             _run(
@@ -255,6 +283,9 @@ def _handle(args: argparse.Namespace) -> int:
                 shutdown=shutdown,
             )
         )
+    except Exception as exc:  # noqa: BLE001
+        exit_code = 1
+        print(f"[live-paper] failed: {exc!r}", file=sys.stderr, flush=True)
     finally:
         manifest = _write_manifest(
             run_dir, stats, strategy_spec, sleeve_spec, patterns, series_tickers, channels, args
@@ -265,7 +296,7 @@ def _handle(args: argparse.Namespace) -> int:
             file=sys.stderr,
             flush=True,
         )
-    return 0
+    return exit_code
 
 
 # ---------- async orchestration ----------
@@ -276,7 +307,7 @@ async def _run(
     strategy: Any,
     strategy_spec: Any,
     sleeve_spec: Any,
-    risk_gate: AllowAllRiskGate,
+    risk_gate: SleeveRiskGate,
     threshold_model: TemperatureThresholdModel,
     patterns: Sequence[str],
     series_tickers: Sequence[str],
@@ -295,7 +326,19 @@ async def _run(
     handlers = normalizer.handlers()
 
     # Initial strategy lifecycle.
-    ctx_provider = _ContextProvider(strategy_spec.strategy_id, sleeve_spec.sleeve_id)
+    cash_balance = await _initial_cash_balance(
+        rest=rest,
+        sleeve_spec=sleeve_spec,
+        cash_source=args.cash_source,
+        subaccount=args.kalshi_subaccount,
+    )
+    _record_cash_stats(stats, args.cash_source, cash_balance)
+    ctx_provider = _ContextProvider(
+        strategy_spec.strategy_id,
+        sleeve_spec.sleeve_id,
+        sleeve_spec.currency,
+        cash_balance,
+    )
     strategy.on_init(ctx_provider.context())
 
     tasks: list[asyncio.Task[Any]] = []
@@ -334,6 +377,21 @@ async def _run(
             )
         )
     )
+    if args.cash_source == "account":
+        tasks.append(
+            asyncio.create_task(
+                _balance_loop(
+                    rest=rest,
+                    ctx_provider=ctx_provider,
+                    stats=stats,
+                    currency=sleeve_spec.currency,
+                    subaccount=args.kalshi_subaccount,
+                    interval=args.balance_refresh_seconds,
+                    shutdown=shutdown,
+                    deadline=deadline,
+                )
+            )
+        )
     tasks.append(
         asyncio.create_task(
             _snapshot_loop(
@@ -668,7 +726,7 @@ async def _strategy_loop(
     strategy: Any,
     strategy_spec: Any,
     sleeve_spec: Any,
-    risk_gate: AllowAllRiskGate,
+    risk_gate: SleeveRiskGate,
     ctx_provider: _ContextProvider,
     event_queue: asyncio.Queue[NormalizedEvent],
     files: RunFiles,
@@ -769,16 +827,112 @@ class WeatherMarketCatalog:
         )
 
 
+async def _initial_cash_balance(
+    *,
+    rest: KalshiPublicClient,
+    sleeve_spec: Any,
+    cash_source: str,
+    subaccount: int,
+) -> CashBalance:
+    if cash_source == "account":
+        try:
+            balance = await rest.get_cash_balance(
+                currency=sleeve_spec.currency,
+                subaccount=subaccount,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "could not read Kalshi account balance from /portfolio/balance; "
+                "set KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PATH for "
+                "--cash-source account, or use --cash-source sleeve for dry paper"
+            ) from exc
+        print(
+            f"[live-paper] account cash={balance.available} {balance.currency} "
+            f"updated_at={balance.updated_at.isoformat()}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return balance
+    return _sleeve_cash_balance(sleeve_spec)
+
+
+async def _balance_loop(
+    *,
+    rest: KalshiPublicClient,
+    ctx_provider: _ContextProvider,
+    stats: LiveStats,
+    currency: str,
+    subaccount: int,
+    interval: int,
+    shutdown: asyncio.Event,
+    deadline: datetime,
+) -> None:
+    while not shutdown.is_set() and datetime.now(UTC) < deadline:
+        await _wait_or_shutdown(shutdown, interval)
+        if shutdown.is_set() or datetime.now(UTC) >= deadline:
+            return
+        try:
+            balance = await rest.get_cash_balance(
+                currency=currency,
+                subaccount=subaccount,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[live-paper] balance refresh failed: {exc!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
+        ctx_provider.update_cash(balance)
+        _record_cash_stats(stats, "account", balance)
+
+
+def _sleeve_cash_balance(sleeve_spec: Any) -> CashBalance:
+    now = datetime.now(UTC)
+    available = Decimal(str(sleeve_spec.capital_allocation))
+    return CashBalance(
+        currency=sleeve_spec.currency,
+        total=available,
+        available=available,
+        held_for_orders=Decimal("0"),
+        settling=Decimal("0"),
+        updated_at=now,
+    )
+
+
+def _record_cash_stats(stats: LiveStats, cash_source: str, balance: CashBalance) -> None:
+    stats.cash_source = cash_source
+    stats.cash_available = balance.available
+    stats.cash_updated_at = balance.updated_at
+
+
 @dataclass
 class _ContextProvider:
     strategy_id: StrategyId
     sleeve_id: SleeveId
+    currency: str
+    cash_balance: CashBalance
+
+    def update_cash(self, cash_balance: CashBalance) -> None:
+        self.cash_balance = cash_balance
 
     def context(self) -> InMemoryContext:
+        now = datetime.now(UTC)
+        balance = self.cash_balance
         return InMemoryContext(
             strategy_id_value=self.strategy_id,
             sleeve_id_value=self.sleeve_id,
-            clock_now=datetime.now(UTC),
+            clock_now=now,
+            cash_by_ccy={
+                self.currency: CashBalance(
+                    currency=balance.currency,
+                    total=balance.total,
+                    available=balance.available,
+                    held_for_orders=balance.held_for_orders,
+                    settling=balance.settling,
+                    updated_at=balance.updated_at,
+                ),
+            },
         )
 
 
@@ -830,6 +984,7 @@ def _print_snapshot(stats: LiveStats) -> None:
     rate = stats.normalized_events / elapsed
     last_ev = stats.last_event_at.isoformat() if stats.last_event_at else "-"
     last_fc = stats.last_forecast_at.isoformat() if stats.last_forecast_at else "-"
+    cash = str(stats.cash_available) if stats.cash_available is not None else "-"
     print(
         f"[live-paper] elapsed={int(elapsed)}s "
         f"discoveries={stats.discoveries} markets={stats.last_discovered_markets} "
@@ -837,6 +992,7 @@ def _print_snapshot(stats: LiveStats) -> None:
         f"({rate:.1f}/s) signals={stats.external_signals_emitted} "
         f"forecasts={stats.forecast_snapshots} decisions={stats.decisions} "
         f"dispatched={stats.intents_dispatched} rejected={stats.intents_rejected} "
+        f"cash={cash} source={stats.cash_source or '-'} "
         f"last_event={last_ev} last_forecast={last_fc}",
         file=sys.stderr,
         flush=True,
@@ -885,6 +1041,9 @@ def _write_manifest(
             "snapshot_interval_seconds": args.snapshot_interval_seconds,
             "discover_timeout_seconds": args.discover_timeout_seconds,
             "discover_max_pages": args.discover_max_pages,
+            "cash_source": args.cash_source,
+            "balance_refresh_seconds": args.balance_refresh_seconds,
+            "kalshi_subaccount": args.kalshi_subaccount,
         },
         "stats": {
             "discoveries": stats.discoveries,
@@ -900,6 +1059,13 @@ def _write_manifest(
             "intents_dispatched": stats.intents_dispatched,
             "intents_rejected": stats.intents_rejected,
             "risk_reject_reasons": dict(stats.risk_reject_reasons),
+            "cash_source": stats.cash_source,
+            "cash_available": str(stats.cash_available)
+            if stats.cash_available is not None
+            else None,
+            "cash_updated_at": stats.cash_updated_at.isoformat()
+            if stats.cash_updated_at
+            else None,
             "last_event_at": stats.last_event_at.isoformat() if stats.last_event_at else None,
             "last_forecast_at": stats.last_forecast_at.isoformat()
             if stats.last_forecast_at
@@ -909,7 +1075,7 @@ def _write_manifest(
             "no fill simulation; decisions recorded only",
             "no sequence-gap recovery on ws reconnect",
             "no state checkpoints",
-            "allow-all risk gate (sleeve.risk limits not enforced yet)",
+            "risk gate uses point-in-time context cash/exposure/open-order snapshots",
         ],
     }
     manifest_path = run_dir / "manifest.json"

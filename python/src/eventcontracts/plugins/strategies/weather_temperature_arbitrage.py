@@ -51,24 +51,21 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
         self.max_size = Decimal(str(spec.parameters.get("max_size", "10")))
         self.kelly_fraction = Decimal(str(spec.parameters.get("kelly_fraction", "0.10")))
         self.capital_base = Decimal(str(spec.parameters.get("capital_base", "0")))
+        self.capital_source = str(spec.parameters.get("capital_source", "context_cash")).lower()
+        self.allow_static_capital_base = self.capital_source in {"static", "spec", "capital_base"} or _truthy(
+            spec.parameters.get("allow_static_capital_base", "false")
+        )
         self.max_trade_capital_fraction = Decimal(str(spec.parameters.get("max_trade_capital_fraction", "0")))
         self.max_ladder_capital_fraction = Decimal(str(spec.parameters.get("max_ladder_capital_fraction", "0")))
         self.max_active_capital_fraction = Decimal(str(spec.parameters.get("max_active_capital_fraction", "0")))
         self.signal_source = str(spec.parameters.get("signal_source", "open-meteo"))
+        self.currency = str(spec.parameters.get("currency", "USD")).upper()
         self.execution_mode = str(spec.parameters.get("execution_mode", "passive_mid"))
         self.max_spread = Decimal(str(spec.parameters.get("max_spread", "1.00")))
         self.spread_edge_multiplier = Decimal(str(spec.parameters.get("spread_edge_multiplier", "0.00")))
         self.near_binary_price = Decimal(str(spec.parameters.get("near_binary_price", "1.00")))
         self.near_binary_min_edge_bps = Decimal(str(spec.parameters.get("near_binary_min_edge_bps", "0")))
         self.max_ladder_notional = Decimal(str(spec.parameters.get("max_ladder_notional", "1000000")))
-        if self.capital_base > 0 and self.max_ladder_capital_fraction > 0:
-            self.max_ladder_notional = self.capital_base * self.max_ladder_capital_fraction
-        self.max_trade_notional: Decimal | None = None
-        if self.capital_base > 0 and self.max_trade_capital_fraction > 0:
-            self.max_trade_notional = self.capital_base * self.max_trade_capital_fraction
-        self.max_active_notional: Decimal | None = None
-        if self.capital_base > 0 and self.max_active_capital_fraction > 0:
-            self.max_active_notional = self.capital_base * self.max_active_capital_fraction
         self.max_ladder_orders = int(spec.parameters.get("max_ladder_orders", 1_000_000))
         self.max_ticker_orders = int(spec.parameters.get("max_ticker_orders", 1_000_000))
         self.min_retrade_price_delta = Decimal(str(spec.parameters.get("min_retrade_price_delta", "0.00")))
@@ -117,8 +114,12 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
         if mid is None:
             return (NoAction(reason="warmup:no_mid_yet"),)
 
+        capital_base = self._available_capital(ctx)
+        if capital_base <= 0:
+            return (NoAction(reason="censored:no_available_cash"),)
+
         if self.execution_mode == "taker_if_edge":
-            decision = self._taker_decision(instrument_id, forecast_prob, event.payload)
+            decision = self._taker_decision(instrument_id, forecast_prob, event.payload, capital_base)
             if decision is None:
                 return (NoAction(reason="edge_below_executable_threshold"),)
             return (decision,)
@@ -130,7 +131,7 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
         side = OutcomeSide.YES if edge_bps > 0 else OutcomeSide.NO
         order_side = OrderSide.BUY
         limit_price = mid if side is OutcomeSide.YES else Decimal("1") - mid
-        size = self._size_for_edge(edge_bps=edge_bps, price=limit_price)
+        size = self._size_for_edge(edge_bps=edge_bps, price=limit_price, capital_base=capital_base)
         if size <= 0:
             return (NoAction(reason="sizing_zero"),)
 
@@ -162,6 +163,7 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
         instrument_id: InstrumentId,
         forecast_prob: Decimal,
         payload: Mapping[str, object],
+        capital_base: Decimal,
     ) -> PlaceOrder | None:
         quote = self._quote_by_instrument.get(instrument_id)
         if quote is None:
@@ -189,6 +191,7 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
                 reason_price=yes_ask,
                 forecast_prob=forecast_prob,
                 ladder_key=self._ladder_key(instrument_id, payload),
+                capital_base=capital_base,
             )
         return self._place_order(
             instrument_id=instrument_id,
@@ -198,6 +201,7 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
             reason_price=no_ask,
             forecast_prob=forecast_prob,
             ladder_key=self._ladder_key(instrument_id, payload),
+            capital_base=capital_base,
         )
 
     def _place_order(
@@ -210,16 +214,17 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
         reason_price: Decimal,
         forecast_prob: Decimal,
         ladder_key: str,
+        capital_base: Decimal,
     ) -> PlaceOrder | None:
         if not self._can_retrade(instrument_id, price, forecast_prob):
             return None
-        size = self._size_for_edge(edge_bps=edge_bps, price=price)
+        size = self._size_for_edge(edge_bps=edge_bps, price=price, capital_base=capital_base)
         if size <= 0:
             return None
         notional = price * size
-        if not self._can_add_ladder_exposure(ladder_key, instrument_id, notional):
+        if not self._can_add_ladder_exposure(ladder_key, instrument_id, notional, capital_base):
             return None
-        if not self._can_add_active_exposure(notional):
+        if not self._can_add_active_exposure(notional, capital_base):
             return None
         self._submitted_notional_by_ladder[ladder_key] = (
             self._submitted_notional_by_ladder.get(ladder_key, Decimal("0")) + notional
@@ -250,12 +255,13 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
     def _required_edge_bps(self, spread: Decimal) -> Decimal:
         return self.min_edge_bps + (spread * Decimal("10000") * self.spread_edge_multiplier)
 
-    def _size_for_edge(self, *, edge_bps: Decimal, price: Decimal) -> Decimal:
-        if price <= 0:
+    def _size_for_edge(self, *, edge_bps: Decimal, price: Decimal, capital_base: Decimal) -> Decimal:
+        if price <= 0 or capital_base <= 0:
             return Decimal("0")
         edge_fraction = min(abs(edge_bps) / Decimal("10000"), Decimal("1"))
-        if self.max_trade_notional is not None:
-            target_notional = self.max_trade_notional * edge_fraction * self.kelly_fraction
+        max_trade_notional = self._max_trade_notional(capital_base)
+        if max_trade_notional is not None:
+            target_notional = max_trade_notional * edge_fraction * self.kelly_fraction
             raw_size = (target_notional / price).to_integral_value(rounding=ROUND_FLOOR)
         else:
             raw_size = (edge_fraction * self.kelly_fraction * self.max_size).to_integral_value(
@@ -263,33 +269,61 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
             )
         size = max(raw_size, Decimal("1"))
         size = min(size, self.max_size)
-        return self._cap_size_by_trade_notional(size=size, price=price)
+        return self._cap_size_by_trade_notional(size=size, price=price, capital_base=capital_base)
 
-    def _cap_size_by_trade_notional(self, *, size: Decimal, price: Decimal) -> Decimal:
-        if self.max_trade_notional is None:
-            return size
+    def _cap_size_by_trade_notional(self, *, size: Decimal, price: Decimal, capital_base: Decimal) -> Decimal:
         if price <= 0:
             return Decimal("0")
-        max_size = (self.max_trade_notional / price).to_integral_value(rounding=ROUND_FLOOR)
+        notional_cap = capital_base
+        max_trade_notional = self._max_trade_notional(capital_base)
+        if max_trade_notional is not None:
+            notional_cap = min(notional_cap, max_trade_notional)
+        max_size = (notional_cap / price).to_integral_value(rounding=ROUND_FLOOR)
         return min(size, max_size)
+
+    def _available_capital(self, ctx: StrategyContext) -> Decimal:
+        balance = ctx.cash(self.currency)
+        if balance.available > 0:
+            return balance.available
+        if self.allow_static_capital_base and self.capital_base > 0:
+            return self.capital_base
+        return Decimal("0")
+
+    def _max_trade_notional(self, capital_base: Decimal) -> Decimal | None:
+        if capital_base <= 0 or self.max_trade_capital_fraction <= 0:
+            return None
+        return capital_base * self.max_trade_capital_fraction
+
+    def _max_ladder_notional(self, capital_base: Decimal) -> Decimal:
+        limit = self.max_ladder_notional
+        if capital_base > 0 and self.max_ladder_capital_fraction > 0:
+            limit = min(limit, capital_base * self.max_ladder_capital_fraction)
+        return limit
+
+    def _max_active_notional(self, capital_base: Decimal) -> Decimal | None:
+        if capital_base <= 0 or self.max_active_capital_fraction <= 0:
+            return None
+        return capital_base * self.max_active_capital_fraction
 
     def _can_add_ladder_exposure(
         self,
         ladder_key: str,
         instrument_id: InstrumentId,
         notional: Decimal,
+        capital_base: Decimal,
     ) -> bool:
         if self._submitted_orders_by_instrument.get(instrument_id, 0) >= self.max_ticker_orders:
             return False
         if self._submitted_orders_by_ladder.get(ladder_key, 0) >= self.max_ladder_orders:
             return False
         current = self._submitted_notional_by_ladder.get(ladder_key, Decimal("0"))
-        return current + notional <= self.max_ladder_notional
+        return current + notional <= self._max_ladder_notional(capital_base)
 
-    def _can_add_active_exposure(self, notional: Decimal) -> bool:
-        if self.max_active_notional is None:
+    def _can_add_active_exposure(self, notional: Decimal, capital_base: Decimal) -> bool:
+        max_active_notional = self._max_active_notional(capital_base)
+        if max_active_notional is None:
             return True
-        return self._active_notional + notional <= self.max_active_notional
+        return self._active_notional + notional <= max_active_notional
 
     def _release_settled_notional(self, instrument_id: InstrumentId) -> Decimal:
         released = self._submitted_notional_by_instrument.pop(instrument_id, Decimal("0"))
@@ -338,3 +372,7 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
 @register("weather_temperature_arbitrage")
 def factory(spec: StrategySpec) -> WeatherTemperatureArbitrageStrategy:
     return WeatherTemperatureArbitrageStrategy(spec)
+
+
+def _truthy(value: object) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}

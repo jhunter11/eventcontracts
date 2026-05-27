@@ -48,6 +48,21 @@ def test_rest_client_paginates_and_maps_market_book_and_trades() -> None:
     asyncio.run(run())
 
 
+def test_rest_client_maps_authenticated_balance_to_cash_balance() -> None:
+    async def run() -> None:
+        client = _mock_rest_client()
+
+        balance = await client.get_cash_balance(currency="USD", subaccount=2)
+
+        assert balance.currency == "USD"
+        assert balance.available == Decimal("123.45")
+        assert balance.total == Decimal("123.45")
+        assert balance.held_for_orders == Decimal("0")
+        assert balance.updated_at == datetime(2026, 5, 27, 10, 0, tzinfo=UTC)
+
+    asyncio.run(run())
+
+
 def test_resolve_kalshi_tickers_unions_exact_and_glob_patterns() -> None:
     async def run() -> None:
         client = _mock_rest_client()
@@ -380,6 +395,17 @@ def _recorded_ws_envelopes(client: KalshiWebSocketClient) -> list[Any]:
 
 def _mock_rest_client() -> KalshiPublicClient:
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/portfolio/balance"):
+            assert request.url.params.get("subaccount") == "2"
+            return httpx.Response(
+                200,
+                json={
+                    "balance": 12345,
+                    "balance_dollars": "123.45",
+                    "portfolio_value": 14567,
+                    "updated_ts": 1779876000,
+                },
+            )
         if request.url.path.endswith("/markets") and request.url.params.get("cursor") == "next-page":
             return httpx.Response(200, json=_fixture_json("rest_markets_page_2.json"))
         if request.url.path.endswith("/markets"):

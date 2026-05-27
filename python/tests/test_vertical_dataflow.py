@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from eventcontracts.domain import (
+    CashBalance,
     EventSubscription,
     RiskProfile,
     SleeveId,
@@ -108,6 +109,16 @@ def test_raw_capture_to_paper_fill_vertical_slice() -> None:
         strategy_id_value=spec.strategy_id,
         sleeve_id_value=sleeve.sleeve_id,
         clock_now=now,
+        cash_by_ccy={
+            "USD": CashBalance(
+                currency="USD",
+                total=Decimal("1000"),
+                available=Decimal("1000"),
+                held_for_orders=Decimal("0"),
+                settling=Decimal("0"),
+                updated_at=now,
+            )
+        },
     )
     broker = PaperBroker(simulator=ImmediateFillSimulator(filled_at=now))
     sink = PaperIntentSink(broker=broker)

@@ -20,6 +20,7 @@ from eventcontracts.domain.decisions import (
 from eventcontracts.domain.spec import SleeveSpec
 from eventcontracts.execution.simulator import OrderIntent
 from eventcontracts.risk.limits import (
+    check_available_cash,
     check_daily_loss,
     check_gross_exposure,
     check_open_orders,
@@ -104,6 +105,7 @@ class SleeveRiskGate:
 
         exposure_value = ctx.exposure()
         reasons.extend(check_gross_exposure(decision, self.sleeve.risk, exposure_value))
+        reasons.extend(check_available_cash(decision, ctx.cash(self.sleeve.currency)))
 
         when: datetime = envelope.emitted_at
         reasons.extend(

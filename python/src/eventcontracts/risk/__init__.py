@@ -2,6 +2,7 @@
 
 from eventcontracts.risk.limits import (
     RiskLimits,
+    check_available_cash,
     check_daily_loss,
     check_gross_exposure,
     check_open_orders,
@@ -23,6 +24,7 @@ __all__ = [
     "PreTradePolicyService",
     "RiskLimits",
     "SleeveRiskGate",
+    "check_available_cash",
     "check_daily_loss",
     "check_gross_exposure",
     "check_open_orders",

@@ -34,6 +34,7 @@ from eventcontracts.domain.models import (
     Trade,
     Venue,
 )
+from eventcontracts.domain.positions import CashBalance
 from eventcontracts.storage.interfaces import EventEnvelope
 
 KALSHI_REST_PROD = "https://external-api.kalshi.com/trade-api/v2"
@@ -95,6 +96,26 @@ class KalshiEnvironment:
         return cls(rest_base_url=KALSHI_REST_DEMO, ws_url=KALSHI_WS_DEMO)
 
 
+@dataclass(frozen=True)
+class KalshiBalanceSnapshot:
+    """Authenticated account balance from Kalshi's portfolio endpoint."""
+
+    available_cash: Decimal
+    portfolio_value: Decimal
+    updated_at: datetime
+    raw: Mapping[str, Any]
+
+    def cash_balance(self, *, currency: str = "USD") -> CashBalance:
+        return CashBalance(
+            currency=currency,
+            total=self.available_cash,
+            available=self.available_cash,
+            held_for_orders=Decimal("0"),
+            settling=Decimal("0"),
+            updated_at=self.updated_at,
+        )
+
+
 class KalshiPublicClient:
     """Async REST client for public Kalshi market data."""
 
@@ -125,6 +146,22 @@ class KalshiPublicClient:
             response = await client.get(url, params=params, headers=headers)
             response.raise_for_status()
             return _as_dict(response.json())
+
+    async def get_balance_payload(self, *, subaccount: int | None = None) -> dict[str, Any]:
+        params = {"subaccount": subaccount} if subaccount is not None else None
+        return await self._get("/portfolio/balance", params=params)
+
+    async def get_balance(self, *, subaccount: int | None = None) -> KalshiBalanceSnapshot:
+        payload = await self.get_balance_payload(subaccount=subaccount)
+        return _balance_snapshot_from_payload(payload)
+
+    async def get_cash_balance(
+        self,
+        *,
+        currency: str = "USD",
+        subaccount: int | None = None,
+    ) -> CashBalance:
+        return (await self.get_balance(subaccount=subaccount)).cash_balance(currency=currency)
 
     async def get_markets_payload(
         self,
@@ -474,6 +511,47 @@ def _parse_time(value: Any) -> datetime | None:
     if text.endswith("Z"):
         text = f"{text[:-1]}+00:00"
     return datetime.fromisoformat(text)
+
+
+def _parse_unix_time(value: Any) -> datetime:
+    if value is None:
+        return _utc_now()
+    seconds = Decimal(str(value))
+    if seconds > Decimal("100000000000"):
+        seconds = seconds / Decimal("1000")
+    return datetime.fromtimestamp(float(seconds), tz=UTC)
+
+
+def _dollars_from_cents_or_string(
+    payload: Mapping[str, Any],
+    *,
+    dollars_key: str,
+    cents_key: str,
+) -> Decimal:
+    dollars = payload.get(dollars_key)
+    if dollars is not None:
+        return Decimal(str(dollars))
+    cents = payload.get(cents_key)
+    if cents is None:
+        return Decimal("0")
+    return Decimal(str(cents)) / Decimal("100")
+
+
+def _balance_snapshot_from_payload(payload: Mapping[str, Any]) -> KalshiBalanceSnapshot:
+    return KalshiBalanceSnapshot(
+        available_cash=_dollars_from_cents_or_string(
+            payload,
+            dollars_key="balance_dollars",
+            cents_key="balance",
+        ),
+        portfolio_value=_dollars_from_cents_or_string(
+            payload,
+            dollars_key="portfolio_value_dollars",
+            cents_key="portfolio_value",
+        ),
+        updated_at=_parse_unix_time(payload.get("updated_ts")),
+        raw=dict(payload),
+    )
 
 
 def _message_time(message: Mapping[str, Any]) -> datetime | None:
