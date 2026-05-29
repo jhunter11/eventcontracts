@@ -525,6 +525,7 @@ dependencies = [
  "eventcontracts-contracts",
  "eventcontracts-runtime-hot",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 

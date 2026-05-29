@@ -15,6 +15,7 @@ use eventcontracts_contracts::{
     NormalizedEventRecord,
 };
 use eventcontracts_feature_builder::TennisMatchSnapshot;
+use eventcontracts_feature_builder::TennisV2Snapshot;
 use eventcontracts_feature_builder::QUOTE_FEATURE_WIDTH;
 use eventcontracts_gateway::{
     AsyncVenueClient, DecisionPayload, DryRunGateway, EnqueueOutcome, GatewayError,
@@ -25,7 +26,10 @@ use eventcontracts_kalshi::{
     normalize_ws_payload, reset_sequence_tracking, KalshiAuth, KalshiEnv, KalshiEnvironment,
     KalshiFill, KalshiRest, KalshiVenueClient, KalshiWsClient, KalshiWsEnvelope, NormalizeError,
 };
-use eventcontracts_model_runtime::{OnnxScorer, OutputSelect, TennisOnnxArtifact};
+use eventcontracts_model_runtime::{
+    bundle_feature_schema_version, OnnxScorer, OutputSelect, TennisOnnxArtifact,
+    TennisV2OnnxArtifact,
+};
 use eventcontracts_risk::{
     epoch_seconds_from_rfc3339, invalidate_quote_bbo, record_book_bbo, record_quote_bbo,
     utc_day_from_epoch_secs, IntentSnapshot, RiskDecision, RiskGate, RiskLimits,
@@ -254,7 +258,7 @@ buy_no_below = 0.7
         )
         .unwrap();
 
-        let event = tennis_prediction_event(&row, 0.612345, 7).unwrap();
+        let event = tennis_prediction_event(&row.market_id, &row.source, 0.612345, 7).unwrap();
         assert_eq!(event.event_kind, "external");
         assert_eq!(event.provenance.source, "tennis_xgboost_onnx");
         assert!(event.payload_json.contains("\"market_id\":\"KXTENNIS-M1\""));
@@ -262,6 +266,31 @@ buy_no_below = 0.7
             .payload_json
             .contains("\"player_1_win_probability\":\"0.612345\""));
         event.validate().unwrap();
+    }
+
+    #[test]
+    fn tennis_v2_snapshot_row_flattens_and_parses() {
+        let row: TennisV2SnapshotRow = serde_json::from_str(
+            r#"{
+                "market_id": "KXTENNIS-V2",
+                "surface": "Clay",
+                "tourney_level": "G",
+                "best_of": 5,
+                "round": "QF",
+                "p1_elo": 1850.0,
+                "p2_elo": 1600.0,
+                "p1_elo_blend": 1870.0,
+                "p2_elo_blend": 1580.0,
+                "p1_hand": "L",
+                "p2_hand": "R"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(row.market_id, "KXTENNIS-V2");
+        assert_eq!(row.source, "tennis_xgboost_onnx");
+        assert_eq!(row.snapshot.round, "QF");
+        // unspecified fields fall back to the v2 priors.
+        assert!((row.snapshot.p1_serve_won - 0.63).abs() < 1e-9);
     }
 
     #[test]
@@ -1686,7 +1715,35 @@ fn default_tennis_prediction_source() -> String {
     "tennis_xgboost_onnx".into()
 }
 
+#[derive(Debug, Deserialize)]
+struct TennisV2SnapshotRow {
+    market_id: String,
+    #[serde(default = "default_tennis_prediction_source")]
+    source: String,
+    #[serde(flatten)]
+    snapshot: TennisV2Snapshot,
+}
+
+/// Score offline tennis snapshots into external prediction events. The
+/// promoted bundle's `feature_schema.json` decides which feature contract is
+/// in force: `schema_version = "2"` routes to the 34-feature v2 builder,
+/// anything else to the v1 (20-feature) builder. This keeps a v1 bundle
+/// working untouched while letting a v2 bundle deploy by swapping the artifact.
 fn score_tennis_snapshot_file(
+    artifact_dir: &std::path::Path,
+    snapshot_path: &std::path::Path,
+) -> Result<Vec<NormalizedEventRecord>, Box<dyn Error>> {
+    let version = bundle_feature_schema_version(artifact_dir).unwrap_or_default();
+    if version == "2" {
+        eprintln!("tennis scoring: feature_schema v2 (34 features)");
+        score_tennis_v2_snapshot_file(artifact_dir, snapshot_path)
+    } else {
+        eprintln!("tennis scoring: feature_schema v1 (20 features)");
+        score_tennis_v1_snapshot_file(artifact_dir, snapshot_path)
+    }
+}
+
+fn score_tennis_v1_snapshot_file(
     artifact_dir: &std::path::Path,
     snapshot_path: &std::path::Path,
 ) -> Result<Vec<NormalizedEventRecord>, Box<dyn Error>> {
@@ -1703,7 +1760,34 @@ fn score_tennis_snapshot_file(
         let row: TennisSnapshotRow = serde_json::from_str(trimmed)?;
         let probability = artifact.predict_snapshot(&row.snapshot)?;
         events.push(tennis_prediction_event(
-            &row,
+            &row.market_id,
+            &row.source,
+            probability,
+            index as u64 + 1,
+        )?);
+    }
+    Ok(events)
+}
+
+fn score_tennis_v2_snapshot_file(
+    artifact_dir: &std::path::Path,
+    snapshot_path: &std::path::Path,
+) -> Result<Vec<NormalizedEventRecord>, Box<dyn Error>> {
+    let mut artifact = TennisV2OnnxArtifact::load_bundle(artifact_dir)?;
+    let file = File::open(snapshot_path)?;
+    let reader = BufReader::new(file);
+    let mut events = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let row: TennisV2SnapshotRow = serde_json::from_str(trimmed)?;
+        let probability = artifact.predict_snapshot(&row.snapshot)?;
+        events.push(tennis_prediction_event(
+            &row.market_id,
+            &row.source,
             probability,
             index as u64 + 1,
         )?);
@@ -1712,20 +1796,21 @@ fn score_tennis_snapshot_file(
 }
 
 fn tennis_prediction_event(
-    row: &TennisSnapshotRow,
+    market_id: &str,
+    source: &str,
     probability: f32,
     seq: u64,
 ) -> Result<NormalizedEventRecord, Box<dyn Error>> {
     let now = rfc3339_now();
     let payload = serde_json::json!({
-        "source": row.source,
-        "market_id": row.market_id,
+        "source": source,
+        "market_id": market_id,
         "player_1_win_probability": format!("{probability:.6}"),
     });
-    let event_id = format!("tennis-xgboost:{}:{seq}", row.market_id);
+    let event_id = format!("tennis-xgboost:{market_id}:{seq}");
     let payload_json = payload.to_string();
     let provenance = EventProvenance {
-        source: row.source.clone(),
+        source: source.to_string(),
         channel: "artifact-score".into(),
         schema_version: "normalized-event-v1".into(),
         venue: Some("kalshi".into()),

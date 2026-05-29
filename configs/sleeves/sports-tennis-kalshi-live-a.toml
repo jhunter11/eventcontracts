@@ -6,8 +6,19 @@
 #
 #   - capital_allocation: set to the amount you have actually funded for this
 #     sleeve. The starter below is a small smoke-test size.
-#   - The [risk] limits are the live circuit breakers. max_daily_loss is the
-#     hard stop for the UTC day (latches the kill switch in both gates).
+#   - The [risk] limits are the live circuit breakers. IMPORTANT — the two
+#     gates treat max_daily_loss DIFFERENTLY (do not assume parity):
+#       * Rust (live, --live-submit): on breach it REJECTS new risk-increasing
+#         orders but still ALLOWS risk-reducing exits, re-evaluated every event.
+#         It does NOT latch a kill switch and does NOT halt the process.
+#         Accounting is loss legs + fees for the UTC day (winning fills do NOT
+#         credit back), so it trips sooner than a net-PnL view would.
+#       * Python (backtest/paper): a realized-loss breach LATCHES a one-way
+#         kill switch (operator reset required).
+#     The hard process-level stops for a live run are the operator kill-switch
+#     file (--kill-switch-file) and --max-live-orders, plus the toxicity
+#     circuit breaker — NOT max_daily_loss. Size max_daily_loss as a
+#     de-risking trigger, and watch the run; use the kill-switch file to halt.
 #
 # The Rust live-runner (--live-submit) reads max_order_notional,
 # max_position_notional, max_daily_loss, max_open_orders, max_gross_exposure

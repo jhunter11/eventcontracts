@@ -11,8 +11,8 @@
 //!   `OnnxScorer`. The Python-side feature contract is unchanged.
 
 use eventcontracts_feature_builder::{
-    tennis_xgboost_feature_vector, Scorer, ScorerError, TennisMatchSnapshot,
-    TENNIS_XGBOOST_FEATURE_NAMES,
+    tennis_v2_feature_vector, tennis_xgboost_feature_vector, Scorer, ScorerError,
+    TennisMatchSnapshot, TennisV2Snapshot, TENNIS_V2_FEATURE_NAMES, TENNIS_XGBOOST_FEATURE_NAMES,
 };
 use ndarray::Array2;
 use ort::{
@@ -565,6 +565,137 @@ pub fn validate_tennis_feature_schema(path: impl AsRef<Path>) -> Result<(), Mode
     Ok(())
 }
 
+/// Read the `schema_version` string from a bundle `feature_schema.json`.
+/// Lets a caller pick the right tennis feature builder (v1 = 20 features,
+/// v2 = 34) from the promoted bundle instead of a hard-coded assumption.
+pub fn read_feature_schema_version(path: impl AsRef<Path>) -> Result<String, ModelRuntimeError> {
+    let raw = fs::read_to_string(path)?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw)?;
+    Ok(parsed
+        .get("schema_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string())
+}
+
+/// Resolve a bundle's `feature_schema.json` and read its `schema_version`.
+/// The live-runner uses this to choose the v1 (20-feature) or v2 (34-feature)
+/// tennis scorer from the promoted bundle itself.
+pub fn bundle_feature_schema_version(
+    bundle_dir: impl AsRef<Path>,
+) -> Result<String, ModelRuntimeError> {
+    let schema = find_bundle_feature_schema(bundle_dir.as_ref())?;
+    read_feature_schema_version(schema)
+}
+
+// ---------- tennis v2 specialization (34 features) ----------
+
+/// Tennis v2 ONNX classifier — same shape as [`TennisOnnxModel`] but bound to
+/// the 34-feature v2 contract and `tennis_v2_feature_vector`.
+pub struct TennisV2OnnxModel {
+    scorer: OnnxScorerPool,
+}
+
+impl TennisV2OnnxModel {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, ModelRuntimeError> {
+        let scorer = OnnxScorerPool::load(
+            path,
+            "features",
+            "probabilities",
+            TENNIS_V2_FEATURE_NAMES.len(),
+            OutputSelect::ScalarAt(1),
+            default_onnx_pool_size(),
+        )?;
+        Ok(Self { scorer })
+    }
+
+    pub fn predict_snapshot(
+        &mut self,
+        snapshot: &TennisV2Snapshot,
+    ) -> Result<f32, ModelRuntimeError> {
+        self.predict_features(&tennis_v2_feature_vector(snapshot))
+    }
+
+    pub fn predict_features(&mut self, features: &[f32]) -> Result<f32, ModelRuntimeError> {
+        let out = self
+            .scorer
+            .predict(features)
+            .map_err(|e| ModelRuntimeError::Signature(e.to_string()))?;
+        let value = out
+            .first()
+            .copied()
+            .ok_or(ModelRuntimeError::MissingPlayerOneProbability)?;
+        validate_probability(value)
+    }
+}
+
+pub struct TennisV2OnnxArtifact {
+    model: TennisV2OnnxModel,
+    pub bundle_dir: PathBuf,
+    pub model_path: PathBuf,
+    pub feature_schema_path: PathBuf,
+}
+
+impl TennisV2OnnxArtifact {
+    pub fn load_bundle(bundle_dir: impl AsRef<Path>) -> Result<Self, ModelRuntimeError> {
+        let bundle_dir = bundle_dir.as_ref().to_path_buf();
+        let model_path = find_bundle_model(&bundle_dir)?;
+        let feature_schema_path = find_bundle_feature_schema(&bundle_dir)?;
+        validate_tennis_v2_feature_schema(&feature_schema_path)?;
+        Ok(Self {
+            model: TennisV2OnnxModel::load(&model_path)?,
+            bundle_dir,
+            model_path,
+            feature_schema_path,
+        })
+    }
+
+    pub fn predict_snapshot(
+        &mut self,
+        snapshot: &TennisV2Snapshot,
+    ) -> Result<f32, ModelRuntimeError> {
+        self.model.predict_snapshot(snapshot)
+    }
+}
+
+/// Validate that a bundle `feature_schema.json` matches the v2 feature
+/// contract in name and order before any inference.
+pub fn validate_tennis_v2_feature_schema(path: impl AsRef<Path>) -> Result<(), ModelRuntimeError> {
+    let raw = fs::read_to_string(path)?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw)?;
+    let features = parsed
+        .get("features")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| {
+            serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "feature schema missing features array",
+            ))
+        })?;
+    for (index, expected) in TENNIS_V2_FEATURE_NAMES.iter().enumerate() {
+        let actual = features
+            .get(index)
+            .and_then(|value| value.get("name"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string();
+        if actual != *expected {
+            return Err(ModelRuntimeError::FeatureSchemaMismatch {
+                index,
+                expected,
+                actual,
+            });
+        }
+    }
+    if features.len() != TENNIS_V2_FEATURE_NAMES.len() {
+        return Err(ModelRuntimeError::FeatureWidth {
+            expected: TENNIS_V2_FEATURE_NAMES.len(),
+            actual: features.len(),
+        });
+    }
+    Ok(())
+}
+
 fn first_existing(candidates: &[PathBuf]) -> Option<PathBuf> {
     candidates.iter().find(|path| path.exists()).cloned()
 }
@@ -679,6 +810,44 @@ mod tests {
         assert!(matches!(
             err,
             ModelRuntimeError::FeatureWidth { actual: 0, .. }
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validates_expected_v2_feature_schema_order_and_reads_version() {
+        let path = temp_schema_path("v2-valid");
+        let features: Vec<_> = TENNIS_V2_FEATURE_NAMES
+            .iter()
+            .map(|name| serde_json::json!({"name": name, "dtype": "float32"}))
+            .collect();
+        fs::write(
+            &path,
+            serde_json::json!({"schema_version": "2", "features": features}).to_string(),
+        )
+        .unwrap();
+
+        validate_tennis_v2_feature_schema(&path).unwrap();
+        assert_eq!(read_feature_schema_version(&path).unwrap(), "2");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_v2_schema_with_v1_feature_set() {
+        // A v1 (20-feature) schema must be rejected by the v2 validator so a
+        // bundle/feature-builder mismatch can't reach live inference.
+        let path = temp_schema_path("v2-wrong");
+        let features: Vec<_> = TENNIS_XGBOOST_FEATURE_NAMES
+            .iter()
+            .map(|name| serde_json::json!({"name": name, "dtype": "float32"}))
+            .collect();
+        fs::write(&path, serde_json::json!({"features": features}).to_string()).unwrap();
+
+        let err = validate_tennis_v2_feature_schema(&path).unwrap_err();
+        // First divergent name is at index 2 (v1 rank_log_advantage vs v2 elo_blend_diff).
+        assert!(matches!(
+            err,
+            ModelRuntimeError::FeatureSchemaMismatch { .. }
         ));
         let _ = fs::remove_file(path);
     }
