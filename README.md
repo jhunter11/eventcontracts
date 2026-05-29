@@ -79,7 +79,7 @@ All Python source lives under `python/src/eventcontracts/`:
 - `execution`: paper execution, fill simulation, and queue modeling boundary.
 - `risk`: pre-trade policy, limits, and compliance boundary.
 - `features`: offline/online feature schema, builder, and feature-store contracts.
-- `models`: Python-first training, export, inference, and model-registry contracts.
+- `models`: Python-first training, model-family-agnostic ONNX export (sklearn/XGBoost/LightGBM/HuggingFace), calibrated evaluation, export-parity, inference, and model-registry contracts.
 - `artifacts`: immutable strategy/model bundle writer, loader, validator, and promotion contracts.
 - `bus`: typed IPC topic, message, codec, publisher, and subscriber contracts.
 - `gateway`: live-shaped venue command, idempotency, priority scheduling, dry-run gateway, and reconciliation contracts.
@@ -223,6 +223,9 @@ rate-limit allocation, but never to bypass risk checks.
   data types and plug-in contract.
 - [docs/artifact-contract.md](docs/artifact-contract.md): planned model and
   strategy artifact bundle format.
+- [docs/ml-model-pipeline.md](docs/ml-model-pipeline.md): model-family-agnostic
+  ONNX/HuggingFace training, export, parity, and serving pipeline with reference
+  results.
 - [docs/development.md](docs/development.md): local setup, verification, and
   contribution conventions.
 - [docs/implementation-roadmap.md](docs/implementation-roadmap.md): gap matrix,

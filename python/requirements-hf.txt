@@ -1,0 +1,15 @@
+# Optional HuggingFace / transformer extras for NLP signal models.
+#
+# NOT installed in CI or the base research env — these are large (torch alone
+# is ~1-2 GB). Install only when building or scoring a HuggingFace text model:
+#
+#   pip install -r requirements-hf.txt
+#
+# Everything in eventcontracts.models.hf imports these lazily and fails with a
+# clear message if they are missing, so the base framework never depends on
+# them. The tabular ONNX path (sklearn / xgboost / lightgbm) needs none of this.
+
+transformers==4.46.3
+torch==2.5.1
+optimum[exporters]==1.23.3
+huggingface-hub==0.26.5

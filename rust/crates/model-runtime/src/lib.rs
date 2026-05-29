@@ -319,6 +319,177 @@ fn validate_output_index(dtype: &ValueType, index: usize) -> Result<(), ModelRun
     Ok(())
 }
 
+// ---------- generic promoted ONNX bundle ----------
+
+/// A promoted ONNX artifact bundle for *any* model family.
+///
+/// This is the model-agnostic counterpart to [`TennisOnnxArtifact`]: it reads
+/// the bundle's `feature_schema.json` (any feature set, any width), resolves
+/// the model's input/output tensors, and serves scores through a pooled
+/// [`OnnxScorer`]. The Rust runtime never needs per-model code to load a
+/// promoted bundle — the Python `model-train` / tennis pipelines write a
+/// schema + `model.onnx` that this loader understands.
+///
+/// The feature *values* are still produced upstream (by the hot-path feature
+/// builder, in the schema's order); this loader validates the schema's feature
+/// *count* against the model's input width and fails fast on a mismatch.
+pub struct OnnxArtifact {
+    scorer: OnnxScorerPool,
+    pub bundle_dir: PathBuf,
+    pub model_path: PathBuf,
+    pub feature_schema_path: PathBuf,
+    pub feature_names: Vec<String>,
+    pub output_select: OutputSelect,
+}
+
+impl OnnxArtifact {
+    /// Load a bundle directory. `output_select` chooses the model output the
+    /// scorer returns — `ScalarAt(1)` for a binary classifier's positive-class
+    /// probability, `All` for regression / multi-output models.
+    pub fn load_bundle(
+        bundle_dir: impl AsRef<Path>,
+        output_select: OutputSelect,
+    ) -> Result<Self, ModelRuntimeError> {
+        let bundle_dir = bundle_dir.as_ref().to_path_buf();
+        let model_path = find_bundle_model(&bundle_dir)?;
+        let feature_schema_path = find_bundle_feature_schema(&bundle_dir)?;
+        let feature_names = read_feature_schema_names(&feature_schema_path)?;
+        let input_width = feature_names.len();
+        let output_name = resolve_output_name(&model_path, output_select)?;
+        let scorer = OnnxScorerPool::load(
+            &model_path,
+            "features",
+            output_name,
+            input_width,
+            output_select,
+            default_onnx_pool_size(),
+        )?;
+        Ok(Self {
+            scorer,
+            bundle_dir,
+            model_path,
+            feature_schema_path,
+            feature_names,
+            output_select,
+        })
+    }
+
+    /// Number of features the model expects, i.e. the feature-schema width.
+    pub fn input_width(&self) -> usize {
+        self.feature_names.len()
+    }
+
+    /// Score one feature row (already in schema order). Returns the value(s)
+    /// selected by `output_select`.
+    pub fn predict_features(&self, features: &[f32]) -> Result<Vec<f32>, ModelRuntimeError> {
+        self.scorer
+            .predict(features)
+            .map_err(|e| ModelRuntimeError::Signature(e.to_string()))
+    }
+
+    /// Convenience for binary classifiers loaded with `ScalarAt`: the single
+    /// selected probability, validated to be a finite value in `[0, 1]`.
+    pub fn predict_probability(&self, features: &[f32]) -> Result<f32, ModelRuntimeError> {
+        let out = self.predict_features(features)?;
+        let value = out
+            .first()
+            .copied()
+            .ok_or(ModelRuntimeError::MissingPlayerOneProbability)?;
+        validate_probability(value)
+    }
+}
+
+impl Scorer for OnnxArtifact {
+    fn input_width(&self) -> usize {
+        self.feature_names.len()
+    }
+
+    fn predict(&self, features: &[f32]) -> Result<Vec<f32>, ScorerError> {
+        self.scorer.predict(features)
+    }
+}
+
+/// Read the ordered feature names from a bundle `feature_schema.json`.
+pub fn read_feature_schema_names(path: impl AsRef<Path>) -> Result<Vec<String>, ModelRuntimeError> {
+    let raw = fs::read_to_string(path)?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw)?;
+    let features = parsed
+        .get("features")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| {
+            serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "feature schema missing features array",
+            ))
+        })?;
+    if features.is_empty() {
+        return Err(ModelRuntimeError::FeatureWidth {
+            expected: 1,
+            actual: 0,
+        });
+    }
+    Ok(features
+        .iter()
+        .map(|value| {
+            value
+                .get("name")
+                .and_then(|name| name.as_str())
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect())
+}
+
+/// Open the model once to discover the output tensor name. For a classifier
+/// (`ScalarAt`) prefer an output whose name contains `probab`; otherwise take
+/// the first output (the regression value).
+fn resolve_output_name(
+    path: impl AsRef<Path>,
+    output_select: OutputSelect,
+) -> Result<String, ModelRuntimeError> {
+    let session = Session::builder()?
+        .with_intra_threads(1)
+        .map_err(|e| ModelRuntimeError::SessionBuilder(e.to_string()))?
+        .commit_from_file(path)?;
+    let outputs = session.outputs();
+    if outputs.is_empty() {
+        return Err(ModelRuntimeError::MissingProbabilityOutput);
+    }
+    if matches!(output_select, OutputSelect::ScalarAt(_)) {
+        if let Some(output) = outputs
+            .iter()
+            .find(|output| output.name().to_ascii_lowercase().contains("probab"))
+        {
+            return Ok(output.name().to_string());
+        }
+        return Ok(outputs[outputs.len() - 1].name().to_string());
+    }
+    Ok(outputs[0].name().to_string())
+}
+
+fn find_bundle_model(bundle_dir: &Path) -> Result<PathBuf, ModelRuntimeError> {
+    first_existing(&[
+        bundle_dir.join("model").join("model.onnx"),
+        bundle_dir.join("model.onnx"),
+    ])
+    .ok_or_else(|| {
+        ModelRuntimeError::MissingModel(bundle_dir.join("model/model.onnx").display().to_string())
+    })
+}
+
+fn find_bundle_feature_schema(bundle_dir: &Path) -> Result<PathBuf, ModelRuntimeError> {
+    first_existing(&[
+        bundle_dir.join("feature_schema.json"),
+        bundle_dir.join("model").join("feature_schema.json"),
+        bundle_dir.join("contracts").join("feature_schema.json"),
+    ])
+    .ok_or_else(|| {
+        ModelRuntimeError::MissingFeatureSchema(
+            bundle_dir.join("feature_schema.json").display().to_string(),
+        )
+    })
+}
+
 // ---------- tennis specialization ----------
 
 /// Tennis ONNX classifier. Now a thin specialization on top of
@@ -339,25 +510,8 @@ pub struct TennisOnnxArtifact {
 impl TennisOnnxArtifact {
     pub fn load_bundle(bundle_dir: impl AsRef<Path>) -> Result<Self, ModelRuntimeError> {
         let bundle_dir = bundle_dir.as_ref().to_path_buf();
-        let model_path = first_existing(&[
-            bundle_dir.join("model").join("model.onnx"),
-            bundle_dir.join("model.onnx"),
-        ])
-        .ok_or_else(|| {
-            ModelRuntimeError::MissingModel(
-                bundle_dir.join("model/model.onnx").display().to_string(),
-            )
-        })?;
-        let feature_schema_path = first_existing(&[
-            bundle_dir.join("feature_schema.json"),
-            bundle_dir.join("model").join("feature_schema.json"),
-            bundle_dir.join("contracts").join("feature_schema.json"),
-        ])
-        .ok_or_else(|| {
-            ModelRuntimeError::MissingFeatureSchema(
-                bundle_dir.join("feature_schema.json").display().to_string(),
-            )
-        })?;
+        let model_path = find_bundle_model(&bundle_dir)?;
+        let feature_schema_path = find_bundle_feature_schema(&bundle_dir)?;
         validate_tennis_feature_schema(&feature_schema_path)?;
         Ok(Self {
             model: TennisOnnxModel::load(&model_path)?,
@@ -494,6 +648,37 @@ mod tests {
         assert!(matches!(
             err,
             ModelRuntimeError::FeatureSchemaMismatch { index: 0, .. }
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_generic_feature_schema_names_of_any_shape() {
+        let path = temp_schema_path("generic");
+        let schema = serde_json::json!({
+            "schema_id": "macro_cpi_features",
+            "schema_version": "1",
+            "features": [
+                {"name": "surprise_z", "dtype": "float32"},
+                {"name": "trend_3m", "dtype": "float32"},
+                {"name": "regime_flag", "dtype": "float32"},
+            ],
+        });
+        fs::write(&path, schema.to_string()).unwrap();
+
+        let names = read_feature_schema_names(&path).unwrap();
+        assert_eq!(names, vec!["surprise_z", "trend_3m", "regime_flag"]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_empty_generic_feature_schema() {
+        let path = temp_schema_path("empty");
+        fs::write(&path, serde_json::json!({"features": []}).to_string()).unwrap();
+        let err = read_feature_schema_names(&path).unwrap_err();
+        assert!(matches!(
+            err,
+            ModelRuntimeError::FeatureWidth { actual: 0, .. }
         ));
         let _ = fs::remove_file(path);
     }

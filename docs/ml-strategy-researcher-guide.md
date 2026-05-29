@@ -668,13 +668,21 @@ raw envelopes
 
 ## Model Training Contract
 
-Python is the research environment. Rust is the future parity/runtime
-environment. Therefore:
+Python is the research environment. Rust is the parity/runtime environment.
+Therefore:
 
 - Train in Python.
 - Export immutable artifacts.
 - Generate parity cases.
 - Validate Python/Rust equivalence before promotion.
+
+The model-family-agnostic pipeline that implements this — ONNX export for
+scikit-learn / XGBoost / LightGBM, HuggingFace support, calibrated evaluation,
+export-parity verification, and the generic `model-train` CLI — is documented
+in [docs/ml-model-pipeline.md](ml-model-pipeline.md). Use
+`eventcontracts.models.onnx_export.export_model_onnx` /
+`eventcontracts.models.evaluation.evaluate_classification` rather than
+hand-rolling export or metric code per strategy.
 
 Training dataset object:
 

@@ -25,6 +25,10 @@ from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from eventcontracts.models import evaluation as _evaluation
+from eventcontracts.models import onnx_export as _onnx
+from eventcontracts.models import parity as _parity
+
 if TYPE_CHECKING:
     import polars as pl
 
@@ -485,63 +489,34 @@ def export_xgboost_onnx(
 ) -> Path:
     """Export a trained XGBoost booster to ONNX for Rust live inference.
 
-    The ONNX graph input is a ``[N, len(TENNIS_XGBOOST_FEATURE_NAMES)]`` float
-    tensor. The feature names are embedded as ONNX metadata, but the promoted
-    ArtifactBundle should still include ``feature_schema.json`` as the source of
-    truth for Rust parity checks.
+    Thin tennis specialization over the model-agnostic
+    :func:`eventcontracts.models.onnx_export.export_model_onnx`. The graph
+    input is a ``[N, len(TENNIS_XGBOOST_FEATURE_NAMES)]`` float tensor and the
+    ``eventcontracts.*`` metadata pins the feature schema and order. The
+    promoted ArtifactBundle still ships ``feature_schema.json`` as the source
+    of truth for Rust parity checks.
     """
 
-    try:
-        onnxmltools = import_module("onnxmltools")
-        data_types = import_module("onnxmltools.convert.common.data_types")
-        FloatTensorType = data_types.FloatTensorType
-    except ImportError as exc:  # pragma: no cover - optional research dependency
-        raise RuntimeError("onnxmltools is required for export_xgboost_onnx; install it in the research env.") from exc
-
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    onnx_model = onnxmltools.convert_xgboost(
+    export = _onnx.export_model_onnx(
         model,
-        initial_types=[(input_name, FloatTensorType([None, len(TENNIS_XGBOOST_FEATURE_NAMES)]))],
+        TENNIS_XGBOOST_FEATURE_NAMES,
+        path,
+        model_family=_onnx.ModelFamily.XGBOOST,
+        task=_onnx.ModelTask.BINARY_CLASSIFICATION,
+        feature_schema_id=FEATURE_SCHEMA_ID,
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+        input_name=input_name,
         target_opset=target_opset,
     )
-    _set_onnx_metadata(
-        onnx_model,
-        {
-            "eventcontracts.feature_schema_id": FEATURE_SCHEMA_ID,
-            "eventcontracts.feature_schema_version": FEATURE_SCHEMA_VERSION,
-            "eventcontracts.feature_names_json": json.dumps(TENNIS_XGBOOST_FEATURE_NAMES),
-            "eventcontracts.model_family": "xgboost_binary_onnx",
-            "eventcontracts.input_name": input_name,
-        },
-    )
-    onnxmltools.utils.save_model(onnx_model, str(target))
-    return target
+    return export.path
 
 
 def predict_onnx_probabilities(model_path: str | Path, frame: pl.DataFrame) -> tuple[float, ...]:
     """Run the exported artifact through ONNX Runtime for export parity checks."""
 
-    try:
-        np = import_module("numpy")
-        ort = import_module("onnxruntime")
-    except ImportError as exc:  # pragma: no cover - optional deployment dependency
-        raise RuntimeError(
-            "onnxruntime is required for predict_onnx_probabilities; install it in the research env."
-        ) from exc
-
-    session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
-    inputs = np.asarray(
-        frame.select(TENNIS_XGBOOST_FEATURE_NAMES).to_numpy(),
-        dtype=np.float32,
-    )
-    outputs = session.run(None, {"features": inputs})
-    probabilities = outputs[1]
-    if hasattr(probabilities, "shape") and len(probabilities.shape) == 2:
-        return tuple(float(value) for value in probabilities[:, 1])
-    if isinstance(probabilities, list):
-        return tuple(float(row[1]) for row in probabilities)
-    raise ValueError("ONNX model did not return binary probability output")
+    features = frame.select(TENNIS_XGBOOST_FEATURE_NAMES).to_numpy()
+    probabilities = _onnx.predict_onnx(model_path, features, output_select="scalar:1")
+    return tuple(float(value) for value in probabilities)
 
 
 def write_parity_cases(
@@ -555,28 +530,20 @@ def write_parity_cases(
 
     if frame.height != len(probabilities):
         raise ValueError("frame and probabilities must contain the same number of rows")
-    if max_rows <= 0:
-        raise ValueError("max_rows must be > 0")
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    documents: list[str] = []
-    for row, probability in zip(frame.head(max_rows).to_dicts(), probabilities, strict=False):
-        documents.append(
-            json.dumps(
-                {
-                    "case_id": str(row["match_id"]),
-                    "match_date": str(row["match_date"]),
-                    "feature_schema_id": FEATURE_SCHEMA_ID,
-                    "feature_schema_version": FEATURE_SCHEMA_VERSION,
-                    "features": [float(row[name]) for name in TENNIS_XGBOOST_FEATURE_NAMES],
-                    "expected_player_1_win_probability": float(probability),
-                    "label": int(row["label"]),
-                },
-                separators=(",", ":"),
-            )
-        )
-    target.write_text("\n".join(documents) + ("\n" if documents else ""), encoding="utf-8")
-    return target
+    rows = frame.to_dicts()
+    return _parity.write_parity_cases(
+        path,
+        feature_names=TENNIS_XGBOOST_FEATURE_NAMES,
+        rows=[[float(row[name]) for name in TENNIS_XGBOOST_FEATURE_NAMES] for row in rows],
+        expected=[float(value) for value in probabilities],
+        schema_id=FEATURE_SCHEMA_ID,
+        schema_version=FEATURE_SCHEMA_VERSION,
+        case_ids=[str(row["match_id"]) for row in rows],
+        labels=[int(row["label"]) for row in rows],
+        scalar_field="expected_player_1_win_probability",
+        extra={"match_date": [str(row["match_date"]) for row in rows]},
+        max_rows=max_rows,
+    )
 
 
 def onnx_deployment_metadata(*, model_path: str = "model.onnx") -> dict[str, Any]:
@@ -606,30 +573,25 @@ def evaluate_probabilities(
     *,
     threshold: float = 0.5,
 ) -> TennisEvaluation:
-    labels = [int(value) for value in y_true]
-    probabilities = [float(value) for value in y_probability]
-    if len(labels) != len(probabilities):
-        raise ValueError("y_true and y_probability must have the same shape")
-    if not labels:
-        raise ValueError("at least one sample is required")
-    clipped = [min(max(probability, 1e-15), 1.0 - 1e-15) for probability in probabilities]
-    predictions = [1 if probability >= threshold else 0 for probability in probabilities]
-    accuracy = sum(int(prediction == label) for prediction, label in zip(predictions, labels, strict=True)) / len(
-        labels
-    )
-    log_loss = -sum(
-        label * math.log(probability) + (1 - label) * math.log(1.0 - probability)
-        for label, probability in zip(labels, clipped, strict=True)
-    ) / len(labels)
-    brier = sum((probability - label) ** 2 for label, probability in zip(labels, probabilities, strict=True)) / len(
-        labels
+    """Tennis-shaped view over the generic classification evaluator.
+
+    New strategies should call
+    :func:`eventcontracts.models.evaluation.evaluate_classification` directly —
+    it returns the same numbers plus calibration and baseline skill. This
+    keeps the tennis CLI/report contract (``TennisEvaluation``) stable.
+    """
+
+    metrics = _evaluation.evaluate_classification(
+        [int(value) for value in y_true],
+        [float(value) for value in y_probability],
+        threshold=threshold,
     )
     return TennisEvaluation(
-        accuracy=float(accuracy),
-        roc_auc=_roc_auc(labels, probabilities),
-        log_loss=float(log_loss),
-        brier_score=float(brier),
-        samples=len(labels),
+        accuracy=metrics.accuracy,
+        roc_auc=metrics.roc_auc,
+        log_loss=metrics.log_loss,
+        brier_score=metrics.brier_score,
+        samples=metrics.samples,
     )
 
 
@@ -846,36 +808,8 @@ def _number(value: object, default: float) -> float:
     return default if parsed is None else parsed
 
 
-def _roc_auc(labels: Sequence[int], probabilities: Sequence[float]) -> float:
-    n_pos = sum(1 for label in labels if label == 1)
-    n_neg = sum(1 for label in labels if label == 0)
-    if n_pos == 0 or n_neg == 0:
-        return math.nan
-    ranked = sorted(enumerate(probabilities), key=lambda item: item[1])
-    ranks = [0.0] * len(probabilities)
-    cursor = 0
-    while cursor < len(ranked):
-        end = cursor + 1
-        while end < len(ranked) and ranked[end][1] == ranked[cursor][1]:
-            end += 1
-        avg_rank = (cursor + 1 + end) / 2.0
-        for original_index, _probability in ranked[cursor:end]:
-            ranks[original_index] = avg_rank
-        cursor = end
-    pos_rank_sum = sum(rank for rank, label in zip(ranks, labels, strict=True) if label == 1)
-    return (pos_rank_sum - (n_pos * (n_pos + 1) / 2.0)) / (n_pos * n_neg)
-
-
 def _polars() -> Any:
     try:
         return import_module("polars")
     except ImportError as exc:  # pragma: no cover - environment dependent
         raise RuntimeError("polars is required for tennis dataframe helpers; install requirements.txt.") from exc
-
-
-def _set_onnx_metadata(model: Any, values: Mapping[str, str]) -> None:
-    del model.metadata_props[:]
-    for key, value in values.items():
-        prop = model.metadata_props.add()
-        prop.key = key
-        prop.value = value

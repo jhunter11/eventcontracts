@@ -3,6 +3,15 @@
 This design follows `docs/deep-research-report (17).md` and keeps the Python
 research implementation portable to the Rust runner.
 
+> **Now a specialization of the generic pipeline.** The export, export-parity,
+> and metric code that used to live here is now the model-family-agnostic
+> pipeline in [docs/ml-model-pipeline.md](ml-model-pipeline.md):
+> `export_xgboost_onnx`, `predict_onnx_probabilities`, `write_parity_cases`,
+> and `evaluate_probabilities` are thin tennis wrappers over
+> `eventcontracts.models.onnx_export` / `.evaluation` / `.parity`, and the Rust
+> `TennisOnnxArtifact` shares the generic `OnnxArtifact` bundle loader. Current
+> reference metrics for the trained model are tabulated in that document.
+
 ## Model Contract
 
 - Model family: XGBoost binary classifier.

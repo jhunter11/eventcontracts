@@ -19,6 +19,7 @@ from eventcontracts.cli import gen_windows as gen_windows_cmd
 from eventcontracts.cli import inspect_data as inspect_data_cmd
 from eventcontracts.cli import live_paper as live_paper_cmd
 from eventcontracts.cli import migrate_data as migrate_data_cmd
+from eventcontracts.cli import model_train as model_train_cmd
 from eventcontracts.cli import normalize as normalize_cmd
 from eventcontracts.cli import rank as rank_cmd
 from eventcontracts.cli import replay as replay_cmd
@@ -87,6 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
     gen_windows_cmd.register(subparsers)
     rank_cmd.register(subparsers)
     train_cmd.register(subparsers)
+    model_train_cmd.register(subparsers)
     tennis_xgboost_cmd.register(subparsers)
     sports_golf_cmd.register(subparsers)
     strategy_tools_cmd.register(subparsers)

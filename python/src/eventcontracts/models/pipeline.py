@@ -71,9 +71,12 @@ class ModelArtifact:
 class ModelExporter:
     """Export trained models to non-JSON runtime artifacts (e.g. ONNX).
 
-    Kept as a scaffold while the JSON artifact path in
-    :mod:`eventcontracts.models.artifacts` handles the common case. An
-    ONNX exporter is the next promotion step once Rust inference exists.
+    The concrete, model-family-agnostic ONNX export path lives in
+    :mod:`eventcontracts.models.onnx_export` (``export_model_onnx`` /
+    ``predict_onnx`` / ``verify_export_parity``) and is what the tennis
+    pipeline and the ``model-train`` CLI use. This abstract boundary stays for
+    the in-process JSON path in :mod:`eventcontracts.models.artifacts`, which
+    handles the pure-numpy linear/logistic models that don't need ONNX.
     """
 
     def export_onnx(self, run: TrainingRun) -> ModelArtifact:

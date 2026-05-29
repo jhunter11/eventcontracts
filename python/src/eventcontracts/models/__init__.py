@@ -7,6 +7,13 @@ from eventcontracts.models.artifacts import (
     write_artifact,
 )
 from eventcontracts.models.dataset import TrainingExample, TrainingExampleBuilder
+from eventcontracts.models.evaluation import (
+    CalibrationBin,
+    ClassificationMetrics,
+    RegressionMetrics,
+    evaluate_classification,
+    evaluate_regression,
+)
 from eventcontracts.models.labelers import (
     BinaryProfitableAfterFeesLabeler,
     Labeler,
@@ -21,6 +28,17 @@ from eventcontracts.models.models import (
     TrainingMetrics,
     load_model,
 )
+from eventcontracts.models.onnx_export import (
+    ModelFamily,
+    ModelTask,
+    OnnxExport,
+    OnnxExportParityError,
+    export_model_onnx,
+    predict_onnx,
+    read_metadata,
+    verify_export_parity,
+)
+from eventcontracts.models.parity import write_parity_cases
 from eventcontracts.models.pipeline import (
     ModelArtifact,
     ModelExporter,
@@ -43,7 +61,9 @@ from eventcontracts.models.trainer import (
 
 __all__ = [
     "BinaryProfitableAfterFeesLabeler",
+    "CalibrationBin",
     "ChronologicalSplit",
+    "ClassificationMetrics",
     "InMemoryModelRegistry",
     "InProcessModelRunner",
     "Labeler",
@@ -52,11 +72,16 @@ __all__ = [
     "LogisticRegressionModel",
     "ModelArtifact",
     "ModelExporter",
+    "ModelFamily",
     "ModelKind",
     "ModelRegistry",
     "ModelRunner",
+    "ModelTask",
     "ModelTrainer",
     "NextMidChangeBpsLabeler",
+    "OnnxExport",
+    "OnnxExportParityError",
+    "RegressionMetrics",
     "SettlementProbabilityLabeler",
     "TrainableModel",
     "TrainerConfig",
@@ -67,8 +92,15 @@ __all__ = [
     "TrainingResult",
     "TrainingRun",
     "canonical_dumps",
+    "evaluate_classification",
+    "evaluate_regression",
+    "export_model_onnx",
     "load_artifact",
     "load_model",
+    "predict_onnx",
+    "read_metadata",
     "sha256_of_payload",
+    "verify_export_parity",
     "write_artifact",
+    "write_parity_cases",
 ]
