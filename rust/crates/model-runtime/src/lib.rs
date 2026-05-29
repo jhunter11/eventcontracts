@@ -852,6 +852,39 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    /// End-to-end ONNX inference on a real promoted v2 bundle. Skipped unless
+    /// `EVENTCONTRACTS_TENNIS_V2_BUNDLE` points at a bundle dir (so CI without
+    /// the artifact stays green); run locally after exporting the v2 model to
+    /// prove the Rust `ort` path loads + scores it and respects the monotone
+    /// Elo constraint. Closes the last seam beyond Python export-parity.
+    #[test]
+    fn v2_bundle_scores_and_respects_elo_monotonicity_when_present() {
+        let Ok(dir) = std::env::var("EVENTCONTRACTS_TENNIS_V2_BUNDLE") else {
+            return;
+        };
+        let mut artifact = TennisV2OnnxArtifact::load_bundle(&dir).expect("load v2 bundle");
+        let neutral = TennisV2Snapshot::default();
+        let p_neutral = artifact.predict_snapshot(&neutral).unwrap();
+        assert!(
+            p_neutral > 0.0 && p_neutral < 1.0,
+            "neutral probability out of range: {p_neutral}"
+        );
+        let strong = TennisV2Snapshot {
+            p1_elo: 1950.0,
+            p2_elo: 1500.0,
+            p1_surface_elo: 1950.0,
+            p2_surface_elo: 1500.0,
+            p1_elo_blend: 1950.0,
+            p2_elo_blend: 1500.0,
+            ..Default::default()
+        };
+        let p_strong = artifact.predict_snapshot(&strong).unwrap();
+        assert!(
+            p_strong >= p_neutral,
+            "elo-favored p1 must not score lower (monotone): strong={p_strong} neutral={p_neutral}"
+        );
+    }
+
     fn temp_schema_path(label: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
