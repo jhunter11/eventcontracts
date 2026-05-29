@@ -9,6 +9,7 @@ pure-Python coverage still runs in a minimal environment.
 
 from __future__ import annotations
 
+import json
 import struct
 from datetime import date
 from pathlib import Path
@@ -274,6 +275,23 @@ def test_train_and_predict_in_unit_interval() -> None:
     preds = v2.predict_v2(model, frame)
     assert len(preds) == frame.height
     assert all(0.0 <= p <= 1.0 for p in preds)
+
+
+def test_committed_parity_fixture_is_current() -> None:
+    """The committed Python<->Rust fixture must equal a fresh generation.
+
+    If a v2 feature changes without regenerating the fixture, this fails — and
+    the Rust `feature_vector_matches_python_fixture` test would then be checking
+    against stale numbers. The two tests together pin both sides.
+    """
+    fixture_path = REPO_ROOT / v2.PARITY_FIXTURE_RELPATH
+    committed = json.loads(fixture_path.read_text())
+    fresh = json.loads(json.dumps(v2.feature_parity_fixture()))
+    assert committed == fresh, (
+        f"{v2.PARITY_FIXTURE_RELPATH} is stale; regenerate from "
+        "feature_parity_fixture() after changing v2 features"
+    )
+    assert committed["feature_names"] == list(v2.TENNIS_V2_FEATURE_NAMES)
 
 
 def test_antisymmetric_inference_gives_coherent_two_sided_prices() -> None:

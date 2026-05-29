@@ -297,6 +297,90 @@ def feature_vector_v2(snapshot: TennisV2Snapshot) -> tuple[float, ...]:
     return tuple(row[name] for name in TENNIS_V2_FEATURE_NAMES)
 
 
+# Path of the committed Python<->Rust feature-parity fixture. The Rust
+# feature-builder test loads this and asserts agreement; a Python drift-guard
+# test asserts the committed file still equals a fresh generation.
+PARITY_FIXTURE_RELPATH = "contracts/parity/tennis_v2_features/feature_cases.json"
+
+
+def _parity_snapshots() -> list[TennisV2Snapshot]:
+    """Diverse snapshots that exercise every branch of ``feature_row_v2``."""
+
+    return [
+        # 0: pure defaults / priors, no odds, unknown surface.
+        TennisV2Snapshot(match_id="v2-0", match_date=date(2025, 1, 6), p1_id="a", p2_id="b"),
+        # 1: strong p1 favorite, slam, clay, QF, best-of-5, lefty vs righty, vigged odds.
+        TennisV2Snapshot(
+            match_id="v2-1", match_date=date(2025, 5, 26), p1_id="a", p2_id="b",
+            surface="Clay", tourney_level="G", best_of=5, round="QF",
+            p1_elo=1850.0, p2_elo=1600.0, p1_surface_elo=1900.0, p2_surface_elo=1550.0,
+            p1_elo_blend=1870.0, p2_elo_blend=1580.0, p1_rank=2, p2_rank=25,
+            p1_rank_points=8500.0, p2_rank_points=1800.0, p1_seed=1, p2_seed=12,
+            p1_age=24.3, p2_age=31.8, p1_height_cm=185.0, p2_height_cm=178.0,
+            p1_hand="L", p2_hand="R", p1_serve_won=0.69, p2_serve_won=0.61,
+            p1_return_won=0.42, p2_return_won=0.35, p1_ace_rate=0.11, p2_ace_rate=0.05,
+            p1_df_rate=0.03, p2_df_rate=0.06, p1_bp_save=0.66, p2_bp_save=0.58,
+            p1_bp_convert=0.44, p2_bp_convert=0.38, p1_recent_wins=9, p2_recent_wins=4,
+            p1_recent_matches=11, p2_recent_matches=10, p1_opp_adjusted_form=0.18,
+            p2_opp_adjusted_form=-0.05, p1_surface_wins=40, p2_surface_wins=15,
+            p1_surface_matches=50, p2_surface_matches=30, p1_days_since_match=2,
+            p2_days_since_match=9, p1_matches_14d=4, p2_matches_14d=1, p1_games_14d=58,
+            p2_games_14d=14, p1_prev_long=1, p2_prev_long=0, p1_decimal_odds=1.4,
+            p2_decimal_odds=2.9,
+        ),
+        # 2: p2 favorite, grass final, righty vs lefty, p2 vigged odds.
+        TennisV2Snapshot(
+            match_id="v2-2", match_date=date(2025, 7, 13), p1_id="a", p2_id="b",
+            surface="Grass", tourney_level="G", best_of=5, round="F",
+            p1_elo=1580.0, p2_elo=1820.0, p1_surface_elo=1560.0, p2_surface_elo=1880.0,
+            p1_elo_blend=1575.0, p2_elo_blend=1840.0, p1_rank=30, p2_rank=3,
+            p1_hand="R", p2_hand="L", p1_days_since_match=100, p2_days_since_match=4,
+            p1_decimal_odds=3.5, p2_decimal_odds=1.3,
+        ),
+        # 3: missing odds + missing ranks, hard court, R32, varied serve.
+        TennisV2Snapshot(
+            match_id="v2-3", match_date=date(2025, 3, 10), p1_id="a", p2_id="b",
+            surface="Hard", tourney_level="M", best_of=3, round="R32",
+            p1_elo=1700.0, p2_elo=1680.0, p1_serve_won=0.64, p2_serve_won=0.67,
+            p1_return_won=0.39, p2_return_won=0.36, p1_recent_wins=6, p2_recent_wins=7,
+            p1_recent_matches=10, p2_recent_matches=12,
+        ),
+        # 4: carpet (no surface one-hot fires), round-robin, rank_points only.
+        TennisV2Snapshot(
+            match_id="v2-4", match_date=date(2025, 11, 12), p1_id="a", p2_id="b",
+            surface="Carpet", tourney_level="F", best_of=3, round="RR",
+            p1_rank_points=3200.0, p2_rank_points=3400.0, p1_matches_14d=3,
+            p2_matches_14d=3, p1_games_14d=40, p2_games_14d=44, p1_prev_long=0,
+            p2_prev_long=1, p1_decimal_odds=2.0, p2_decimal_odds=2.0,
+        ),
+    ]
+
+
+def feature_parity_fixture() -> dict[str, Any]:
+    """Snapshots + expected vectors pinning Python<->Rust v2 feature parity."""
+
+    from dataclasses import asdict
+
+    cases = []
+    for snapshot in _parity_snapshots():
+        fields = asdict(snapshot)
+        for non_feature in ("match_id", "match_date", "p1_id", "p2_id", "label"):
+            fields.pop(non_feature, None)
+        cases.append(
+            {
+                "case_id": snapshot.match_id,
+                "snapshot": fields,
+                "expected": list(feature_vector_v2(snapshot)),
+            }
+        )
+    return {
+        "schema_id": FEATURE_SCHEMA_ID,
+        "schema_version": FEATURE_SCHEMA_VERSION,
+        "feature_names": list(TENNIS_V2_FEATURE_NAMES),
+        "cases": cases,
+    }
+
+
 def _hand_matchup(p1_hand: str, p2_hand: str) -> float:
     p1 = (p1_hand or "U").strip().upper()[:1]
     p2 = (p2_hand or "U").strip().upper()[:1]

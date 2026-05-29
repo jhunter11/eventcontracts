@@ -374,6 +374,273 @@ fn normalized_implied_probabilities(p1: Option<f64>, p2: Option<f64>) -> (f64, f
     }
 }
 
+// ---------- tennis v2 (34-feature) ----------
+//
+// Mirrors `eventcontracts.research.tennis_v2.feature_row_v2` operation-for-
+// operation. ONLY the stateless snapshot -> vector arithmetic lives here; the
+// stateful accumulation (dynamic-K/MoV Elo, rolling serve/return, fatigue
+// windows, opponent-adjusted form) stays Python-side in the training-frame
+// builder, exactly like v1. Cross-language agreement is pinned by
+// `contracts/parity/tennis_v2_features/feature_cases.json` (Python-generated,
+// asserted in `tennis_v2_tests::feature_vector_matches_python_fixture`).
+
+/// Feature order shared with `tennis_v2.TENNIS_V2_FEATURE_NAMES` and the
+/// promoted v2 `feature_schema.json`.
+pub const TENNIS_V2_FEATURE_NAMES: [&str; 34] = [
+    "elo_diff",
+    "surface_elo_diff",
+    "elo_blend_diff",
+    "rank_log_advantage",
+    "rank_points_log_diff",
+    "seed_advantage",
+    "age_diff",
+    "height_cm_diff",
+    "hand_matchup",
+    "serve_pts_won_diff",
+    "return_pts_won_diff",
+    "serve_edge_diff",
+    "ace_rate_diff",
+    "df_rate_diff",
+    "bp_save_pct_diff",
+    "bp_convert_pct_diff",
+    "recent_win_pct_diff",
+    "opp_adjusted_form_diff",
+    "surface_win_pct_diff",
+    "recent_match_count_diff",
+    "days_rest_diff",
+    "recent_matches_14d_diff",
+    "recent_games_14d_diff",
+    "prev_match_long_diff",
+    "best_of_5",
+    "is_grand_slam",
+    "round_ordinal",
+    "surface_hard",
+    "surface_clay",
+    "surface_grass",
+    "p1_implied_prob",
+    "implied_prob_diff",
+    "odds_overround",
+    "odds_present",
+];
+
+/// Pre-match v2 state input. Serde field names match the Python
+/// `TennisV2Snapshot` dataclass so a single JSON shape feeds both languages.
+/// Defaults mirror the Python priors so a default snapshot scores identically.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TennisV2Snapshot {
+    pub surface: String,
+    pub tourney_level: String,
+    pub best_of: i32,
+    pub round: String,
+    pub p1_elo: f64,
+    pub p2_elo: f64,
+    pub p1_surface_elo: f64,
+    pub p2_surface_elo: f64,
+    pub p1_elo_blend: f64,
+    pub p2_elo_blend: f64,
+    pub p1_rank: Option<i32>,
+    pub p2_rank: Option<i32>,
+    pub p1_rank_points: Option<f64>,
+    pub p2_rank_points: Option<f64>,
+    pub p1_seed: Option<i32>,
+    pub p2_seed: Option<i32>,
+    pub p1_age: Option<f64>,
+    pub p2_age: Option<f64>,
+    pub p1_height_cm: Option<f64>,
+    pub p2_height_cm: Option<f64>,
+    pub p1_hand: String,
+    pub p2_hand: String,
+    pub p1_serve_won: f64,
+    pub p2_serve_won: f64,
+    pub p1_return_won: f64,
+    pub p2_return_won: f64,
+    pub p1_ace_rate: f64,
+    pub p2_ace_rate: f64,
+    pub p1_df_rate: f64,
+    pub p2_df_rate: f64,
+    pub p1_bp_save: f64,
+    pub p2_bp_save: f64,
+    pub p1_bp_convert: f64,
+    pub p2_bp_convert: f64,
+    pub p1_recent_wins: i32,
+    pub p2_recent_wins: i32,
+    pub p1_recent_matches: i32,
+    pub p2_recent_matches: i32,
+    pub p1_opp_adjusted_form: f64,
+    pub p2_opp_adjusted_form: f64,
+    pub p1_surface_wins: i32,
+    pub p2_surface_wins: i32,
+    pub p1_surface_matches: i32,
+    pub p2_surface_matches: i32,
+    pub p1_days_since_match: Option<i32>,
+    pub p2_days_since_match: Option<i32>,
+    pub p1_matches_14d: i32,
+    pub p2_matches_14d: i32,
+    pub p1_games_14d: i32,
+    pub p2_games_14d: i32,
+    pub p1_prev_long: i32,
+    pub p2_prev_long: i32,
+    pub p1_decimal_odds: Option<f64>,
+    pub p2_decimal_odds: Option<f64>,
+}
+
+impl Default for TennisV2Snapshot {
+    fn default() -> Self {
+        Self {
+            surface: "Unknown".into(),
+            tourney_level: String::new(),
+            best_of: 3,
+            round: String::new(),
+            p1_elo: 1500.0,
+            p2_elo: 1500.0,
+            p1_surface_elo: 1500.0,
+            p2_surface_elo: 1500.0,
+            p1_elo_blend: 1500.0,
+            p2_elo_blend: 1500.0,
+            p1_rank: None,
+            p2_rank: None,
+            p1_rank_points: None,
+            p2_rank_points: None,
+            p1_seed: None,
+            p2_seed: None,
+            p1_age: None,
+            p2_age: None,
+            p1_height_cm: None,
+            p2_height_cm: None,
+            p1_hand: "U".into(),
+            p2_hand: "U".into(),
+            p1_serve_won: 0.63,
+            p2_serve_won: 0.63,
+            p1_return_won: 0.37,
+            p2_return_won: 0.37,
+            p1_ace_rate: 0.07,
+            p2_ace_rate: 0.07,
+            p1_df_rate: 0.045,
+            p2_df_rate: 0.045,
+            p1_bp_save: 0.61,
+            p2_bp_save: 0.61,
+            p1_bp_convert: 0.40,
+            p2_bp_convert: 0.40,
+            p1_recent_wins: 0,
+            p2_recent_wins: 0,
+            p1_recent_matches: 0,
+            p2_recent_matches: 0,
+            p1_opp_adjusted_form: 0.0,
+            p2_opp_adjusted_form: 0.0,
+            p1_surface_wins: 0,
+            p2_surface_wins: 0,
+            p1_surface_matches: 0,
+            p2_surface_matches: 0,
+            p1_days_since_match: None,
+            p2_days_since_match: None,
+            p1_matches_14d: 0,
+            p2_matches_14d: 0,
+            p1_games_14d: 0,
+            p2_games_14d: 0,
+            p1_prev_long: 0,
+            p2_prev_long: 0,
+            p1_decimal_odds: None,
+            p2_decimal_odds: None,
+        }
+    }
+}
+
+/// Produce exactly the float32 tensor row expected by the v2 `model.onnx`.
+pub fn tennis_v2_feature_vector(s: &TennisV2Snapshot) -> [f32; 34] {
+    let (p1_prob, p2_prob, overround) =
+        normalized_implied_probabilities(s.p1_decimal_odds, s.p2_decimal_odds);
+    let surface = s.surface.trim().to_ascii_lowercase();
+    let p1_recent = smoothed_win_pct(s.p1_recent_wins, s.p1_recent_matches);
+    let p2_recent = smoothed_win_pct(s.p2_recent_wins, s.p2_recent_matches);
+    let p1_surface = smoothed_win_pct(s.p1_surface_wins, s.p1_surface_matches);
+    let p2_surface = smoothed_win_pct(s.p2_surface_wins, s.p2_surface_matches);
+    let p1_total = s.p1_serve_won + s.p1_return_won;
+    let p2_total = s.p2_serve_won + s.p2_return_won;
+    [
+        (s.p1_elo - s.p2_elo) as f32,
+        (s.p1_surface_elo - s.p2_surface_elo) as f32,
+        (s.p1_elo_blend - s.p2_elo_blend) as f32,
+        rank_log_advantage(s.p1_rank, s.p2_rank) as f32,
+        (log1p_points(s.p1_rank_points) - log1p_points(s.p2_rank_points)) as f32,
+        seed_advantage(s.p1_seed, s.p2_seed) as f32,
+        difference(s.p1_age, s.p2_age) as f32,
+        difference(s.p1_height_cm, s.p2_height_cm) as f32,
+        hand_matchup(&s.p1_hand, &s.p2_hand),
+        (s.p1_serve_won - s.p2_serve_won) as f32,
+        (s.p1_return_won - s.p2_return_won) as f32,
+        (p1_total - p2_total) as f32,
+        (s.p1_ace_rate - s.p2_ace_rate) as f32,
+        (s.p1_df_rate - s.p2_df_rate) as f32,
+        (s.p1_bp_save - s.p2_bp_save) as f32,
+        (s.p1_bp_convert - s.p2_bp_convert) as f32,
+        (p1_recent - p2_recent) as f32,
+        (s.p1_opp_adjusted_form - s.p2_opp_adjusted_form) as f32,
+        (p1_surface - p2_surface) as f32,
+        (s.p1_recent_matches - s.p2_recent_matches) as f32,
+        (rest_days(s.p1_days_since_match) - rest_days(s.p2_days_since_match)) as f32,
+        (s.p1_matches_14d - s.p2_matches_14d) as f32,
+        (s.p1_games_14d - s.p2_games_14d) as f32,
+        (s.p1_prev_long - s.p2_prev_long) as f32,
+        if s.best_of >= 5 { 1.0 } else { 0.0 },
+        if s.tourney_level.eq_ignore_ascii_case("G") {
+            1.0
+        } else {
+            0.0
+        },
+        round_ordinal(&s.round),
+        if surface == "hard" { 1.0 } else { 0.0 },
+        if surface == "clay" { 1.0 } else { 0.0 },
+        if surface == "grass" { 1.0 } else { 0.0 },
+        p1_prob as f32,
+        (p1_prob - p2_prob) as f32,
+        overround as f32,
+        if overround > 0.0 { 1.0 } else { 0.0 },
+    ]
+}
+
+pub fn tennis_v2_named_feature_vector(s: &TennisV2Snapshot) -> Vec<(&'static str, f32)> {
+    TENNIS_V2_FEATURE_NAMES
+        .iter()
+        .copied()
+        .zip(tennis_v2_feature_vector(s))
+        .collect()
+}
+
+/// `math.log1p(_number(points, 0.0))` — missing rank-points default to 0.
+fn log1p_points(points: Option<f64>) -> f64 {
+    points.unwrap_or(0.0).ln_1p()
+}
+
+/// `+1` p1 lefty vs righty, `-1` righty vs lefty, `0` otherwise. Mirrors
+/// `tennis_v2._hand_matchup` (first char, ASCII-uppercased).
+fn hand_matchup(p1_hand: &str, p2_hand: &str) -> f32 {
+    let first =
+        |h: &str| -> Option<char> { h.trim().chars().next().map(|c| c.to_ascii_uppercase()) };
+    match (first(p1_hand), first(p2_hand)) {
+        (Some('L'), Some('R')) => 1.0,
+        (Some('R'), Some('L')) => -1.0,
+        _ => 0.0,
+    }
+}
+
+/// Round name -> [0,1]. Mirrors `tennis_v2._ROUND_ORDINAL` / `_MAX_ROUND`.
+fn round_ordinal(round_name: &str) -> f32 {
+    let ordinal = match round_name.trim().to_ascii_uppercase().as_str() {
+        "R128" => 1,
+        "R64" => 2,
+        "R32" => 3,
+        "R16" => 4,
+        "QF" => 5,
+        "SF" => 6,
+        "F" => 7,
+        "RR" => 3,
+        "BR" => 6,
+        _ => 0,
+    };
+    ordinal as f32 / 7.0
+}
+
 #[cfg(test)]
 mod hot_path_tests {
     use super::*;
@@ -501,5 +768,91 @@ mod tennis_tests {
         assert_eq!(vector[12], 0.5);
         assert_eq!(vector[14], 0.0);
         assert_eq!(vector[19], 1.0);
+    }
+}
+
+#[cfg(test)]
+mod tennis_v2_tests {
+    use super::*;
+    use serde::Deserialize;
+
+    #[test]
+    fn v2_default_snapshot_is_neutral() {
+        let v = tennis_v2_feature_vector(&TennisV2Snapshot::default());
+        assert_eq!(v.len(), 34);
+        // elo/surface/blend diffs zero; rank/seed advantage zero (both default).
+        assert_eq!(v[0], 0.0);
+        assert_eq!(v[2], 0.0);
+        // neutral market block when no odds: p1_implied_prob=0.5, present=0.
+        assert_eq!(v[30], 0.5);
+        assert_eq!(v[33], 0.0);
+        // unknown surface -> no one-hot fires.
+        assert_eq!(v[27], 0.0);
+        assert_eq!(v[28], 0.0);
+        assert_eq!(v[29], 0.0);
+    }
+
+    #[test]
+    fn v2_hand_and_round_helpers() {
+        assert_eq!(hand_matchup("L", "R"), 1.0);
+        assert_eq!(hand_matchup("R", "L"), -1.0);
+        assert_eq!(hand_matchup("R", "R"), 0.0);
+        assert!((round_ordinal("QF") - 5.0 / 7.0).abs() < 1e-6);
+        assert_eq!(round_ordinal("F"), 1.0);
+        assert_eq!(round_ordinal("unknown"), 0.0);
+    }
+
+    #[derive(Deserialize)]
+    struct ParityFixture {
+        feature_names: Vec<String>,
+        cases: Vec<ParityFeatureCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct ParityFeatureCase {
+        case_id: String,
+        snapshot: TennisV2Snapshot,
+        expected: Vec<f64>,
+    }
+
+    /// The keystone Python<->Rust parity guard: the committed fixture is
+    /// generated by `tennis_v2.feature_parity_fixture()`; here Rust loads the
+    /// same snapshots through serde and asserts the vector agrees within f32
+    /// tolerance. If the two feature builders ever drift, this fails.
+    #[test]
+    fn feature_vector_matches_python_fixture() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../contracts/parity/tennis_v2_features/feature_cases.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read parity fixture {}: {e}", path.display()));
+        let fixture: ParityFixture = serde_json::from_str(&raw).expect("parse parity fixture");
+
+        assert_eq!(
+            fixture.feature_names.as_slice(),
+            TENNIS_V2_FEATURE_NAMES,
+            "feature name/order drift between Python and Rust"
+        );
+        assert!(!fixture.cases.is_empty(), "fixture has no cases");
+
+        for case in &fixture.cases {
+            let actual = tennis_v2_feature_vector(&case.snapshot);
+            assert_eq!(
+                case.expected.len(),
+                actual.len(),
+                "case {} width mismatch",
+                case.case_id
+            );
+            for (i, (&exp, act)) in case.expected.iter().zip(actual.iter()).enumerate() {
+                let diff = (exp - f64::from(*act)).abs();
+                let tol = 1e-4 + 1e-6 * exp.abs();
+                assert!(
+                    diff <= tol,
+                    "case {} feature {} ({}): python={exp} rust={act} diff={diff} tol={tol}",
+                    case.case_id,
+                    i,
+                    TENNIS_V2_FEATURE_NAMES[i],
+                );
+            }
+        }
     }
 }
