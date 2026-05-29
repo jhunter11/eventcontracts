@@ -47,6 +47,8 @@ class FeatureVector:
                 raise ValueError(f"duplicate feature name: {name}")
             if not isfinite(value):
                 raise ValueError(f"feature value must be finite: {name}={value}")
+            if _is_probability_semantic_feature(name) and not 0.0 <= value <= 1.0:
+                raise ValueError(f"probability feature must be between 0 and 1: {name}={value}")
             seen.add(name)
 
     def to_dict(self) -> dict[str, float]:
@@ -102,3 +104,18 @@ class Prediction:
             if not isfinite(extra):
                 raise ValueError(f"extra value must be finite: {key}={extra}")
         object.__setattr__(self, "extras", freeze_mapping(self.extras))
+
+
+def _is_probability_semantic_feature(name: str) -> bool:
+    """Best-effort guard for feature names that explicitly carry probabilities.
+
+    Broad model features like `implied_prob_diff` and `win_pct_diff` can be
+    signed deltas, so only direct probability names are clamped.
+    """
+
+    lowered = name.lower()
+    if any(token in lowered for token in ("diff", "delta", "edge", "overround")):
+        return False
+    return lowered in {"prob", "probability", "confidence"} or lowered.endswith(
+        ("_prob", "_probability", "_win_pct")
+    )

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from pathlib import Path
 
 from eventcontracts.config import (
     load_sleeve_spec,
     load_storage_config,
     load_strategy_spec,
+    load_toml,
     load_venue_config,
 )
 from eventcontracts.domain import LatencyTier, Venue
@@ -40,3 +42,12 @@ def test_load_storage_and_venue_configs() -> None:
 
     assert storage.raw.schema_version == "raw-event-v1"
     assert venue.venue["name"] == "kalshi"
+
+
+def test_load_toml_preserves_decimal_float_precision(tmp_path: Path) -> None:
+    path = tmp_path / "decimal.toml"
+    path.write_text("value = 0.10000000000000000001\n", encoding="utf-8")
+
+    loaded = load_toml(path)
+
+    assert loaded["value"] == Decimal("0.10000000000000000001")

@@ -54,22 +54,8 @@ from tests.conftest import REPO_ROOT
 NOW = datetime(2026, 1, 2, 14, 30, tzinfo=UTC)
 CONFIGS = REPO_ROOT / "configs"
 
-STRATEGY_CONFIGS: tuple[str, ...] = (
-    "weather-temperature-arbitrage.toml",
-    "microstructure-obi-scalper.toml",
-    "macro-nfp-absorber.toml",
-    "arbitrage-cross-venue.toml",
-    "macro-fed-gnn.toml",
-    "aerospace-launch-delay.toml",
-    "entertainment-box-office.toml",
-    "politics-primary-momentum.toml",
-    "politics-legislative-cascade.toml",
-    "microstructure-queue-evader.toml",
-    "macro-cpi-predictor.toml",
-    "sports-player-cut-lgbm.toml",
-    "sports-cut-line-shifter.toml",
-    "sports-frl-weather-arb.toml",
-    "sports-hole-by-hole-pin.toml",
+STRATEGY_CONFIGS: tuple[str, ...] = tuple(
+    sorted(path.name for path in (CONFIGS / "strategies").glob("*.toml"))
 )
 
 SLEEVE_CONFIGS: tuple[str, ...] = (
@@ -100,6 +86,20 @@ def test_all_strategy_configs_load_and_create_registered_strategies() -> None:
         assert strategy.spec == spec
 
 
+def test_every_builtin_strategy_has_toml_config() -> None:
+    strategy_modules = {
+        path.stem
+        for path in (REPO_ROOT / "python/src/eventcontracts/plugins/strategies").glob("*.py")
+        if not path.stem.startswith("_")
+    }
+    configured = {
+        load_strategy_spec(CONFIGS / "strategies" / config_name).name
+        for config_name in STRATEGY_CONFIGS
+    }
+
+    assert strategy_modules <= configured
+
+
 def test_all_sleeve_configs_load_and_reference_strategy_configs() -> None:
     strategy_ids = {
         load_strategy_spec(CONFIGS / "strategies" / config_name).strategy_id
@@ -112,6 +112,33 @@ def test_all_sleeve_configs_load_and_reference_strategy_configs() -> None:
         assert sleeve.strategy_id in strategy_ids
         assert sleeve.currency == "USD"
         assert sleeve.risk.currency == "USD"
+
+
+def test_sleeve_daily_loss_has_five_order_buffer() -> None:
+    for config_name in SLEEVE_CONFIGS:
+        sleeve = load_sleeve_spec(CONFIGS / "sleeves" / config_name)
+
+        assert sleeve.risk.max_daily_loss >= sleeve.risk.max_order_notional * Decimal("5")
+
+
+def test_audited_strategy_configs_expose_read_parameters() -> None:
+    expected = {
+        "weather-temperature-arbitrage.toml": {
+            "order_ttl_ms",
+            "allow_static_capital_base",
+        },
+        "macro-cpi-predictor.toml": {"order_ttl_ms"},
+        "microstructure-obi-scalper.toml": {
+            "model_kind",
+            "model_long_threshold",
+            "model_cancel_threshold",
+            "model_long_bps_threshold",
+        },
+    }
+    for config_name, keys in expected.items():
+        spec = load_strategy_spec(CONFIGS / "strategies" / config_name)
+
+        assert keys <= set(spec.parameters)
 
 
 @pytest.mark.parametrize(

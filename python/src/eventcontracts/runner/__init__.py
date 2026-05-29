@@ -5,7 +5,8 @@ from __future__ import annotations
 import warnings
 from typing import Any
 
-from eventcontracts.runner.base import RunSummary, StrategyRunner
+from eventcontracts.runner.base import RunSummary, StepResult, StrategyRunner
+from eventcontracts.runner.context import StatefulContext, StatefulContextProvider
 from eventcontracts.runner.ports import (
     Clock,
     ContextProvider,
@@ -24,7 +25,10 @@ __all__ = [
     "RiskDecision",
     "RiskGate",
     "RunSummary",
+    "StepResult",
     "StateStore",
+    "StatefulContext",
+    "StatefulContextProvider",
     "StrategyRunner",
 ]
 

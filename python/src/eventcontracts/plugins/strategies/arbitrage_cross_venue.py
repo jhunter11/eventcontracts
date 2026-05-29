@@ -7,8 +7,8 @@ no ML.
 Trigger: `QuoteEvent` from either venue. The strategy keeps the latest
 best-bid/best-ask per `(market_id, venue)` and, when both venues have current
 two-sided quotes, computes the cross-venue spread net of taker fees. When
-`(other_bid - this_ask) > min_edge_bps + fee_bps`, it emits a market order
-on the side this sleeve controls (the spec's `parameters.controlled_venue`).
+`(other_bid - this_ask) > min_edge_bps + fee_bps`, it emits an IOC limit
+order at the controlled venue's observed ask.
 
 The strategy explicitly does *not* leg both sides — it only places the order
 on the venue it controls and assumes the other venue's quote represents
@@ -27,10 +27,14 @@ from eventcontracts.domain.decisions import (
     PlaceOrder,
     StrategyDecision,
 )
-from eventcontracts.domain.events import NormalizedEvent, QuoteEvent
+from eventcontracts.domain.events import (
+    NormalizedEvent,
+    QuoteEvent,
+    market_snapshot_from_quote_event,
+)
 from eventcontracts.domain.ids import ClientOrderId
 from eventcontracts.domain.latency import ExecutionPriority, LatencyTier
-from eventcontracts.domain.models import OutcomeSide, Venue
+from eventcontracts.domain.models import MarketSnapshot, OutcomeSide, Venue
 from eventcontracts.domain.orders import OrderSide, OrderType, TimeInForce
 from eventcontracts.domain.spec import StrategySpec
 from eventcontracts.strategy.base import StrategyBase
@@ -44,6 +48,7 @@ class _BestQuote:
     bid_qty: Decimal | None = None
     ask: Decimal | None = None
     ask_qty: Decimal | None = None
+    snapshot: MarketSnapshot | None = None
 
 
 class ArbitrageCrossVenueStrategy(StrategyBase):
@@ -84,6 +89,7 @@ class ArbitrageCrossVenueStrategy(StrategyBase):
         if quote.ask is not None:
             entry.ask = quote.ask.price
             entry.ask_qty = quote.ask.quantity
+        entry.snapshot = market_snapshot_from_quote_event(event, side=OutcomeSide.YES)
 
         # Need both venues quoting on the same market_id.
         other_venue = self._opposite_venue(venue)
@@ -91,6 +97,8 @@ class ArbitrageCrossVenueStrategy(StrategyBase):
         this = self._book[key]
         if other is None or other.bid is None or this.ask is None:
             return (NoAction(reason="warmup:waiting_for_both_venues"),)
+        if this.snapshot is None or this.snapshot.ask is None:
+            return (NoAction(reason="warmup:missing_executable_snapshot"),)
 
         fee_bps = self.kalshi_taker_fee_bps + self.poly_taker_fee_bps
         edge_bps = (other.bid - this.ask) / this.ask * Decimal("10000")
@@ -110,9 +118,11 @@ class ArbitrageCrossVenueStrategy(StrategyBase):
                 instrument_id=instrument,
                 outcome_side=OutcomeSide.YES,
                 order_side=OrderSide.BUY,
-                order_type=OrderType.MARKET,
+                order_type=OrderType.LIMIT,
                 time_in_force=TimeInForce.IOC,
                 quantity=size,
+                price=this.snapshot.ask.price,
+                market_snapshot=this.snapshot,
                 reason=f"cross_venue_arb_edge_{edge_bps:.0f}bps",
                 expected_edge_bps=edge_bps,
                 priority=ExecutionPriority(tier=LatencyTier.FAST),

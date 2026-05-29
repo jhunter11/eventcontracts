@@ -1,0 +1,28 @@
+strategy_id = "energy-storage_weather_spread-v1"
+name = "energy_storage_weather_spread"
+version = "1.0.0"
+description = "Rules-mode grid stress strategy using load, renewables, and battery-state signals."
+feature_schema_id = "energy_storage_weather_spread_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXGRID*", "KXPOWER*", "KXENERGY*"]
+event_kinds = ["quote", "book", "external"]
+external_sources = ["grid-risk"]
+
+[default_execution_priority]
+tier = "relaxed"
+max_delay_ms = 5000
+expires_after_ms = 3600000
+reason = "grid stress forecast signals decay over minutes"
+
+[parameters]
+signal_source = "grid-risk"
+min_edge_bps = "100"
+size = "4"
+venue = "kalshi"
+
+[tags]
+family = "energy"
+mode = "paper"
+research_doc = "docs/strategy-specs.md"

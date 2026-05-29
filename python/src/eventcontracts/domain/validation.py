@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 ZERO = Decimal("0")
@@ -17,6 +17,26 @@ def require_non_empty(value: str, field_name: str) -> None:
 def require_aware_datetime(value: datetime, field_name: str) -> None:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field_name} must be timezone-aware")
+
+
+def require_utc_datetime(value: datetime, field_name: str) -> None:
+    require_aware_datetime(value, field_name)
+    if value.utcoffset() != UTC.utcoffset(value):
+        raise ValueError(f"{field_name} must be UTC: {value}")
+
+
+def require_not_future_datetime(
+    value: datetime,
+    field_name: str,
+    *,
+    now: datetime | None = None,
+    slack: timedelta = timedelta(seconds=60),
+) -> None:
+    require_aware_datetime(value, field_name)
+    reference = now or datetime.now(tz=UTC)
+    require_aware_datetime(reference, "now")
+    if value.astimezone(UTC) > reference.astimezone(UTC) + slack:
+        raise ValueError(f"{field_name} must not be in the future: {value}")
 
 
 def require_optional_aware_datetime(value: datetime | None, field_name: str) -> None:

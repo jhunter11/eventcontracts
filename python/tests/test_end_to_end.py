@@ -18,7 +18,7 @@ against Parquet-backed data with no other glue.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -40,6 +40,7 @@ from eventcontracts.domain.decisions import IntentEnvelope, PlaceOrder
 from eventcontracts.domain.events import (
     EventProvenance,
     OrderBookEvent,
+    QuoteEvent,
     TradeEvent,
 )
 from eventcontracts.domain.ids import EventId
@@ -48,6 +49,7 @@ from eventcontracts.domain.models import (
     OrderBook,
     OrderBookLevel,
     OutcomeSide,
+    Quote,
     Trade,
     Venue,
 )
@@ -56,7 +58,6 @@ from eventcontracts.execution import (
     FractionalQueueEstimator,
     MarketPaperSimulator,
     PnLTracker,
-    intent_to_order,
 )
 from eventcontracts.plugins.strategies import example_threshold  # noqa: F401 - registers
 from eventcontracts.replay import NormalizedReplaySource
@@ -79,7 +80,7 @@ def _strategy_spec() -> StrategySpec:
         subscription=EventSubscription(
             venues=(Venue.KALSHI,),
             instrument_patterns=("*",),
-            event_kinds=("trade",),
+            event_kinds=("quote", "trade"),
         ),
         parameters={"buy_below": "0.55", "size": "10"},
     )
@@ -100,13 +101,15 @@ def _sleeve() -> SleeveSpec:
             max_open_orders=10,
             max_gross_exposure=Decimal("1000"),
             currency="USD",
+            max_market_data_age_ms=20_000,
         ),
     )
 
 
 def _seed_data(store: ParquetEventStore) -> None:
-    """Synthesize one book snapshot followed by three falling-price trades."""
+    """Replay one book snapshot with quote/trade ticks from a falling market."""
 
+    event_start = NOW - timedelta(seconds=10)
     book = OrderBookEvent(
         event_id=EventId("book-1"),
         book=OrderBook(
@@ -121,8 +124,8 @@ def _seed_data(store: ParquetEventStore) -> None:
             ),
             no_bids=(),
             no_asks=(),
-            exchange_ts=NOW,
-            received_at=NOW,
+            exchange_ts=event_start,
+            received_at=event_start,
         ),
         provenance=EventProvenance(source="fixture", channel="book", venue=Venue.KALSHI),
     )
@@ -130,8 +133,29 @@ def _seed_data(store: ParquetEventStore) -> None:
 
     # Trades stepping down through 0.46, 0.44, 0.42 — first two are above
     # threshold (0.45), the third triggers a buy.
-    for i, price in enumerate(["0.46", "0.44", "0.42"]):
-        trade_at = NOW.replace(second=i + 1)
+    for i, (bid, ask, price) in enumerate(
+        [("0.43", "0.46", "0.46"), ("0.43", "0.44", "0.44"), ("0.41", "0.42", "0.42")]
+    ):
+        trade_at = event_start + timedelta(seconds=i + 1)
+        store.append_normalized(
+            QuoteEvent(
+                event_id=EventId(f"q-{i:03d}"),
+                quote=Quote(
+                    instrument_id=INSTR,
+                    side=OutcomeSide.YES,
+                    bid=OrderBookLevel(price=Decimal(bid), quantity=Decimal("50")),
+                    ask=OrderBookLevel(price=Decimal(ask), quantity=Decimal("50")),
+                    exchange_ts=trade_at,
+                    received_at=trade_at,
+                ),
+                provenance=EventProvenance(
+                    source="fixture",
+                    channel="ticker",
+                    venue=Venue.KALSHI,
+                    source_sequence=f"q-{i}",
+                ),
+            )
+        )
         store.append_normalized(
             TradeEvent(
                 event_id=EventId(f"t-{i:03d}"),
@@ -157,8 +181,8 @@ def test_phase1_phase2_phase3_vertical_slice(tmp_path: Path) -> None:
 
     # Phase 1 evidence: DuckDB sees the partitions.
     with DuckDbEventStore(tmp_path) as duck:
-        assert duck.normalized_count() == 4
-        assert set(duck.kinds_present()) == {"book", "trade"}
+        assert duck.normalized_count() == 7
+        assert set(duck.kinds_present()) == {"book", "quote", "trade"}
 
     spec = _strategy_spec()
     sleeve = _sleeve()
@@ -181,10 +205,7 @@ def test_phase1_phase2_phase3_vertical_slice(tmp_path: Path) -> None:
         def emit(self, envelope: IntentEnvelope) -> None:
             if not isinstance(envelope.decision, PlaceOrder):
                 return
-            intent = intent_to_order(envelope)
-            if intent is None:
-                return
-            for fill in simulator.submit(intent, envelope.emitted_at):
+            for fill in simulator.submit_envelope(envelope):
                 self.fills_observed.append(str(fill.fill_id))
 
     sink = _Sink()
@@ -232,9 +253,10 @@ def test_phase1_phase2_phase3_vertical_slice(tmp_path: Path) -> None:
 
     summary = runner.run()
 
-    # Strategy saw 4 events and emitted a decision for each.
-    assert summary.events_processed == 4
-    assert summary.decisions_emitted == 4
+    # Strategy saw the full external-style event stream and emitted an explicit
+    # decision for every event.
+    assert summary.events_processed == 7
+    assert summary.decisions_emitted == 7
     assert summary.intents_rejected == 0
 
     # With threshold 0.55 and trades at 0.46/0.44/0.42, all three trades

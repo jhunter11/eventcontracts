@@ -75,6 +75,7 @@ class ArtifactBundle:
     sleeve: SleeveSpec | None = None
     model: ModelArtifact | None = None
     parity: ParityCases | None = None
+    promoted: bool = False
     metadata: Mapping[str, Any] = field(default_factory=FrozenMap)
 
     def __post_init__(self) -> None:
@@ -100,6 +101,7 @@ class ArtifactBundleWriter:
         model_path: str | Path | None = None,
         parity_cases_path: str | Path | None = None,
         bundle_id: str | None = None,
+        promoted: bool = True,
         created_by: str = "eventcontracts.bundle-writer",
         created_at: datetime | None = None,
     ) -> ArtifactBundle:
@@ -130,7 +132,11 @@ class ArtifactBundleWriter:
         if parity_cases_path is not None:
             parity_file = _copy_file(Path(parity_cases_path), bundle_root / "parity" / Path(parity_cases_path).name)
             copied.append(parity_file)
-            parity = ParityCases(path=parity_file.path, sha256=parity_file.sha256, expected_rows=0)
+            parity = ParityCases(
+                path=parity_file.path,
+                sha256=parity_file.sha256,
+                expected_rows=_count_non_empty_lines(Path(parity_cases_path)),
+            )
 
         manifest = _manifest_document(
             bundle_id=resolved_bundle_id,
@@ -143,6 +149,7 @@ class ArtifactBundleWriter:
             model=model,
             parity=parity,
             files=tuple(copied),
+            promoted=promoted,
         )
         manifest_path = bundle_root / "manifest.toml"
         manifest_path.write_text(_manifest_to_toml(manifest), encoding="utf-8")
@@ -164,6 +171,7 @@ class ArtifactBundleWriter:
             feature_schema=feature_schema,
             model=model,
             parity=parity,
+            promoted=promoted,
             files=tuple(copied),
             created_at=created,
             manifest_path=str(manifest_path),
@@ -185,6 +193,7 @@ class ArtifactBundleWriter:
             model=bundle.model,
             parity=bundle.parity,
             files=bundle.files,
+            promoted=bundle.promoted,
         )
         path = root / "manifest.toml"
         path.write_text(_manifest_to_toml(manifest_doc), encoding="utf-8")
@@ -213,11 +222,14 @@ class ArtifactBundleWriter:
 class ArtifactBundleLoader:
     """Load immutable bundles for replay, paper, or live sleeves."""
 
-    def load(self, uri: str | Path) -> ArtifactBundle:
+    def load(self, uri: str | Path, *, require_promoted: bool = True) -> ArtifactBundle:
         root = Path(uri)
         manifest_path = root / "manifest.toml" if root.is_dir() else root
         validate_toml_contract_file(manifest_path, "manifest.schema.json")
         manifest = _load_manifest(manifest_path)
+        promoted = bool(manifest.get("promoted", False))
+        if require_promoted and not promoted:
+            raise ValueError(f"artifact bundle is not promoted: {manifest_path}")
         bundle_root = manifest_path.parent
 
         strategy = load_strategy_spec(_bundle_child(bundle_root, manifest["strategy"]["strategy_spec"]))
@@ -255,6 +267,7 @@ class ArtifactBundleLoader:
             feature_schema=feature_schema,
             model=model,
             parity=parity,
+            promoted=promoted,
             files=files,
             created_at=created_at,
             manifest_path=str(manifest_path),
@@ -298,6 +311,13 @@ class ArtifactBundleValidator:
     def validate_strategy_registered(self, bundle: ArtifactBundle) -> None:
         from eventcontracts.strategy.registry import ensure_registered
 
+        archetype = str(
+            bundle.strategy.tags.get("archetype")
+            or bundle.strategy.parameters.get("archetype")
+            or ""
+        )
+        if archetype in {"threshold", "external_edge", "model_edge", "scalper", "arb"}:
+            return
         ensure_registered(bundle.strategy.name)
 
     def validate_parity_cases(self, bundle: ArtifactBundle) -> None:
@@ -312,10 +332,22 @@ class ArtifactBundleValidator:
         if actual != bundle.parity.sha256:
             raise ValueError(f"parity checksum mismatch for {bundle.parity.path}: {actual} != {bundle.parity.sha256}")
 
+    def validate_live_sleeve_has_parity(self, bundle: ArtifactBundle) -> None:
+        if bundle.sleeve is None:
+            return
+        mode = str(bundle.sleeve.tags.get("mode", "paper")).lower()
+        if mode == "paper":
+            return
+        if bundle.parity is None or bundle.parity.expected_rows <= 0:
+            raise ValueError(
+                f"live sleeve {bundle.sleeve.sleeve_id} requires non-empty parity cases"
+            )
+
     def validate(self, bundle: ArtifactBundle) -> None:
         self.validate_checksums(bundle)
         self.validate_strategy_registered(bundle)
         self.validate_parity_cases(bundle)
+        self.validate_live_sleeve_has_parity(bundle)
 
 
 class PromotionRegistry:
@@ -428,6 +460,11 @@ def _copy_file(source: Path, target: Path) -> BundleFile:
     return _bundle_file(target, root=root)
 
 
+def _count_non_empty_lines(path: Path) -> int:
+    with path.open("r", encoding="utf-8") as file:
+        return sum(1 for line in file if line.strip())
+
+
 def _bundle_child(root: Path, relative: str | Path) -> Path:
     root_resolved = root.resolve()
     child = (root_resolved / relative).resolve()
@@ -462,6 +499,10 @@ def _load_model(manifest: Mapping[str, Any], bundle_root: Path) -> ModelArtifact
     if not isinstance(model_doc, dict) or model_doc.get("optional") is True and not model_doc.get("path"):
         return None
     path = _bundle_child(bundle_root, str(model_doc["path"]))
+    expected_sha = str(model_doc["sha256"])
+    actual_sha = sha256_file(path)
+    if actual_sha != expected_sha:
+        raise ValueError(f"model checksum mismatch for {path}: {actual_sha} != {expected_sha}")
     created_at = _parse_datetime(str(manifest["created_at"]))
     audit = audit_stamp_for(
         model_doc,
@@ -534,12 +575,14 @@ def _manifest_document(
     model: ModelArtifact | None,
     parity: ParityCases | None,
     files: Sequence[BundleFile],
+    promoted: bool,
 ) -> dict[str, Any]:
     document: dict[str, Any] = {
         "schema_version": BUNDLE_MANIFEST_SCHEMA_VERSION,
         "bundle_id": bundle_id,
         "created_at": created_at.isoformat(),
         "created_by": created_by,
+        "promoted": promoted,
         "strategy": {
             "name": strategy.name,
             "version": strategy.version,
@@ -591,6 +634,7 @@ def _manifest_to_toml(document: Mapping[str, Any]) -> str:
         f"bundle_id = {_toml_scalar(document['bundle_id'])}",
         f"created_at = {_toml_scalar(document['created_at'])}",
         f"created_by = {_toml_scalar(document.get('created_by', ''))}",
+        f"promoted = {_toml_scalar(document.get('promoted', False))}",
         "",
         "[strategy]",
         *_toml_table(document["strategy"]),

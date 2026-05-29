@@ -13,6 +13,7 @@ from eventcontracts.domain.models import Venue
 from eventcontracts.domain.validation import (
     require_aware_datetime,
     require_non_empty,
+    require_not_future_datetime,
     require_optional_aware_datetime,
 )
 
@@ -32,6 +33,7 @@ class EventEnvelope:
         require_non_empty(self.source, "source")
         require_non_empty(self.channel, "channel")
         require_aware_datetime(self.received_at, "received_at")
+        require_not_future_datetime(self.received_at, "received_at")
         require_optional_aware_datetime(self.exchange_ts, "exchange_ts")
         require_non_empty(self.schema_version, "schema_version")
         object.__setattr__(self, "payload", freeze_mapping(self.payload))

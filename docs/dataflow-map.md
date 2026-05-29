@@ -242,8 +242,6 @@ iteration:
 - `eventcontracts-runner`: runner/event-source/strategy/risk/sink traits.
 - `eventcontracts-gateway`: gateway command, ack, scheduler, idempotency, and
   venue executor traits.
-- `eventcontracts-bus`: topic, message, codec, publisher, and subscriber traits.
-- `eventcontracts-allocator`: capital snapshot and allocator traits.
 - `eventcontracts-parity`: parity case/result and parity runner traits.
 
 Run `make rust-check` for a fast compile check of all Rust scaffolds.

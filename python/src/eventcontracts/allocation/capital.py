@@ -6,17 +6,21 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
+from enum import Enum
 from typing import cast
 
 from eventcontracts.audit import AuditStamp, audit_stamp_for
-from eventcontracts.domain.ids import SleeveId
+from eventcontracts.domain.decisions import IntentEnvelope, PlaceOrder
+from eventcontracts.domain.ids import ClientOrderId, SleeveId
 from eventcontracts.domain.metadata import FrozenMap, freeze_mapping
+from eventcontracts.domain.orders import OrderSide
 from eventcontracts.domain.spec import SleeveSpec
 from eventcontracts.domain.validation import (
     require_aware_datetime,
     require_currency,
     require_non_empty,
     require_non_negative_decimal,
+    require_positive_decimal,
 )
 
 
@@ -46,6 +50,173 @@ class AllocationDecision:
         require_non_empty(str(self.sleeve_id), "sleeve_id")
         require_non_negative_decimal(self.target_capital, "target_capital")
         require_non_empty(self.reason, "reason")
+
+
+@dataclass(frozen=True)
+class PortfolioReservation:
+    client_order_id: ClientOrderId
+    sleeve_id: SleeveId
+    event_group_id: str
+    amount: Decimal
+    created_at: datetime
+    audit: AuditStamp
+
+    def __post_init__(self) -> None:
+        require_non_empty(str(self.client_order_id), "client_order_id")
+        require_non_empty(str(self.sleeve_id), "sleeve_id")
+        require_non_empty(self.event_group_id, "event_group_id")
+        require_positive_decimal(self.amount, "amount")
+        require_aware_datetime(self.created_at, "created_at")
+
+
+class IntentOutcome(str, Enum):
+    ACCEPTED = "accepted"
+    FILLED = "filled"
+    CANCELED = "canceled"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+
+
+@dataclass
+class PortfolioRiskAllocator:
+    """Atomic capital reservations across sleeves and event groups."""
+
+    total_capital: Decimal
+    currency: str
+    sleeve_budgets: Mapping[SleeveId, Decimal]
+    group_budgets: Mapping[str, Decimal] = field(default_factory=dict)
+    clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+    reservations: dict[ClientOrderId, PortfolioReservation] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        require_positive_decimal(self.total_capital, "total_capital")
+        require_currency(self.currency, "currency")
+        for sleeve_id, budget in self.sleeve_budgets.items():
+            require_non_empty(str(sleeve_id), "sleeve_id")
+            require_non_negative_decimal(budget, "sleeve budget")
+        for group_id, budget in self.group_budgets.items():
+            require_non_empty(group_id, "event_group_id")
+            require_non_negative_decimal(budget, "group budget")
+        # `freeze_mapping` returns `FrozenMap`, which is a `Mapping` —
+        # explicit cast keeps mypy happy on the declared field types.
+        self.sleeve_budgets = cast(
+            Mapping[SleeveId, Decimal], freeze_mapping(self.sleeve_budgets)
+        )
+        self.group_budgets = cast(Mapping[str, Decimal], freeze_mapping(self.group_budgets))
+
+    def reserve(
+        self,
+        envelope: IntentEnvelope,
+        *,
+        event_group_id: str | None = None,
+    ) -> tuple[PortfolioReservation | None, tuple[str, ...]]:
+        decision = envelope.decision
+        if not isinstance(decision, PlaceOrder) or decision.order_side is not OrderSide.BUY:
+            return None, ()
+        amount = (decision.price if decision.price is not None else Decimal("1")) * decision.quantity
+        if amount <= 0:
+            return None, ()
+
+        client_order_id = decision.client_order_id
+        if client_order_id in self.reservations:
+            return self.reservations[client_order_id], ()
+
+        group_id = self._event_group_id(envelope, decision, event_group_id)
+        reasons: list[str] = []
+        if self.reserved_total() + amount > self.total_capital:
+            reasons.append("portfolio_budget")
+        sleeve_budget = self.sleeve_budgets.get(envelope.sleeve_id)
+        if sleeve_budget is None:
+            reasons.append("sleeve_budget_missing")
+        elif self.reserved_for_sleeve(envelope.sleeve_id) + amount > sleeve_budget:
+            reasons.append("sleeve_budget")
+        group_budget = self.group_budgets.get(group_id)
+        if group_budget is not None and self.reserved_for_group(group_id) + amount > group_budget:
+            reasons.append("event_group_budget")
+        if reasons:
+            return None, tuple(reasons)
+
+        now = self._now()
+        reservation = PortfolioReservation(
+            client_order_id=client_order_id,
+            sleeve_id=envelope.sleeve_id,
+            event_group_id=group_id,
+            amount=amount,
+            created_at=now,
+            audit=audit_stamp_for(
+                {
+                    "client_order_id": str(client_order_id),
+                    "sleeve_id": str(envelope.sleeve_id),
+                    "event_group_id": group_id,
+                    "amount": str(amount),
+                    "currency": self.currency,
+                },
+                object_id=f"portfolio-reservation:{client_order_id}",
+                object_kind="portfolio_reservation",
+                schema_version="allocation-v1",
+                produced_at=now,
+                producer="portfolio_risk_allocator",
+                parent_ids=(str(envelope.correlation_id),),
+            ),
+        )
+        self.reservations[client_order_id] = reservation
+        return reservation, ()
+
+    def release(self, client_order_id: ClientOrderId) -> PortfolioReservation | None:
+        return self.reservations.pop(client_order_id, None)
+
+    def on_intent_outcome(
+        self,
+        client_order_id: ClientOrderId,
+        outcome: IntentOutcome | str,
+    ) -> PortfolioReservation | None:
+        outcome_value = outcome if isinstance(outcome, IntentOutcome) else IntentOutcome(str(outcome))
+        if outcome_value in {
+            IntentOutcome.FILLED,
+            IntentOutcome.CANCELED,
+            IntentOutcome.REJECTED,
+            IntentOutcome.EXPIRED,
+        }:
+            return self.release(client_order_id)
+        return None
+
+    def reserved_total(self) -> Decimal:
+        return sum((reservation.amount for reservation in self.reservations.values()), Decimal("0"))
+
+    def reserved_for_sleeve(self, sleeve_id: SleeveId) -> Decimal:
+        return sum(
+            (reservation.amount for reservation in self.reservations.values() if reservation.sleeve_id == sleeve_id),
+            Decimal("0"),
+        )
+
+    def reserved_for_group(self, event_group_id: str) -> Decimal:
+        return sum(
+            (
+                reservation.amount
+                for reservation in self.reservations.values()
+                if reservation.event_group_id == event_group_id
+            ),
+            Decimal("0"),
+        )
+
+    def _event_group_id(
+        self,
+        envelope: IntentEnvelope,
+        decision: PlaceOrder,
+        explicit: str | None,
+    ) -> str:
+        raw = (
+            explicit
+            or decision.metadata.get("event_group_id")
+            or envelope.metadata.get("event_group_id")
+            or decision.instrument_id.market_id
+        )
+        return str(raw)
+
+    def _now(self) -> datetime:
+        now = self.clock()
+        require_aware_datetime(now, "allocator clock")
+        return now
 
 
 class SleeveRegistry:
@@ -169,10 +340,7 @@ class EqualWeightAllocator(Allocator):
                             "total_capital": str(self.total_capital),
                             "currency": self.currency,
                         },
-                        object_id=(
-                            f"allocation-decision:{sleeve.sleeve_id}:"
-                            f"{now.isoformat()}"
-                        ),
+                        object_id=(f"allocation-decision:{sleeve.sleeve_id}:{now.isoformat()}"),
                         object_kind="allocation_decision",
                         schema_version="allocation-v1",
                         produced_at=now,

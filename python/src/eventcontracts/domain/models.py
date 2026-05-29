@@ -92,6 +92,39 @@ class OrderBookLevel:
 
 
 @dataclass(frozen=True)
+class MarketSnapshot:
+    """Executable top-of-book evidence attached to a trading decision."""
+
+    instrument_id: InstrumentId
+    side: OutcomeSide
+    bid: OrderBookLevel | None
+    ask: OrderBookLevel | None
+    exchange_ts: datetime | None
+    received_at: datetime
+    source: str
+    source_sequence: str | None = None
+    sequence_gap: bool = False
+    metadata: Mapping[str, Any] = field(default_factory=FrozenMap)
+
+    def __post_init__(self) -> None:
+        require_non_empty(self.source, "source")
+        if self.source_sequence is not None:
+            require_non_empty(self.source_sequence, "source_sequence")
+        require_optional_aware_datetime(self.exchange_ts, "exchange_ts")
+        require_aware_datetime(self.received_at, "received_at")
+        object.__setattr__(self, "metadata", freeze_mapping(self.metadata))
+
+    def age_ms(self, at: datetime) -> int:
+        require_aware_datetime(at, "at")
+        return int((at - self.received_at).total_seconds() * 1000)
+
+    def spread(self) -> Decimal | None:
+        if self.bid is None or self.ask is None:
+            return None
+        return self.ask.price - self.bid.price
+
+
+@dataclass(frozen=True)
 class Quote:
     instrument_id: InstrumentId
     side: OutcomeSide

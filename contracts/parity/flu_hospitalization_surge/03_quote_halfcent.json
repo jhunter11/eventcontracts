@@ -1,0 +1,31 @@
+{
+  "case_id": "flu_hospitalization_surge_03_quote_halfcent",
+  "event": {
+    "event_id": "flu:quote:2",
+    "event_kind": "quote",
+    "payload_json": "{\"instrument\":\"kalshi:KXFLU-DEMO\",\"bid\":\"0.58\",\"ask\":\"0.61\"}",
+    "provenance": {
+      "source": "kalshi-ws",
+      "channel": "ticker",
+      "schema_version": "kalshi-ws-v1",
+      "venue": "kalshi",
+      "source_sequence": "3",
+      "normalization_version": "kalshi-ws-v1",
+      "metadata": {}
+    },
+    "audit": {
+      "object_id": "flu:quote:2",
+      "object_kind": "normalized_event",
+      "schema_version": "normalized-event-v1",
+      "produced_at": "2026-05-26T12:00:02Z",
+      "producer": "external-fixture",
+      "canonical_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "parent_ids": [],
+      "trace_id": null,
+      "metadata": {}
+    }
+  },
+  "feature_vector": null,
+  "expected_decisions": [],
+  "tolerance_bps": "0"
+}

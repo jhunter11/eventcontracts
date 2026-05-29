@@ -6,12 +6,17 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 eventcontracts-contracts = { path = "../contracts" }
 eventcontracts-oms = { path = "../oms" }
 eventcontracts-risk = { path = "../risk" }
+eventcontracts-runtime-hot = { path = "../runtime-hot" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "time"] }
 
 [lib]
 path = "src/lib.rs"

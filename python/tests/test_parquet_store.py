@@ -6,8 +6,13 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+
 from eventcontracts.domain.events import (
     EventProvenance,
+    ExternalSignalEvent,
     OwnFillEvent,
     OwnOrderRejectEvent,
     OwnOrderUpdateEvent,
@@ -41,7 +46,18 @@ from eventcontracts.domain.orders import (
     OrderType,
     TimeInForce,
 )
-from eventcontracts.storage import EventEnvelope, ParquetEventStore
+from eventcontracts.storage import (
+    EventEnvelope,
+    InMemoryEventStore,
+    NormalizationReject,
+    ParquetEventStore,
+)
+from eventcontracts.storage.parquet_store import (
+    PARQUET_SCHEMA_METADATA_KEY,
+    RAW_PARQUET_SCHEMA_VERSION,
+    migrate_event_lake,
+)
+from eventcontracts.storage.sorting import normalized_event_sort_key
 
 NOW = datetime(2026, 1, 15, 14, 30, tzinfo=UTC)
 INSTR = InstrumentId(venue=Venue.KALSHI, market_id="M-1", outcome_id=None)
@@ -53,6 +69,7 @@ def _envelope(
     *,
     source: str = "kalshi-md",
     at: datetime = NOW,
+    metadata: dict[str, object] | None = None,
 ) -> EventEnvelope:
     return EventEnvelope(
         venue=Venue.KALSHI,
@@ -62,6 +79,7 @@ def _envelope(
         exchange_ts=at,
         payload=payload,
         schema_version="raw-event-v1",
+        metadata=metadata or {},
     )
 
 
@@ -108,6 +126,199 @@ def test_raw_envelope_round_trip(tmp_path: Path) -> None:
     assert read_back[0].payload["price"] == "0.5"
 
 
+def test_raw_parquet_writes_schema_version_metadata_and_column(tmp_path: Path) -> None:
+    store = ParquetEventStore(tmp_path)
+    store.append(_envelope("trade", {"market_id": "M-1"}))
+    store.flush()
+
+    path = next((tmp_path / "raw").rglob("*.parquet"))
+    parquet_file = pq.ParquetFile(path)
+    metadata = parquet_file.metadata.metadata or {}
+    table = parquet_file.read()
+
+    assert metadata[PARQUET_SCHEMA_METADATA_KEY] == str(RAW_PARQUET_SCHEMA_VERSION).encode("ascii")
+    assert set(table.column("_schema_version").to_pylist()) == {RAW_PARQUET_SCHEMA_VERSION}
+
+
+def test_raw_parquet_newer_schema_version_raises(tmp_path: Path) -> None:
+    # A file written by a NEWER build than this one must hard-fail (we can't know
+    # how to read it). Older/missing versions are tolerated (see the legacy test).
+    store = ParquetEventStore(tmp_path)
+    store.append(_envelope("trade", {"market_id": "M-1"}))
+    store.flush()
+    partition = next((tmp_path / "raw").rglob("date=*"))
+    bad = partition / "part-bad.parquet"
+    schema = pa.schema(
+        [
+            ("_schema_version", pa.int16()),
+            ("venue", pa.string()),
+            ("source", pa.string()),
+            ("channel", pa.string()),
+            ("received_at", pa.timestamp("us", tz="UTC")),
+            ("exchange_ts", pa.timestamp("us", tz="UTC")),
+            ("payload_json", pa.string()),
+            ("schema_version", pa.string()),
+            ("metadata_json", pa.string()),
+        ],
+        metadata={PARQUET_SCHEMA_METADATA_KEY: b"2"},
+    )
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "_schema_version": 2,
+                    "venue": "kalshi",
+                    "source": "kalshi-md",
+                    "channel": "trade",
+                    "received_at": NOW,
+                    "exchange_ts": NOW,
+                    "payload_json": "{}",
+                    "schema_version": "raw-event-v2",
+                    "metadata_json": "{}",
+                }
+            ],
+            schema=schema,
+        ),
+        bad,
+    )
+
+    with pytest.raises(ValueError, match="newer than supported"):
+        list(store.read(source="*"))
+
+
+def test_legacy_parquet_without_schema_version_reads_and_migrates(tmp_path: Path) -> None:
+    # V6-D1: a file written before the schema marker existed (no KV metadata and
+    # no `_schema_version` column) must read via upcast, and `migrate-data` must
+    # stamp it so the strict path applies afterward.
+    store = ParquetEventStore(tmp_path)
+    store.append(_envelope("trade", {"market_id": "M-1"}))
+    store.flush()
+    partition = next((tmp_path / "raw").rglob("date=*"))
+    legacy = partition / "part-legacy.parquet"
+    legacy_schema = pa.schema(
+        [
+            ("venue", pa.string()),
+            ("source", pa.string()),
+            ("channel", pa.string()),
+            ("received_at", pa.timestamp("us", tz="UTC")),
+            ("exchange_ts", pa.timestamp("us", tz="UTC")),
+            ("payload_json", pa.string()),
+            ("schema_version", pa.string()),
+            ("metadata_json", pa.string()),
+        ]
+    )
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "venue": "kalshi",
+                    "source": "kalshi-md",
+                    "channel": "trade",
+                    "received_at": NOW,
+                    "exchange_ts": NOW,
+                    "payload_json": '{"market_id": "L-1"}',
+                    "schema_version": "raw-event-v0",
+                    "metadata_json": "{}",
+                }
+            ],
+            schema=legacy_schema,
+        ),
+        legacy,
+    )
+
+    # Reads via upcast (would previously crash with a strict mismatch).
+    read_ids = {e.payload.get("market_id") for e in store.read(source="*")}
+    assert "L-1" in read_ids
+
+    counts = migrate_event_lake(tmp_path)
+    assert counts["raw"] >= 1  # the legacy file was stamped
+    parquet_file = pq.ParquetFile(legacy)
+    metadata = parquet_file.metadata.metadata or {}
+    assert metadata[PARQUET_SCHEMA_METADATA_KEY] == str(RAW_PARQUET_SCHEMA_VERSION).encode("ascii")
+    assert "_schema_version" in parquet_file.schema_arrow.names
+
+    # Still reads after migration (now via the strict path), and is idempotent.
+    assert "L-1" in {e.payload.get("market_id") for e in store.read(source="*")}
+    assert migrate_event_lake(tmp_path)["raw"] == 0
+
+
+def test_raw_envelope_rejects_far_future_received_at() -> None:
+    with pytest.raises(ValueError, match="future"):
+        _envelope(
+            "trade",
+            {"market_id": "M-1"},
+            at=datetime(9999, 1, 1, tzinfo=UTC),
+        )
+
+
+def test_private_raw_payloads_are_redacted_before_parquet_write(tmp_path: Path) -> None:
+    store = ParquetEventStore(tmp_path)
+    store.append(
+        _envelope(
+            "order",
+            {
+                "account_id": "acct-secret",
+                "order_id": "venue-order-secret",
+                "market_id": "M-1",
+                "nested": {"token": "token-secret"},
+            },
+            source="kalshi-private",
+        )
+    )
+    store.flush()
+
+    path = next((tmp_path / "raw").rglob("*.parquet"))
+    payload_json = pq.ParquetFile(path).read().column("payload_json").to_pylist()[0]
+
+    assert "acct-secret" not in payload_json
+    assert "venue-order-secret" not in payload_json
+    assert "token-secret" not in payload_json
+    assert "market_id" in payload_json
+
+
+def test_private_reject_payloads_are_redacted_before_parquet_write(tmp_path: Path) -> None:
+    store = ParquetEventStore(tmp_path)
+    raw = _envelope(
+        "own_fill",
+        {"account_id": "acct-secret", "fill_id": "fill-public-ish"},
+        source="kalshi-private",
+    )
+    store.append_normalization_reject(
+        NormalizationReject(
+            raw=raw,
+            reasons=("fixture",),
+            raw_sha256="a" * 64,
+        )
+    )
+    store.flush()
+
+    path = next((tmp_path / "normalization_rejects").rglob("*.parquet"))
+    payload_json = pq.ParquetFile(path).read().column("payload_json").to_pylist()[0]
+
+    assert "acct-secret" not in payload_json
+    assert "fill-public-ish" in payload_json
+
+
+def test_private_partition_ttl_deletes_only_private_old_files(tmp_path: Path) -> None:
+    store = ParquetEventStore(tmp_path)
+    old = datetime(2026, 1, 1, tzinfo=UTC)
+    recent = datetime(2026, 1, 10, tzinfo=UTC)
+    store.append(_envelope("order", {"account_id": "old"}, source="kalshi-private", at=old))
+    store.append(_envelope("trade", {"market_id": "public"}, source="kalshi-md", at=old))
+    store.append(_envelope("order", {"account_id": "recent"}, source="kalshi-private", at=recent))
+    store.flush()
+
+    deleted = store.expire_private_partitions(
+        retention_days=3,
+        now=datetime(2026, 1, 10, tzinfo=UTC),
+    )
+
+    assert deleted == 1
+    remaining = list((tmp_path / "raw").rglob("*.parquet"))
+    assert len(remaining) == 2
+    assert any("source=kalshi-md" in path.as_posix() for path in remaining)
+
+
 def test_normalized_round_trip(tmp_path: Path) -> None:
     store = ParquetEventStore(tmp_path)
     store.append_normalized(_trade_event("0.40", "10"))
@@ -140,6 +351,70 @@ def test_partitioning_creates_expected_directories(tmp_path: Path) -> None:
         assert path.exists(), f"missing partition {path}"
         files = list(path.glob("*.parquet"))
         assert files, f"no parquet files in {path}"
+
+
+def test_flush_uses_unique_uuid_part_names_without_overwrite(tmp_path: Path) -> None:
+    store = ParquetEventStore(tmp_path)
+    store.append(_envelope("trade", {"market_id": "M-1", "price": "0.5", "quantity": "1"}))
+    store.flush()
+    store.append(_envelope("trade", {"market_id": "M-1", "price": "0.6", "quantity": "1"}))
+    store.flush()
+
+    partition = tmp_path / "raw" / "venue=kalshi" / "source=kalshi-md" / "date=2026-01-15"
+    files = sorted(partition.glob("part-*.parquet"))
+
+    assert len(files) == 2
+    assert files[0].name != files[1].name
+    assert all(len(path.stem.removeprefix("part-")) == 32 for path in files)
+    assert len(list(store.read(source="kalshi-md"))) == 2
+
+
+def test_parquet_and_inmemory_raw_sorting_match_on_timestamp_ties(tmp_path: Path) -> None:
+    events = (
+        _envelope("trade", {"market_id": "M-1"}, source="b", metadata={"source_sequence": "2"}),
+        _envelope("trade", {"market_id": "M-1"}, source="a", metadata={"source_sequence": "3"}),
+        _envelope("book", {"market_id": "M-1"}, source="a", metadata={"source_sequence": "1"}),
+    )
+    parquet = ParquetEventStore(tmp_path, batch_size=10)
+    memory = InMemoryEventStore()
+    for event in events:
+        parquet.append(event)
+        memory.append(event)
+    parquet.flush()
+
+    parquet_order = [(e.source, e.channel, e.metadata.get("source_sequence")) for e in parquet.read(source="*")]
+    memory_order = [(e.source, e.channel, e.metadata.get("source_sequence")) for e in memory.read(source="*")]
+
+    assert parquet_order == memory_order
+
+
+def test_external_signal_sorting_uses_received_at_not_exchange_ts() -> None:
+    early_published_late_received = ExternalSignalEvent(
+        event_id=EventId("external-late"),
+        source="provider",
+        exchange_ts=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
+        received_at=datetime(2026, 1, 1, 12, 0, 5, tzinfo=UTC),
+        schema_version="external-v1",
+        payload={"market_id": "M-1"},
+    )
+    later_published_early_received = ExternalSignalEvent(
+        event_id=EventId("external-early"),
+        source="provider",
+        exchange_ts=datetime(2026, 1, 1, 12, 0, 3, tzinfo=UTC),
+        received_at=datetime(2026, 1, 1, 12, 0, 4, tzinfo=UTC),
+        schema_version="external-v1",
+        payload={"market_id": "M-1"},
+    )
+
+    ordered = sorted(
+        (early_published_late_received, later_published_early_received),
+        key=normalized_event_sort_key,
+    )
+
+    assert [event.event_id for event in ordered] == [
+        EventId("external-early"),
+        EventId("external-late"),
+    ]
 
 
 def test_round_trip_preserves_ordering_with_many_events(tmp_path: Path) -> None:

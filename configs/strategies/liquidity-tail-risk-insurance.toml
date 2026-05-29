@@ -1,0 +1,29 @@
+strategy_id = "liquidity-tail_risk_insurance-v1"
+name = "liquidity_tail_risk_insurance"
+version = "1.0.0"
+description = "Rules-mode tail insurance strategy gated by thin top-of-book liquidity."
+feature_schema_id = "liquidity_tail_risk_insurance_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["*"]
+event_kinds = ["quote", "book", "external"]
+external_sources = ["tail-risk"]
+
+[default_execution_priority]
+tier = "standard"
+max_delay_ms = 1000
+expires_after_ms = 300000
+reason = "liquidity regime signals should execute promptly but are not tick-arb"
+
+[parameters]
+signal_source = "tail-risk"
+min_edge_bps = "175"
+max_top_depth = "25"
+size = "2"
+venue = "kalshi"
+
+[tags]
+family = "liquidity"
+mode = "paper"
+research_doc = "docs/strategy-specs.md"

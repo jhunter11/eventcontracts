@@ -53,6 +53,11 @@ class RiskProfile:
     max_open_orders: int
     max_gross_exposure: Decimal
     currency: str
+    max_market_data_age_ms: int = 1000
+    max_spread: Decimal = Decimal("1")
+    max_order_lifetime_ms: int = 5000
+    allow_market_orders: bool = False
+    allow_unbounded_gtc: bool = False
 
     def __post_init__(self) -> None:
         require_positive_decimal(self.max_order_notional, "max_order_notional")
@@ -61,6 +66,9 @@ class RiskProfile:
         require_positive_int(self.max_open_orders, "max_open_orders")
         require_positive_decimal(self.max_gross_exposure, "max_gross_exposure")
         require_currency(self.currency, "currency")
+        require_positive_int(self.max_market_data_age_ms, "max_market_data_age_ms")
+        require_positive_decimal(self.max_spread, "max_spread")
+        require_positive_int(self.max_order_lifetime_ms, "max_order_lifetime_ms")
 
 
 @dataclass(frozen=True)
@@ -98,7 +106,7 @@ class StrategySpec:
     description: str
     subscription: EventSubscription
     default_execution_priority: ExecutionPriority = DEFAULT_EXECUTION_PRIORITY
-    parameters: Mapping[str, str | int | float | bool] = field(default_factory=FrozenMap)
+    parameters: Mapping[str, str | int | Decimal | bool] = field(default_factory=FrozenMap)
     model: ModelRef | None = None
     feature_schema_id: FeatureSchemaId | None = None
     tags: Mapping[str, str] = field(default_factory=FrozenMap)

@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from typing import Any
 
 from eventcontracts.audit import AuditStamp
 from eventcontracts.domain.events import NormalizedEvent
 from eventcontracts.domain.features import FeatureVector
 from eventcontracts.domain.ids import FeatureSchemaId
+from eventcontracts.domain.metadata import FrozenMap, freeze_mapping
 from eventcontracts.domain.models import InstrumentId
 from eventcontracts.domain.validation import require_aware_datetime, require_non_empty
 
@@ -58,11 +60,13 @@ class OnlineFeatureState:
     as_of: datetime
     last_event: NormalizedEvent | None = None
     vector: FeatureVector | None = None
+    builder_state: Mapping[str, Any] = field(default_factory=FrozenMap)
     audit: AuditStamp | None = None
     notes: tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         require_aware_datetime(self.as_of, "as_of")
+        object.__setattr__(self, "builder_state", freeze_mapping(self.builder_state))
         object.__setattr__(self, "notes", tuple(self.notes))
 
 

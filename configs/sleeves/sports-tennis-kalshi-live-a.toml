@@ -1,0 +1,45 @@
+# ============================================================================
+# TENNIS XGBOOST — LIVE (REAL CAPITAL) SLEEVE
+# ============================================================================
+# OPERATOR: review every value below before the first live run. These are
+# deliberately CONSERVATIVE first-deploy starters, NOT tuned position sizes.
+#
+#   - capital_allocation: set to the amount you have actually funded for this
+#     sleeve. The starter below is a small smoke-test size.
+#   - The [risk] limits are the live circuit breakers. max_daily_loss is the
+#     hard stop for the UTC day (latches the kill switch in both gates).
+#
+# The Rust live-runner (--live-submit) reads max_order_notional,
+# max_position_notional, max_daily_loss, max_open_orders, max_gross_exposure
+# from [risk]. Market-data freshness on the live path uses the runner's
+# built-in default (~30s) plus last-look require_executable_bbo / require_l1_depth
+# (auto-enabled under --live-submit); it is NOT set here because the shared
+# sleeve schema is validated strictly by the Python loader. See
+# docs/runbooks/kalshi-live-runner.md "Tennis go-live".
+#
+# Promotion gate (MUST pass before live):
+#   python -m eventcontracts.cli verify-strategy sports-tennis-xgboost
+# ============================================================================
+
+sleeve_id = "sports-tennis-kalshi-live-a"
+strategy_id = "sports-tennis-xgboost-v1"
+strategy_version = "1.0.0"
+venue = "kalshi"
+capital_allocation = "500"   # OPERATOR: set to your funded amount.
+currency = "USD"
+
+[risk]
+max_order_notional = "25"        # max $ per single order
+max_position_notional = "100"    # max $ exposure per outcome
+max_daily_loss = "150"           # hard stop for the UTC day (>= 5x order)
+max_open_orders = 5
+max_gross_exposure = "250"       # max $ gross across the sleeve
+currency = "USD"
+max_market_data_age_ms = 5000    # Python/backtest freshness (taker: keep tight)
+max_spread = "0.10"              # Python: skip wide/thin books
+max_order_lifetime_ms = 5000
+
+[tags]
+mode = "live"
+family = "sports"
+sport = "tennis"

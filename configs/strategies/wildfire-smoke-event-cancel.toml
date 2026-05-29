@@ -1,0 +1,29 @@
+strategy_id = "wildfire-smoke_event_cancel-v1"
+name = "wildfire_smoke_event_cancel"
+version = "1.0.0"
+description = "Rules-mode smoke plume strategy for event cancellation and AQI threshold markets."
+feature_schema_id = "wildfire_smoke_event_cancel_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXWILDFIRE*", "KXAQI*", "KXSMOKE*"]
+event_kinds = ["quote", "external"]
+external_sources = ["smoke-plume"]
+
+[default_execution_priority]
+tier = "relaxed"
+max_delay_ms = 5000
+expires_after_ms = 3600000
+reason = "smoke plume signals are slow-moving"
+
+[parameters]
+signal_source = "smoke-plume"
+min_edge_bps = "140"
+min_aqi_forecast = "100"
+size = "3"
+venue = "kalshi"
+
+[tags]
+family = "weather"
+mode = "paper"
+research_doc = "docs/strategy-specs.md"

@@ -6,9 +6,9 @@ capital_allocation = "10000"
 currency = "USD"
 
 [risk]
-max_order_notional = "5000"
+max_order_notional = "1000"
 max_position_notional = "10000"
-max_daily_loss = "3000"
+max_daily_loss = "5000"
 max_open_orders = 100
 max_gross_exposure = "10000"
 currency = "USD"

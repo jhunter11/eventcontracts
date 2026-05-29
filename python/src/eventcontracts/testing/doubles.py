@@ -65,6 +65,9 @@ class InMemoryClock:
     def now(self) -> datetime:
         return self.current
 
+    def set(self, current: datetime) -> None:
+        self.current = current
+
     def advance(self, *, seconds: float = 0.0) -> None:
         self.current = self.current + timedelta(seconds=seconds)
 

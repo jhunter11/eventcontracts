@@ -1,0 +1,31 @@
+{
+  "case_id": "sports_tennis_xgboost_01_prediction",
+  "event": {
+    "event_id": "tennis:prediction:1",
+    "event_kind": "external",
+    "payload_json": "{\"market_id\":\"KX-ATP-DEMO\",\"player_1_win_probability\":\"0.70\"}",
+    "provenance": {
+      "source": "tennis_xgboost_onnx",
+      "channel": "external",
+      "schema_version": "tennis-prediction-v1",
+      "venue": "kalshi",
+      "source_sequence": "1",
+      "normalization_version": "normalizer-v1",
+      "metadata": {}
+    },
+    "audit": {
+      "object_id": "tennis:prediction:1",
+      "object_kind": "normalized_event",
+      "schema_version": "normalized-event-v1",
+      "produced_at": "2026-05-26T12:00:00Z",
+      "producer": "external-fixture",
+      "canonical_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "parent_ids": [],
+      "trace_id": null,
+      "metadata": {}
+    }
+  },
+  "feature_vector": null,
+  "expected_decisions": [],
+  "tolerance_bps": "0"
+}

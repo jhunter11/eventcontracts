@@ -6,7 +6,11 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 eventcontracts-contracts = { path = "../contracts" }
+eventcontracts-gateway = { path = "../gateway" }
+eventcontracts-oms = { path = "../oms" }
+eventcontracts-runtime-hot = { path = "../runtime-hot" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -15,6 +19,7 @@ thiserror = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
 futures-util = "0.3"
+parking_lot = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }
 url = "2"
 
@@ -23,6 +28,9 @@ sha2 = "0.10"
 base64 = "0.22"
 
 time = { version = "0.3", default-features = false, features = ["std", "formatting", "parsing", "macros"] }
+
+[dev-dependencies]
+eventcontracts-risk = { path = "../risk" }
 
 [lib]
 path = "src/lib.rs"

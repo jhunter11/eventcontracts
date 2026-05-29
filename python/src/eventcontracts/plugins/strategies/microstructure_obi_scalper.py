@@ -45,7 +45,7 @@ from eventcontracts.domain.latency import ExecutionPriority, LatencyTier
 from eventcontracts.domain.models import InstrumentId, OrderBook, OutcomeSide
 from eventcontracts.domain.orders import OrderSide, OrderType, TimeInForce
 from eventcontracts.domain.spec import StrategySpec
-from eventcontracts.strategy.base import StrategyBase
+from eventcontracts.strategy.base import StrategyBase, StrategyFeedback
 from eventcontracts.strategy.context import StrategyContext
 from eventcontracts.strategy.registry import register
 
@@ -75,6 +75,7 @@ class MicrostructureObiScalperStrategy(StrategyBase):
             str(spec.parameters.get("model_long_bps_threshold", "5"))
         )
         self._open_buy_orders: dict[InstrumentId, ClientOrderId] = {}
+        self._pending_cancel_orders: set[ClientOrderId] = set()
 
     def on_event(
         self, event: NormalizedEvent, ctx: StrategyContext
@@ -123,6 +124,8 @@ class MicrostructureObiScalperStrategy(StrategyBase):
         existing = self._open_buy_orders.get(book.instrument_id)
         if imbalance >= self.imbalance_threshold:
             return self._buy(book, reason=f"obi_buy_imbalance_{imbalance:.2f}")
+        if existing is not None and existing in self._pending_cancel_orders:
+            return (NoAction(reason="cancel_already_pending"),)
         if existing is not None and imbalance <= self.cancel_threshold:
             return self._cancel(book, existing, reason=f"obi_flip_imbalance_{imbalance:.2f}")
         return (NoAction(reason=f"no_signal_imbalance_{imbalance:.2f}"),)
@@ -134,22 +137,31 @@ class MicrostructureObiScalperStrategy(StrategyBase):
         if self.model_kind == "classification":
             if Decimal(str(prediction)) >= self.model_long_threshold:
                 return self._buy(book, reason=f"model_p={prediction:.3f}")
+            if existing is not None and existing in self._pending_cancel_orders:
+                return (NoAction(reason="cancel_already_pending"),)
             if existing is not None and Decimal(str(prediction)) <= self.model_cancel_threshold:
                 return self._cancel(book, existing, reason=f"model_p={prediction:.3f}")
             return (NoAction(reason=f"model_idle_p={prediction:.3f}"),)
         # Regression: prediction is in bps; positive = up, negative = down.
         if Decimal(str(prediction)) >= self.model_long_bps_threshold:
             return self._buy(book, reason=f"model_bps={prediction:.1f}")
+        if existing is not None and existing in self._pending_cancel_orders:
+            return (NoAction(reason="cancel_already_pending"),)
         if existing is not None and Decimal(str(prediction)) <= -self.model_long_bps_threshold:
             return self._cancel(book, existing, reason=f"model_bps={prediction:.1f}")
         return (NoAction(reason=f"model_idle_bps={prediction:.1f}"),)
 
     def _buy(self, book: OrderBook, *, reason: str) -> Sequence[StrategyDecision]:
-        best_bid = book.yes_bids[0].price if book.yes_bids else None
-        if best_bid is None:
-            return (NoAction(reason="censored:no_bid_for_placement"),)
+        # The hypothesis is that a severe bid imbalance precedes an *upward
+        # spread crossing*, so this is a TAKER scalp: we must cross the spread to
+        # capture the move. An IOC priced at the bid (the prior behaviour) is not
+        # marketable — bid < ask — so it would cancel with zero fill every time.
+        # Price at the best ask so the IOC actually crosses and fills; the
+        # `max_spread_bps` gate above bounds the slippage paid to cross.
+        best_ask = book.yes_asks[0].price if book.yes_asks else None
+        if best_ask is None:
+            return (NoAction(reason="censored:no_ask_for_placement"),)
         coid = ClientOrderId(uuid4().hex)
-        self._open_buy_orders[book.instrument_id] = coid
         return (
             PlaceOrder(
                 client_order_id=coid,
@@ -159,7 +171,7 @@ class MicrostructureObiScalperStrategy(StrategyBase):
                 order_type=OrderType.LIMIT,
                 time_in_force=TimeInForce.IOC,
                 quantity=self.clip_size,
-                price=best_bid,
+                price=best_ask,
                 reason=reason,
                 priority=ExecutionPriority(tier=LatencyTier.FAST),
             ),
@@ -168,7 +180,7 @@ class MicrostructureObiScalperStrategy(StrategyBase):
     def _cancel(
         self, book: OrderBook, existing: ClientOrderId, *, reason: str
     ) -> Sequence[StrategyDecision]:
-        self._open_buy_orders.pop(book.instrument_id, None)
+        del book
         return (
             CancelOrder(
                 client_order_id=existing,
@@ -176,6 +188,33 @@ class MicrostructureObiScalperStrategy(StrategyBase):
                 priority=ExecutionPriority(tier=LatencyTier.CRITICAL),
             ),
         )
+
+    def on_feedback(self, feedback: StrategyFeedback, ctx: StrategyContext) -> None:
+        del ctx
+        if feedback.client_order_id is None:
+            return
+        if feedback.kind == "IntentRejected":
+            decision = feedback.envelope.decision
+            if isinstance(decision, PlaceOrder):
+                self._remove_order(feedback.client_order_id)
+            elif isinstance(decision, CancelOrder):
+                self._pending_cancel_orders.discard(feedback.client_order_id)
+            return
+        if feedback.kind == "IntentAccepted":
+            decision = feedback.envelope.decision
+            if isinstance(decision, PlaceOrder):
+                self._open_buy_orders[decision.instrument_id] = feedback.client_order_id
+            elif isinstance(decision, CancelOrder):
+                self._pending_cancel_orders.add(feedback.client_order_id)
+            return
+        if feedback.kind in {"VenueRejected", "VenueTerminal"}:
+            self._remove_order(feedback.client_order_id)
+
+    def _remove_order(self, client_order_id: ClientOrderId) -> None:
+        self._pending_cancel_orders.discard(client_order_id)
+        for instrument_id, existing in list(self._open_buy_orders.items()):
+            if existing == client_order_id:
+                self._open_buy_orders.pop(instrument_id, None)
 
 
 def _l1_quantities(book: OrderBook) -> tuple[Decimal, Decimal]:

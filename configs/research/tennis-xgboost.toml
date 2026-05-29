@@ -1,0 +1,29 @@
+[program]
+name = "tennis_xgboost_match_winner"
+venue = "kalshi"
+enabled = false
+
+[inputs]
+historical_sources = ["jeff_sackmann_atp_matches"]
+optional_sources = ["bookmaker_odds", "atp_player_bios", "challenger_matches"]
+target = "player_1_match_win"
+
+[features]
+schema_id = "tennis_xgboost_match_features"
+schema_version = "1"
+schema_path = "contracts/examples/tennis_xgboost/feature_schema.json"
+temporal_state = ["overall_elo", "surface_elo", "head_to_head", "recent_form", "days_rest"]
+
+[model]
+family = "xgboost"
+export_format = "onnx"
+onnx_path = "model.onnx"
+onnx_input = "features"
+
+[evaluation]
+split = "temporal"
+metrics = ["accuracy", "roc_auc", "log_loss", "brier_score"]
+target_accuracy = 0.75
+target_roc_auc = 0.85
+target_log_loss = 0.50
+target_brier_score = 0.20

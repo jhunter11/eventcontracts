@@ -27,6 +27,8 @@ from eventcontracts.domain.events import (
     TimerEvent,
     TradeEvent,
     event_kind,
+    market_snapshot_from_book_event,
+    market_snapshot_from_quote_event,
 )
 from eventcontracts.domain.features import FeatureVector, Prediction, Signal
 from eventcontracts.domain.fills import Fill
@@ -42,6 +44,8 @@ from eventcontracts.domain.ids import (
     SleeveId,
     StrategyId,
     VenueOrderId,
+    new_client_order_id,
+    validate_client_order_id,
 )
 from eventcontracts.domain.latency import (
     DEFAULT_EXECUTION_PRIORITY,
@@ -57,6 +61,7 @@ from eventcontracts.domain.metadata import FrozenMap
 from eventcontracts.domain.models import (
     InstrumentId,
     Market,
+    MarketSnapshot,
     MarketStatus,
     OrderBook,
     OrderBookLevel,
@@ -114,6 +119,7 @@ __all__ = [
     "Market",
     "MarketLifecycleEvent",
     "MarketLifecycleKind",
+    "MarketSnapshot",
     "MarketStatus",
     "ModelName",
     "ModelRef",
@@ -155,10 +161,14 @@ __all__ = [
     "TradeEvent",
     "Venue",
     "VenueOrderId",
+    "new_client_order_id",
+    "validate_client_order_id",
     "canonical_sha256",
     "decision_kind",
     "decision_priority",
     "event_kind",
+    "market_snapshot_from_book_event",
+    "market_snapshot_from_quote_event",
     "to_canonical_json",
     "to_primitive",
 ]

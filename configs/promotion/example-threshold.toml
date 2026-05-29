@@ -1,0 +1,5 @@
+strategy_spec = "../strategies/example-threshold.toml"
+parity_cases = "../../contracts/parity/example_threshold"
+stage = "paper"
+promoted = true
+

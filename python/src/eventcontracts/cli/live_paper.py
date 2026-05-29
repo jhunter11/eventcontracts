@@ -35,13 +35,12 @@ import os
 import signal
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from eventcontracts.adapters.venues.kalshi.client import (
     KalshiPublicClient,
@@ -57,13 +56,13 @@ from eventcontracts.domain.decisions import (
     IntentEnvelope,
     PlaceOrder,
     decision_kind,
-    decision_priority,
 )
 from eventcontracts.domain.events import NormalizedEvent
-from eventcontracts.domain.ids import CorrelationId, SleeveId, StrategyId
+from eventcontracts.domain.ids import SleeveId, StrategyId
 from eventcontracts.domain.positions import CashBalance
 from eventcontracts.normalization.kalshi import KalshiNormalizer
 from eventcontracts.risk.policy import SleeveRiskGate
+from eventcontracts.runner import StrategyRunner
 from eventcontracts.runner.ports import RiskDecision
 from eventcontracts.strategy.registry import create_from_spec
 from eventcontracts.testing.doubles import InMemoryContext
@@ -325,7 +324,7 @@ async def _run(
     normalizer = KalshiNormalizer()
     handlers = normalizer.handlers()
 
-    # Initial strategy lifecycle.
+    # Initial strategy lifecycle through the shared runner mechanics.
     cash_balance = await _initial_cash_balance(
         rest=rest,
         sleeve_spec=sleeve_spec,
@@ -339,7 +338,18 @@ async def _run(
         sleeve_spec.currency,
         cash_balance,
     )
-    strategy.on_init(ctx_provider.context())
+    runner = StrategyRunner(
+        spec=strategy_spec,
+        sleeve=sleeve_spec,
+        strategy=strategy,
+        events=_EmptyEventSource(),
+        sink=_LivePaperIntentSink(files=files, stats=stats),
+        risk=risk_gate,
+        clock=_LiveClock(),
+        context_provider=ctx_provider,
+        verdict_sink=_LivePaperRiskSink(files=files, stats=stats).on_verdict,
+    )
+    runner.start()
 
     tasks: list[asyncio.Task[Any]] = []
 
@@ -402,14 +412,8 @@ async def _run(
     tasks.append(
         asyncio.create_task(
             _strategy_loop(
-                strategy=strategy,
-                strategy_spec=strategy_spec,
-                sleeve_spec=sleeve_spec,
-                risk_gate=risk_gate,
-                ctx_provider=ctx_provider,
+                runner=runner,
                 event_queue=event_queue,
-                files=files,
-                stats=stats,
                 shutdown=shutdown,
             )
         )
@@ -431,7 +435,7 @@ async def _run(
             with contextlib.suppress(BaseException):
                 await task
         with contextlib.suppress(BaseException):
-            strategy.on_shutdown(ctx_provider.context())
+            runner.stop()
 
 
 # ---------- WS loop ----------
@@ -554,9 +558,11 @@ async def _stream_ws(
                     flush=True,
                 )
             continue
-        stats.normalized_events += 1
+        events = normalized if isinstance(normalized, tuple) else (normalized,)
+        stats.normalized_events += len(events)
         stats.last_event_at = datetime.now(UTC)
-        await event_queue.put(normalized)
+        for event in events:
+            await event_queue.put(event)
 
 
 async def _discover_weather_markets(
@@ -723,14 +729,8 @@ async def _forecast_loop(
 
 async def _strategy_loop(
     *,
-    strategy: Any,
-    strategy_spec: Any,
-    sleeve_spec: Any,
-    risk_gate: SleeveRiskGate,
-    ctx_provider: _ContextProvider,
+    runner: StrategyRunner,
     event_queue: asyncio.Queue[NormalizedEvent],
-    files: RunFiles,
-    stats: LiveStats,
     shutdown: asyncio.Event,
 ) -> None:
     while not shutdown.is_set():
@@ -738,63 +738,75 @@ async def _strategy_loop(
             event = await asyncio.wait_for(event_queue.get(), timeout=2.0)
         except TimeoutError:
             continue
-        ctx = ctx_provider.context()
         try:
-            decisions = strategy.on_event(event, ctx)
+            runner.process_event(event)
         except Exception as exc:  # noqa: BLE001
             print(f"[live-paper] strategy error: {exc!r}", file=sys.stderr, flush=True)
             continue
-        for decision in decisions:
-            kind = decision_kind(decision)
-            stats.decisions += 1
-            stats.decisions_by_kind[kind] = stats.decisions_by_kind.get(kind, 0) + 1
-            envelope = IntentEnvelope(
-                decision=decision,
-                strategy_id=strategy_spec.strategy_id,
-                sleeve_id=sleeve_spec.sleeve_id,
-                correlation_id=CorrelationId(uuid4().hex),
-                emitted_at=datetime.now(UTC),
-                priority=decision_priority(
-                    decision, strategy_spec.default_execution_priority
-                ),
-                triggered_by_event_id=getattr(event, "event_id", None),
-                metadata={"decision_kind": kind},
-            )
-            verdict: RiskDecision = risk_gate.evaluate(envelope, ctx)
-            files.append(
-                files.risk,
-                {
-                    "correlation_id": str(envelope.correlation_id),
-                    "decision_kind": kind,
-                    "allowed": verdict.allowed,
-                    "reasons": list(verdict.reasons),
-                    "emitted_at": envelope.emitted_at.isoformat(),
-                },
-            )
-            if verdict.allowed:
-                stats.intents_dispatched += 1
-                files.append(
-                    files.decisions,
-                    {
-                        "correlation_id": str(envelope.correlation_id),
-                        "decision_kind": kind,
-                        "instrument": _instrument_str(decision),
-                        "decision_repr": repr(decision),
-                        "emitted_at": envelope.emitted_at.isoformat(),
-                        "triggered_by_event_id": str(envelope.triggered_by_event_id)
-                        if envelope.triggered_by_event_id is not None
-                        else None,
-                    },
-                )
-            else:
-                stats.intents_rejected += 1
-                for reason in verdict.reasons or ("unspecified",):
-                    stats.risk_reject_reasons[reason] = (
-                        stats.risk_reject_reasons.get(reason, 0) + 1
-                    )
 
 
 # ---------- helpers ----------
+
+
+class _LiveClock:
+    def now(self) -> datetime:
+        return datetime.now(UTC)
+
+
+class _EmptyEventSource:
+    def stream(self) -> Iterator[NormalizedEvent]:
+        return iter(())
+
+
+@dataclass
+class _LivePaperRiskSink:
+    files: RunFiles
+    stats: LiveStats
+
+    def on_verdict(self, envelope: IntentEnvelope, verdict: RiskDecision) -> None:
+        kind = decision_kind(envelope.decision)
+        self.stats.decisions += 1
+        self.stats.decisions_by_kind[kind] = self.stats.decisions_by_kind.get(kind, 0) + 1
+        self.files.append(
+            self.files.risk,
+            {
+                "correlation_id": str(envelope.correlation_id),
+                "decision_kind": kind,
+                "allowed": verdict.allowed,
+                "reasons": list(verdict.reasons),
+                "emitted_at": envelope.emitted_at.isoformat(),
+            },
+        )
+        if not verdict.allowed:
+            self.stats.intents_rejected += 1
+            for reason in verdict.reasons or ("unspecified",):
+                self.stats.risk_reject_reasons[reason] = (
+                    self.stats.risk_reject_reasons.get(reason, 0) + 1
+                )
+
+
+@dataclass
+class _LivePaperIntentSink:
+    files: RunFiles
+    stats: LiveStats
+
+    def emit(self, envelope: IntentEnvelope) -> None:
+        decision = envelope.decision
+        kind = decision_kind(decision)
+        self.stats.intents_dispatched += 1
+        self.files.append(
+            self.files.decisions,
+            {
+                "correlation_id": str(envelope.correlation_id),
+                "decision_kind": kind,
+                "instrument": _instrument_str(decision),
+                "decision_repr": repr(decision),
+                "emitted_at": envelope.emitted_at.isoformat(),
+                "triggered_by_event_id": str(envelope.triggered_by_event_id)
+                if envelope.triggered_by_event_id is not None
+                else None,
+            },
+        )
 
 
 @dataclass

@@ -8,7 +8,7 @@ import fnmatch
 import json
 import os
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from pprint import pprint
@@ -219,6 +219,8 @@ async def capture_kalshi_rest_polls(
     max_polls: int,
     poll_interval_seconds: float,
     trades_limit: int,
+    monotonic: Callable[[], float] | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> int:
     """Capture repeated REST book snapshots and deduped recent trades.
 
@@ -236,6 +238,8 @@ async def capture_kalshi_rest_polls(
 
     count = 0
     seen_trades: set[str] = set()
+    now_monotonic = monotonic or asyncio.get_running_loop().time
+    next_deadline = now_monotonic()
     for poll_index in range(max_polls):
         for ticker in tickers:
             orderbook = await client.get_order_book_payload(ticker)
@@ -264,7 +268,8 @@ async def capture_kalshi_rest_polls(
                 )
                 count += 1
         if poll_index + 1 < max_polls and poll_interval_seconds > 0:
-            await asyncio.sleep(poll_interval_seconds)
+            next_deadline += poll_interval_seconds
+            await sleep(max(0.0, next_deadline - now_monotonic()))
     store.flush()
     return count
 

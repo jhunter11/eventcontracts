@@ -10,15 +10,43 @@ from pathlib import Path
 import pytest
 
 from eventcontracts.cli import main as _main_fn
-from eventcontracts.domain.events import EventProvenance, TradeEvent
+from eventcontracts.domain.events import EventProvenance, QuoteEvent, TradeEvent
 from eventcontracts.domain.ids import EventId
-from eventcontracts.domain.models import InstrumentId, OutcomeSide, Trade, Venue
+from eventcontracts.domain.models import (
+    InstrumentId,
+    OrderBookLevel,
+    OutcomeSide,
+    Quote,
+    Trade,
+    Venue,
+)
 from eventcontracts.storage import ParquetEventStore
 from tests.conftest import REPO_ROOT
 
 
 def cli(argv: list[str]) -> int:
     return _main_fn(argv)
+
+
+def _quote_event(i: int, ts: datetime) -> QuoteEvent:
+    instrument = InstrumentId(venue=Venue.KALSHI, market_id="M-1", outcome_id=None)
+    return QuoteEvent(
+        event_id=EventId(f"q-{i}"),
+        quote=Quote(
+            instrument_id=instrument,
+            side=OutcomeSide.YES,
+            bid=OrderBookLevel(price=Decimal("0.39"), quantity=Decimal("100")),
+            ask=OrderBookLevel(price=Decimal("0.40"), quantity=Decimal("100")),
+            exchange_ts=ts,
+            received_at=ts,
+        ),
+        provenance=EventProvenance(
+            source="fixture",
+            channel="quote",
+            venue=Venue.KALSHI,
+            source_sequence=f"q-{i}",
+        ),
+    )
 
 
 def test_check_config_runs(capsys: pytest.CaptureFixture[str]) -> None:
@@ -38,6 +66,56 @@ def test_validate_config_strategy(capsys: pytest.CaptureFixture[str]) -> None:
         ]
     )
     assert rc == 0
+
+
+def test_new_strategy_scaffold_and_verify(tmp_path: Path) -> None:
+    rc = cli(
+        [
+            "new-strategy",
+            "demo-edge",
+            "--archetype",
+            "external_edge",
+            "--root",
+            str(tmp_path),
+        ]
+    )
+    assert rc == 0
+
+    assert (tmp_path / "configs/strategies/demo-edge.toml").is_file()
+    assert (tmp_path / "configs/sleeves/demo-edge-kalshi-paper-a.toml").is_file()
+    assert (tmp_path / "contracts/parity/demo_edge").is_dir()
+
+    # A freshly-scaffolded strategy has NO parity cases, so it is not promotable
+    # yet — verify must FAIL rather than give a false green on an empty dir.
+    assert cli(["verify-strategy", "demo-edge", "--root", str(tmp_path), "--skip-parity"]) == 1
+
+    # Adding a parity case file satisfies the structural promotion checks. The
+    # placeholder case is not a runnable event stream, so the no-trade smoke is
+    # skipped here (it has dedicated coverage in test_live_readiness_smoke.py).
+    (tmp_path / "contracts/parity/demo_edge/01_case.json").write_text("{}", encoding="utf-8")
+    assert (
+        cli(
+            [
+                "verify-strategy",
+                "demo-edge",
+                "--root",
+                str(tmp_path),
+                "--skip-parity",
+                "--skip-smoke",
+            ]
+        )
+        == 0
+    )
+
+
+def test_verify_strategy_rejects_non_promotable_archetype(tmp_path: Path) -> None:
+    # `scalper` is scaffoldable but has no Rust runtime, so it cannot be promoted
+    # to live even with a parity case present.
+    assert (
+        cli(["new-strategy", "demo-scalp", "--archetype", "scalper", "--root", str(tmp_path)]) == 0
+    )
+    (tmp_path / "contracts/parity/demo_scalp/01_case.json").write_text("{}", encoding="utf-8")
+    assert cli(["verify-strategy", "demo-scalp", "--root", str(tmp_path), "--skip-parity"]) == 1
 
 
 def test_validate_bundle_accepts_weather_threshold(
@@ -254,6 +332,7 @@ def test_backtest_emits_full_report_and_writes_out_file(
     store = ParquetEventStore(data_dir)
     for i, price in enumerate(["0.46", "0.44", "0.42"]):
         trade_at = datetime(2026, 1, 1, second=i, tzinfo=UTC)
+        store.append_normalized(_quote_event(i, trade_at))
         store.append_normalized(
             TradeEvent(
                 event_id=EventId(f"t-{i}"),
@@ -312,5 +391,8 @@ def test_backtest_emits_full_report_and_writes_out_file(
     ):
         assert field in out_payload, f"missing field: {field}"
 
-    assert out_payload["events_processed"] == 3
+    assert out_payload["events_processed"] == 6
     assert out_payload["intents_dispatched"] >= 1
+    assert out_payload["started_at"] == "2026-01-01T00:00:00+00:00"
+    assert out_payload["ended_at"] == "2026-01-01T00:00:02+00:00"
+    assert out_payload["duration_seconds"] == 2.0

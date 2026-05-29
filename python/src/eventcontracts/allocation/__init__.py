@@ -6,6 +6,9 @@ from eventcontracts.allocation.capital import (
     CapitalSnapshot,
     EqualWeightAllocator,
     InMemorySleeveRegistry,
+    IntentOutcome,
+    PortfolioReservation,
+    PortfolioRiskAllocator,
     SleeveRegistry,
 )
 
@@ -15,5 +18,8 @@ __all__ = [
     "CapitalSnapshot",
     "EqualWeightAllocator",
     "InMemorySleeveRegistry",
+    "IntentOutcome",
+    "PortfolioReservation",
+    "PortfolioRiskAllocator",
     "SleeveRegistry",
 ]

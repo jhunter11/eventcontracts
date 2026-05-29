@@ -4,11 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from eventcontracts.storage.inmemory import (
-    InMemoryEventStore,
-    envelope_sort_key,
-    normalized_event_sort_key,
-)
+from eventcontracts.storage.inmemory import InMemoryEventStore
 from eventcontracts.storage.interfaces import (
     EventEnvelope,
     EventStore,
@@ -16,6 +12,7 @@ from eventcontracts.storage.interfaces import (
     NormalizationRejectStore,
     NormalizedEventStore,
 )
+from eventcontracts.storage.sorting import envelope_sort_key, normalized_event_sort_key
 from eventcontracts.storage.state_store import FileStateStore
 
 if TYPE_CHECKING:

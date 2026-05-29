@@ -1,0 +1,29 @@
+strategy_id = "spaceweather-grid_disruption-v1"
+name = "spaceweather_grid_disruption"
+version = "1.0.0"
+description = "Rules-mode space-weather strategy for grid disruption and Kp threshold markets."
+feature_schema_id = "spaceweather_grid_disruption_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXSPACEWEATHER*", "KXGEOMAG*", "KXGRID*"]
+event_kinds = ["quote", "external"]
+external_sources = ["swpc-nowcast"]
+
+[default_execution_priority]
+tier = "relaxed"
+max_delay_ms = 5000
+expires_after_ms = 3600000
+reason = "space-weather forecast signals are slow-moving"
+
+[parameters]
+signal_source = "swpc-nowcast"
+min_edge_bps = "120"
+min_kp_nowcast = "5.0"
+size = "3"
+venue = "kalshi"
+
+[tags]
+family = "weather"
+mode = "paper"
+research_doc = "docs/strategy-specs.md"

@@ -23,6 +23,7 @@ from eventcontracts.cli.backtest import run_backtest
 from eventcontracts.config import load_sleeve_spec, load_strategy_spec
 from eventcontracts.domain.decisions import IntentEnvelope, PlaceOrder, decision_kind, decision_priority
 from eventcontracts.domain.events import (
+    EventProvenance,
     ExternalSignalEvent,
     NormalizedEvent,
     OrderBookEvent,
@@ -38,7 +39,6 @@ from eventcontracts.execution import (
     FractionalQueueEstimator,
     MarketPaperSimulator,
     PnLTracker,
-    intent_to_order,
 )
 from eventcontracts.replay import NormalizedReplaySource
 from eventcontracts.risk import DailyLossLedger, SleeveRiskGate
@@ -135,8 +135,7 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         type=str,
         default=str(DEFAULT_SYNTHETIC_CANDLE_DEPTH),
         help=(
-            "Fallback top-of-book contracts per REST candle when Kalshi does "
-            "not include volume/open-interest depth."
+            "Fallback top-of-book contracts per REST candle when Kalshi does not include volume/open-interest depth."
         ),
     )
     historical.add_argument("--out", type=Path, default=DEFAULT_OUTPUT_ROOT)
@@ -161,8 +160,7 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         type=str,
         default=str(DEFAULT_SYNTHETIC_CANDLE_DEPTH),
         help=(
-            "Fallback top-of-book contracts per REST candle when Kalshi does "
-            "not include volume/open-interest depth."
+            "Fallback top-of-book contracts per REST candle when Kalshi does not include volume/open-interest depth."
         ),
     )
     sweep.add_argument("--min-candles", type=int, default=1)
@@ -187,9 +185,7 @@ def _handle_historical(args: argparse.Namespace) -> int:
     end = _parse_datetime(args.end)
     target_time = _parse_datetime(args.target_time) if args.target_time else None
     target_day = (
-        _parse_date(args.target_day)
-        if args.target_day
-        else (target_time.date() if target_time else end.date())
+        _parse_date(args.target_day) if args.target_day else (target_time.date() if target_time else end.date())
     )
     summary = asyncio.run(
         run_weather_historical(
@@ -257,8 +253,7 @@ def weather_preflight(configs_root: Path) -> dict[str, Any]:
         "weather_sources": {
             "open_meteo_forecast_endpoint": os.getenv("OPEN_METEO_BASE_URL") or OPEN_METEO_BASE_URL,
             "open_meteo_historical_forecast_endpoint": (
-                os.getenv("OPEN_METEO_HISTORICAL_FORECAST_BASE_URL")
-                or OPEN_METEO_HISTORICAL_FORECAST_BASE_URL
+                os.getenv("OPEN_METEO_HISTORICAL_FORECAST_BASE_URL") or OPEN_METEO_HISTORICAL_FORECAST_BASE_URL
             ),
             "NOAA_TOKEN": bool(os.getenv("NOAA_TOKEN")),
         },
@@ -364,7 +359,11 @@ async def run_weather_historical(
         queue_fraction="1.0",
     )
     report_path = reports_root / "weather-temperature-arbitrage.json"
-    report_path.write_text(json.dumps(report.to_dict(), indent=2, default=str) + "\n", encoding="utf-8")
+    report_payload = _with_synthetic_liquidity_note(
+        report.to_dict(),
+        synthetic_candle_depth=synthetic_candle_depth,
+    )
+    report_path.write_text(json.dumps(report_payload, indent=2, default=str) + "\n", encoding="utf-8")
     diagnostics = write_weather_replay_diagnostics(
         data_root=data_root,
         reports_root=reports_root,
@@ -383,6 +382,8 @@ async def run_weather_historical(
         "target_day": target_day.isoformat(),
         "target_time": target_time.isoformat() if target_time is not None else None,
         "synthetic_candle_depth": str(synthetic_candle_depth),
+        "fills_are_hypothetical": True,
+        "liquidity_assumption": "historical_candle_synthetic_top_of_book",
         "data_root": str(data_root),
         "report": str(report_path),
         "quote_events": len(quote_events),
@@ -625,7 +626,11 @@ async def run_weather_historical_sweep(
         queue_fraction="1.0",
     )
     report_path = reports_root / "weather-temperature-arbitrage-sweep.json"
-    report_path.write_text(json.dumps(report.to_dict(), indent=2, default=str) + "\n", encoding="utf-8")
+    report_payload = _with_synthetic_liquidity_note(
+        report.to_dict(),
+        synthetic_candle_depth=synthetic_candle_depth,
+    )
+    report_path.write_text(json.dumps(report_payload, indent=2, default=str) + "\n", encoding="utf-8")
     outcomes_by_ticker = {contract.ticker: contract.result or "" for contract in contracts}
     diagnostics = write_weather_replay_diagnostics(
         data_root=data_root,
@@ -648,7 +653,9 @@ async def run_weather_historical_sweep(
             "weather_fetch_errors": len(skipped_weather),
             "weather_error_samples": skipped_weather[:10],
             "decisions_emitted": backtest_summary.decisions_emitted,
-            "report_payload": report.to_dict(),
+            "fills_are_hypothetical": True,
+            "liquidity_assumption": "historical_candle_synthetic_top_of_book",
+            "report_payload": report_payload,
             "diagnostics": diagnostics,
         }
     )
@@ -686,6 +693,17 @@ def candlesticks_to_quote_events(
                 exchange_ts=timestamp,
                 received_at=timestamp,
             ),
+            provenance=EventProvenance(
+                source="kalshi-candles",
+                channel="synthetic_quote",
+                venue=instrument.venue,
+                source_sequence=f"{instrument.market_id}:{index}",
+                metadata={
+                    "synthetic_liquidity": True,
+                    "synthetic_depth": str(depth),
+                    "liquidity_source": "historical_candle",
+                },
+            ),
         )
 
 
@@ -714,7 +732,30 @@ def candlesticks_to_book_events(
                 exchange_ts=timestamp,
                 received_at=timestamp,
             ),
+            provenance=EventProvenance(
+                source="kalshi-candles",
+                channel="synthetic_book",
+                venue=instrument.venue,
+                source_sequence=f"{instrument.market_id}:{index}",
+                metadata={
+                    "synthetic_liquidity": True,
+                    "synthetic_depth": str(depth),
+                    "liquidity_source": "historical_candle",
+                },
+            ),
         )
+
+
+def _with_synthetic_liquidity_note(
+    report: dict[str, object],
+    *,
+    synthetic_candle_depth: Decimal,
+) -> dict[str, object]:
+    payload = dict(report)
+    payload["fills_are_hypothetical"] = True
+    payload["liquidity_assumption"] = "historical_candle_synthetic_top_of_book"
+    payload["synthetic_candle_depth"] = str(synthetic_candle_depth)
+    return payload
 
 
 def write_weather_replay_diagnostics(
@@ -788,10 +829,7 @@ def write_weather_replay_diagnostics(
             if not verdict.allowed:
                 rejections += 1
                 continue
-            intent = intent_to_order(envelope)
-            if intent is None:
-                continue
-            fills = simulator.submit(intent, event_time)
+            fills = simulator.submit_envelope(envelope)
             for fill in fills:
                 ladder_key = str(
                     decision.metadata.get("ladder_key") or _ticker_ladder_key(fill.instrument_id.market_id)

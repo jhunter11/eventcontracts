@@ -4,7 +4,8 @@ Hypothesis (per docs/strategy-specs.md #8): early state wins alter posterior
 priors for subsequent states faster than retail can re-price them. The
 strategy listens for `SettlementResolvedEvent`s (state-A primary results)
 and `QuoteEvent`s on related state-B markets, and when a state-A resolution
-diverges from polling priors, it markets into state-B with `FAST` priority.
+diverges from polling priors, it sends an IOC limit order at the latest
+state-B executable ask with `FAST` priority.
 
 Implementation note: the spec calls for a Bayesian updating model. The model
 pipeline is scaffolded only, so this module runs in **rules mode** — a
@@ -36,10 +37,11 @@ from eventcontracts.domain.events import (
     NormalizedEvent,
     QuoteEvent,
     SettlementResolvedEvent,
+    market_snapshot_from_quote_event,
 )
 from eventcontracts.domain.ids import ClientOrderId
 from eventcontracts.domain.latency import ExecutionPriority, LatencyTier
-from eventcontracts.domain.models import InstrumentId, OutcomeSide, Venue
+from eventcontracts.domain.models import InstrumentId, MarketSnapshot, OutcomeSide, Venue
 from eventcontracts.domain.orders import OrderSide, OrderType, TimeInForce
 from eventcontracts.domain.spec import StrategySpec
 from eventcontracts.strategy.base import StrategyBase
@@ -73,6 +75,8 @@ class PoliticsPrimaryMomentumStrategy(StrategyBase):
 
         # Latest state-B mid per market_id.
         self._state_b_mids: dict[str, Decimal] = {}
+        self._state_b_snapshots: dict[tuple[str, OutcomeSide], MarketSnapshot] = {}
+        self._state_b_quotes: dict[str, QuoteEvent] = {}
         # Latest state-A outcome (True for YES, False for NO).
         self._state_a_resolved: dict[str, bool] = {}
 
@@ -111,6 +115,9 @@ class PoliticsPrimaryMomentumStrategy(StrategyBase):
             return (NoAction(reason=f"edge_below_threshold:{edge_bps:.0f}bps"),)
 
         side = OutcomeSide.YES if edge_bps > 0 else OutcomeSide.NO
+        snapshot = self._snapshot_for_state_b(pair.state_b_market_id, side)
+        if snapshot is None or snapshot.ask is None:
+            return (NoAction(reason="warmup:missing_state_b_executable_snapshot"),)
         return (
             PlaceOrder(
                 client_order_id=ClientOrderId(uuid4().hex),
@@ -119,9 +126,11 @@ class PoliticsPrimaryMomentumStrategy(StrategyBase):
                 ),
                 outcome_side=side,
                 order_side=OrderSide.BUY,
-                order_type=OrderType.MARKET,
+                order_type=OrderType.LIMIT,
                 time_in_force=TimeInForce.IOC,
                 quantity=self.size,
+                price=snapshot.ask.price,
+                market_snapshot=snapshot,
                 reason=(
                     f"contagion:{pair.state_a_market_id}={resolved_side.value}"
                     f"->state_b_posterior_{posterior:.3f}"
@@ -141,6 +150,21 @@ class PoliticsPrimaryMomentumStrategy(StrategyBase):
             return
         mid = (quote.bid.price + quote.ask.price) / Decimal("2")
         self._state_b_mids[quote.instrument_id.market_id] = mid
+        self._state_b_quotes[quote.instrument_id.market_id] = event
+        self._state_b_snapshots[(quote.instrument_id.market_id, OutcomeSide.YES)] = (
+            market_snapshot_from_quote_event(event, side=OutcomeSide.YES)
+        )
+        self._state_b_snapshots[(quote.instrument_id.market_id, OutcomeSide.NO)] = (
+            market_snapshot_from_quote_event(event, side=OutcomeSide.NO)
+        )
+
+    def _snapshot_for_state_b(
+        self, market_id: str, side: OutcomeSide
+    ) -> MarketSnapshot | None:
+        latest_quote = self._state_b_quotes.get(market_id)
+        if latest_quote is not None:
+            return market_snapshot_from_quote_event(latest_quote, side=side)
+        return self._state_b_snapshots.get((market_id, side))
 
 
 @register("politics_primary_momentum")

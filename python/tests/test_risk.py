@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 
 from eventcontracts.domain.decisions import (
     CancelOrder,
     IntentEnvelope,
     PlaceOrder,
+    ReplaceOrder,
 )
 from eventcontracts.domain.ids import (
     ClientOrderId,
@@ -17,8 +19,8 @@ from eventcontracts.domain.ids import (
     SleeveId,
     StrategyId,
 )
-from eventcontracts.domain.models import InstrumentId, OutcomeSide, Venue
-from eventcontracts.domain.orders import OrderSide, OrderType, TimeInForce
+from eventcontracts.domain.models import InstrumentId, MarketSnapshot, OrderBookLevel, OutcomeSide, Venue
+from eventcontracts.domain.orders import Order, OrderSide, OrderStatus, OrderType, TimeInForce
 from eventcontracts.domain.positions import CashBalance, Exposure, Position
 from eventcontracts.domain.spec import RiskProfile, SleeveSpec
 from eventcontracts.risk import (
@@ -59,20 +61,36 @@ def _sleeve(profile: RiskProfile | None = None) -> SleeveSpec:
     )
 
 
+def _snapshot(*, received_at: datetime = NOW, sequence_gap: bool = False) -> MarketSnapshot:
+    return MarketSnapshot(
+        instrument_id=InstrumentId(venue=Venue.KALSHI, market_id="MKT-1", outcome_id=None),
+        side=OutcomeSide.YES,
+        bid=OrderBookLevel(price=Decimal("0.49"), quantity=Decimal("100")),
+        ask=OrderBookLevel(price=Decimal("0.51"), quantity=Decimal("100")),
+        exchange_ts=received_at,
+        received_at=received_at,
+        source="fixture",
+        source_sequence="42",
+        sequence_gap=sequence_gap,
+    )
+
+
 def _place_order(quantity: str = "10", price: str = "0.5") -> PlaceOrder:
     return PlaceOrder(
         instrument_id=InstrumentId(venue=Venue.KALSHI, market_id="MKT-1", outcome_id=None),
         outcome_side=OutcomeSide.YES,
         order_side=OrderSide.BUY,
         order_type=OrderType.LIMIT,
-        time_in_force=TimeInForce.GTC,
+        time_in_force=TimeInForce.GTD,
         quantity=Decimal(quantity),
         price=Decimal(price),
         client_order_id=ClientOrderId("co-1"),
+        expires_at=NOW + timedelta(seconds=1),
+        market_snapshot=_snapshot(),
     )
 
 
-def _envelope(decision: PlaceOrder | CancelOrder) -> IntentEnvelope:
+def _envelope(decision: PlaceOrder | CancelOrder | ReplaceOrder) -> IntentEnvelope:
     return IntentEnvelope(
         decision=decision,
         strategy_id=StrategyId("strat-1"),
@@ -80,6 +98,28 @@ def _envelope(decision: PlaceOrder | CancelOrder) -> IntentEnvelope:
         correlation_id=CorrelationId("corr-1"),
         emitted_at=NOW,
         triggered_by_event_id=EventId("ev-1"),
+    )
+
+
+def _open_order(coid: str = "co-1", *, quantity: str = "1", price: str = "0.01") -> Order:
+    return Order(
+        client_order_id=ClientOrderId(coid),
+        venue_order_id=None,
+        instrument_id=InstrumentId(venue=Venue.KALSHI, market_id="MKT-1", outcome_id=None),
+        outcome_side=OutcomeSide.YES,
+        order_side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        time_in_force=TimeInForce.GTD,
+        price=Decimal(price),
+        quantity=Decimal(quantity),
+        filled_quantity=Decimal("0"),
+        status=OrderStatus.OPEN,
+        created_at=NOW,
+        updated_at=NOW,
+        correlation_id=CorrelationId("c"),
+        strategy_id=StrategyId("strat-1"),
+        sleeve_id=SleeveId("sleeve-1"),
+        expires_at=NOW + timedelta(seconds=1),
     )
 
 
@@ -135,35 +175,138 @@ def test_available_cash_rejects_overspend() -> None:
     assert "available_cash" in verdict.reasons
 
 
+def test_missing_market_snapshot_rejects_place_order() -> None:
+    gate = SleeveRiskGate(sleeve=_sleeve())
+    order = _place_order()
+    order = PlaceOrder(
+        client_order_id=order.client_order_id,
+        instrument_id=order.instrument_id,
+        outcome_side=order.outcome_side,
+        order_side=order.order_side,
+        order_type=order.order_type,
+        time_in_force=order.time_in_force,
+        quantity=order.quantity,
+        price=order.price,
+    )
+
+    verdict = gate.evaluate(_envelope(order), _ctx())
+
+    assert not verdict.allowed
+    assert "missing_market_snapshot" in verdict.reasons
+
+
+def test_stale_or_gapped_market_snapshot_rejects_place_order() -> None:
+    gate = SleeveRiskGate(sleeve=_sleeve(_profile(max_market_data_age_ms=100)))
+    stale = _place_order()
+    stale = PlaceOrder(
+        **{
+            **stale.__dict__,
+            "market_snapshot": _snapshot(received_at=datetime(2026, 1, 15, 11, 59, tzinfo=UTC)),
+        }
+    )
+    gapped = _place_order()
+    gapped = PlaceOrder(
+        **{
+            **gapped.__dict__,
+            "market_snapshot": _snapshot(sequence_gap=True),
+        }
+    )
+
+    stale_verdict = gate.evaluate(_envelope(stale), _ctx())
+    gap_verdict = gate.evaluate(_envelope(gapped), _ctx())
+
+    assert "stale_market_snapshot" in stale_verdict.reasons
+    assert "market_snapshot_sequence_gap" in gap_verdict.reasons
+
+
+def test_executable_limit_larger_than_l1_depth_rejects() -> None:
+    gate = SleeveRiskGate(sleeve=_sleeve())
+    buy = _place_order(quantity="150", price="0.51")
+    sell = PlaceOrder(
+        **{
+            **_place_order(quantity="150", price="0.49").__dict__,
+            "order_side": OrderSide.SELL,
+        }
+    )
+
+    buy_verdict = gate.evaluate(_envelope(buy), _ctx())
+    sell_verdict = gate.evaluate(_envelope(sell), _ctx())
+
+    assert "order_quantity_exceeds_l1_depth" in buy_verdict.reasons
+    assert "order_quantity_exceeds_l1_depth" in sell_verdict.reasons
+
+
+def test_passive_limit_larger_than_l1_depth_is_allowed_by_impact_gate() -> None:
+    gate = SleeveRiskGate(sleeve=_sleeve())
+    passive_buy = _place_order(quantity="150", price="0.49")
+
+    verdict = gate.evaluate(_envelope(passive_buy), _ctx())
+
+    assert "order_quantity_exceeds_l1_depth" not in verdict.reasons
+
+
+def test_unbounded_market_and_gtc_orders_reject_by_default() -> None:
+    gate = SleeveRiskGate(sleeve=_sleeve())
+    market_order = PlaceOrder(
+        client_order_id=ClientOrderId("co-market"),
+        instrument_id=InstrumentId(venue=Venue.KALSHI, market_id="MKT-1", outcome_id=None),
+        outcome_side=OutcomeSide.YES,
+        order_side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        time_in_force=TimeInForce.IOC,
+        quantity=Decimal("1"),
+        market_snapshot=_snapshot(),
+    )
+    gtc_order = PlaceOrder(
+        **{
+            **_place_order().__dict__,
+            "time_in_force": TimeInForce.GTC,
+            "expires_at": None,
+        }
+    )
+
+    market_verdict = gate.evaluate(_envelope(market_order), _ctx())
+    gtc_verdict = gate.evaluate(_envelope(gtc_order), _ctx())
+
+    assert "market_orders_disabled" in market_verdict.reasons
+    assert "unpriced_market_order" in market_verdict.reasons
+    assert "unbounded_gtc_order" in gtc_verdict.reasons
+
+
+def test_order_ttl_longer_than_profile_rejects() -> None:
+    gate = SleeveRiskGate(sleeve=_sleeve(_profile(max_order_lifetime_ms=100)))
+    order = PlaceOrder(
+        **{
+            **_place_order().__dict__,
+            "expires_at": NOW + timedelta(seconds=1),
+        }
+    )
+
+    verdict = gate.evaluate(_envelope(order), _ctx())
+
+    assert "order_ttl_too_long" in verdict.reasons
+
+
 def test_max_open_orders_blocks_new_orders() -> None:
-    from eventcontracts.domain.orders import Order, OrderStatus, TimeInForce
-
     gate = SleeveRiskGate(sleeve=_sleeve(_profile(max_open_orders=2)))
-
-    def _open_order(coid: str) -> Order:
-        return Order(
-            client_order_id=ClientOrderId(coid),
-            venue_order_id=None,
-            instrument_id=InstrumentId(venue=Venue.KALSHI, market_id="MKT-1", outcome_id=None),
-            outcome_side=OutcomeSide.YES,
-            order_side=OrderSide.BUY,
-            order_type=OrderType.LIMIT,
-            time_in_force=TimeInForce.GTC,
-            price=Decimal("0.5"),
-            quantity=Decimal("1"),
-            filled_quantity=Decimal("0"),
-            status=OrderStatus.OPEN,
-            created_at=NOW,
-            updated_at=NOW,
-            correlation_id=CorrelationId("c"),
-            strategy_id=StrategyId("strat-1"),
-            sleeve_id=SleeveId("sleeve-1"),
-        )
-
     ctx = _ctx(open_order_list=[_open_order("a"), _open_order("b")])
     verdict = gate.evaluate(_envelope(_place_order()), ctx)
     assert not verdict.allowed
     assert "max_open_orders" in verdict.reasons
+
+
+def test_replace_order_revalidates_new_quantity_against_notional_limit() -> None:
+    gate = SleeveRiskGate(sleeve=_sleeve(_profile(max_order_notional=Decimal("100"))))
+    replace = ReplaceOrder(
+        client_order_id=ClientOrderId("co-1"),
+        new_price=Decimal("0.50"),
+        new_quantity=Decimal("10000"),
+    )
+
+    verdict = gate.evaluate(_envelope(replace), _ctx(open_order_list=[_open_order()]))
+
+    assert not verdict.allowed
+    assert "max_order_notional" in verdict.reasons
 
 
 def test_position_notional_projects_new_holding() -> None:
@@ -199,6 +342,48 @@ def test_gross_exposure_blocks_when_projected_exceeds() -> None:
     assert "max_gross_exposure" in reasons
 
 
+def test_gross_exposure_allows_risk_reducing_sell() -> None:
+    # V6-T1: a SELL closes inventory and cannot increase gross exposure, so it is
+    # never blocked here even when the sleeve is already at the cap.
+    profile = _profile(max_gross_exposure=Decimal("100"))
+    exposure = Exposure(
+        sleeve_id=SleeveId("sleeve-1"),
+        currency="USD",
+        gross_notional=Decimal("90"),
+        net_notional=Decimal("90"),
+        long_notional=Decimal("90"),
+        short_notional=Decimal("0"),
+        updated_at=NOW,
+    )
+    sell = PlaceOrder(
+        **{**_place_order(quantity="50", price="0.49").__dict__, "order_side": OrderSide.SELL}
+    )
+    assert check_gross_exposure(sell, profile, exposure) == ()
+
+
+def test_available_cash_allows_risk_reducing_sell() -> None:
+    # V6-T1: a SELL returns cash; low available cash must not block the exit.
+    gate = SleeveRiskGate(sleeve=_sleeve(_profile(max_order_notional=Decimal("1000"))))
+    ctx = _ctx(
+        cash_by_ccy={
+            "USD": CashBalance(
+                currency="USD",
+                total=Decimal("5"),
+                available=Decimal("5"),
+                held_for_orders=Decimal("0"),
+                settling=Decimal("0"),
+                updated_at=NOW,
+            )
+        }
+    )
+    sell = PlaceOrder(
+        **{**_place_order(quantity="50", price="0.49").__dict__, "order_side": OrderSide.SELL}
+    )
+    verdict = gate.evaluate(_envelope(sell), ctx)
+    assert "available_cash" not in verdict.reasons
+    assert verdict.allowed
+
+
 def test_daily_loss_blocks_after_threshold() -> None:
     profile = _profile(max_daily_loss=Decimal("50"))
     ledger = DailyLossLedger()
@@ -206,11 +391,95 @@ def test_daily_loss_blocks_after_threshold() -> None:
     assert "max_daily_loss" in check_daily_loss(profile, ledger.loss_for(NOW))
 
 
+def test_fee_adjusted_edge_rejects_negative_after_fee() -> None:
+    gate = SleeveRiskGate(sleeve=_sleeve())
+    order = replace(
+        _place_order(quantity="1", price="0.50"),
+        metadata={
+            "fair_price": "0.51",
+            "min_executable_edge_ticks": "0",
+            "fee_rate_bps": "700",
+        },
+    )
+
+    verdict = gate.evaluate(_envelope(order), _ctx())
+
+    assert not verdict.allowed
+    assert "negative_edge_after_fees" in verdict.reasons
+
+
+def test_fee_adjusted_edge_accepts_positive_after_fee() -> None:
+    gate = SleeveRiskGate(sleeve=_sleeve())
+    order = replace(
+        _place_order(quantity="1", price="0.50"),
+        metadata={
+            "fair_price": "0.53",
+            "min_executable_edge_ticks": "0",
+            "fee_rate_bps": "700",
+        },
+    )
+
+    verdict = gate.evaluate(_envelope(order), _ctx())
+
+    assert verdict.allowed
+
+
 def test_daily_loss_zero_disables_check() -> None:
     profile = _profile(max_daily_loss=Decimal("0"))
     ledger = DailyLossLedger()
     ledger.record_realized_pnl(Decimal("-1000000"), NOW)
     assert check_daily_loss(profile, ledger.loss_for(NOW)) == ()
+
+
+def test_unrealized_drawdown_soft_halts_buys_without_tripping_kill_switch() -> None:
+    # V6-T2: a recoverable unrealized (liquidation-mark) drawdown must NOT latch
+    # the one-way kill switch — it engages an auto-clearing soft halt that blocks
+    # new risk-increasing BUYs only.
+    gate = SleeveRiskGate(sleeve=_sleeve(_profile(max_daily_loss=Decimal("50"))))
+    gate.daily_loss.record_unrealized_pnl(Decimal("-55"), NOW)
+
+    verdict = gate.evaluate(_envelope(_place_order()), _ctx())
+
+    assert not verdict.allowed
+    assert "unrealized_drawdown_halt" in verdict.reasons
+    assert "max_daily_loss" not in verdict.reasons
+    assert not gate.kill_switch.tripped
+
+
+def test_unrealized_drawdown_still_allows_risk_reducing_exit() -> None:
+    # V6-T1/T2: a SELL closes inventory; the soft halt never blocks an exit.
+    gate = SleeveRiskGate(sleeve=_sleeve(_profile(max_daily_loss=Decimal("50"))))
+    gate.daily_loss.record_unrealized_pnl(Decimal("-55"), NOW)
+
+    sell = PlaceOrder(
+        **{**_place_order(quantity="10", price="0.49").__dict__, "order_side": OrderSide.SELL}
+    )
+    verdict = gate.evaluate(_envelope(sell), _ctx())
+
+    assert verdict.allowed
+
+
+def test_unrealized_drawdown_soft_halt_auto_clears_on_recovery() -> None:
+    # V6-T2: a transient mark dip then recovery must leave the sleeve tradable.
+    gate = SleeveRiskGate(sleeve=_sleeve(_profile(max_daily_loss=Decimal("50"))))
+    gate.daily_loss.record_unrealized_pnl(Decimal("-55"), NOW)
+    assert not gate.evaluate(_envelope(_place_order()), _ctx()).allowed
+    # Mark recovers below the 0.8*cap hysteresis band -> halt clears.
+    gate.daily_loss.record_unrealized_pnl(Decimal("0"), NOW)
+    assert gate.evaluate(_envelope(_place_order()), _ctx()).allowed
+    assert not gate.kill_switch.tripped
+
+
+def test_realized_daily_loss_latches_kill_switch() -> None:
+    # Realized loss is a persistent fact -> permanent one-way latch (unchanged).
+    gate = SleeveRiskGate(sleeve=_sleeve(_profile(max_daily_loss=Decimal("50"))))
+    gate.daily_loss.record_realized_pnl(Decimal("-60"), NOW)
+
+    verdict = gate.evaluate(_envelope(_place_order()), _ctx())
+
+    assert not verdict.allowed
+    assert "max_daily_loss" in verdict.reasons
+    assert gate.kill_switch.tripped
 
 
 def test_kill_switch_rejects_everything() -> None:
@@ -237,12 +506,22 @@ def test_kill_switch_is_one_way_until_reset() -> None:
     assert switch.reason is None
 
 
-def test_daily_loss_only_records_negative_pnl() -> None:
+def test_daily_loss_uses_net_realized_pnl() -> None:
     ledger = DailyLossLedger()
-    ledger.record_realized_pnl(Decimal("50"), NOW)  # win, ignored
+    ledger.record_realized_pnl(Decimal("50"), NOW)
     ledger.record_realized_pnl(Decimal("-30"), NOW)
-    ledger.record_realized_pnl(Decimal("-20"), NOW)
-    assert ledger.loss_for(NOW) == Decimal("50")
+    assert ledger.loss_for(NOW) == Decimal("0")
+    ledger.record_realized_pnl(Decimal("-40"), NOW)
+    assert ledger.loss_for(NOW) == Decimal("20")
+
+
+def test_daily_loss_groups_by_utc_day() -> None:
+    ledger = DailyLossLedger()
+    local_late = datetime(2026, 1, 1, 23, 30, tzinfo=timezone(timedelta(hours=-5)))
+    ledger.record_realized_pnl(Decimal("-7"), local_late)
+
+    assert ledger.loss_for(datetime(2026, 1, 2, 4, 30, tzinfo=UTC)) == Decimal("7")
+    assert ledger.loss_for(datetime(2026, 1, 1, 23, 30, tzinfo=UTC)) == Decimal("0")
 
 
 def test_pretrade_policy_service_rejects_oversize_intent() -> None:

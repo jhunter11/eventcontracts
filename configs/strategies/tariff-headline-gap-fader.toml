@@ -1,0 +1,29 @@
+strategy_id = "tariff-headline_gap_fader-v1"
+name = "tariff_headline_gap_fader"
+version = "1.0.0"
+description = "Rules-mode trade-policy headline gap fader for tariff markets."
+feature_schema_id = "tariff_headline_gap_fader_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXTARIFF*", "KXTRADE*", "KXPOLICY*"]
+event_kinds = ["quote", "external"]
+external_sources = ["policy-nlp"]
+
+[default_execution_priority]
+tier = "relaxed"
+max_delay_ms = 5000
+expires_after_ms = 3600000
+reason = "policy headline gap-fade signals are slow-moving"
+
+[parameters]
+signal_source = "policy-nlp"
+min_edge_bps = "125"
+min_headline_shock_bps = "50"
+size = "5"
+venue = "kalshi"
+
+[tags]
+family = "policy"
+mode = "paper"
+research_doc = "docs/strategy-specs.md"

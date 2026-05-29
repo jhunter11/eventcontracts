@@ -1,0 +1,5 @@
+strategy_spec = "../strategies/sports-tennis-xgboost.toml"
+parity_cases = "../../contracts/parity/sports_tennis_xgboost"
+stage = "paper"
+promoted = true
+

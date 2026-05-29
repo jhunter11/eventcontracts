@@ -1,0 +1,28 @@
+strategy_id = "sports-tennis-xgboost-v1"
+name = "sports_tennis_xgboost"
+version = "1.0.0"
+description = "Pre-match tennis winner value strategy using an XGBoost model exported to ONNX."
+feature_schema_id = "tennis_xgboost_match_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["*TENNIS*", "*ATP*"]
+event_kinds = ["quote", "external"]
+external_sources = ["tennis_xgboost_onnx"]
+
+[default_execution_priority]
+tier = "relaxed"
+reason = "pre-match fair-value signal does not require low-latency execution"
+
+[parameters]
+prediction_source = "tennis_xgboost_onnx"
+min_edge_bps = "150"
+size = "5"
+onnx_input_name = "features"
+feature_schema_version = "1"
+
+[tags]
+family = "sports"
+sport = "tennis"
+mode = "paper"
+model_format = "onnx"

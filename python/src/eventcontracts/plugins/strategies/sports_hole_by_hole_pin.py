@@ -7,8 +7,8 @@ cross-reference the exact daily pin location difficulty (tucked back
 left over a bunker, etc.) with the player's Strokes Gained: Approach
 from the *specific yardage* they just drove the ball to in the fairway.
 
-Latency-critical (~20ms floor). The strategy trades market orders to
-jump the spread before manual bookmaker updates.
+Latency-critical (~20ms floor). The strategy sends IOC limit orders at the
+latest observed ask rather than uncapped market orders.
 
 Trigger: ``ExternalSignalEvent`` from ShotLink the moment a drive lands
 and stops. Payload must carry:
@@ -22,7 +22,7 @@ and stops. Payload must carry:
 * ``lie`` (``"fairway"`` / ``"rough"`` / ``"sand"``).
 
 Decision: when ``model_or_rules_prob - current_mid > min_edge_bps``,
-emit ``PlaceOrder(priority=FAST, order_type=MARKET, time_in_force=IOC)``.
+emit ``PlaceOrder(priority=FAST, order_type=LIMIT, time_in_force=IOC)``.
 Sizing is intentionally deterministic (``static_clip_size``) to keep
 the critical path branch-free.
 
@@ -50,14 +50,15 @@ from eventcontracts.domain.events import (
     ExternalSignalEvent,
     NormalizedEvent,
     QuoteEvent,
+    market_snapshot_from_quote_event,
 )
 from eventcontracts.domain.features import FeatureVector
 from eventcontracts.domain.ids import ClientOrderId, FeatureSchemaId
 from eventcontracts.domain.latency import ExecutionPriority, LatencyTier
-from eventcontracts.domain.models import InstrumentId, OutcomeSide, Venue
+from eventcontracts.domain.models import InstrumentId, MarketSnapshot, OutcomeSide, Venue
 from eventcontracts.domain.orders import OrderSide, OrderType, TimeInForce
 from eventcontracts.domain.spec import StrategySpec
-from eventcontracts.strategy.base import StrategyBase
+from eventcontracts.strategy.base import StrategyBase, StrategyFeedback
 from eventcontracts.strategy.context import StrategyContext
 from eventcontracts.strategy.registry import register
 
@@ -78,6 +79,7 @@ class _MarketState:
     """Latest known mid per tracked market_id."""
 
     last_mid: Decimal | None = None
+    last_yes_snapshot: MarketSnapshot | None = None
 
 
 class SportsHoleByHolePinStrategy(StrategyBase):
@@ -145,6 +147,8 @@ class SportsHoleByHolePinStrategy(StrategyBase):
         state = self._markets.get(market_id)
         if state is None or state.last_mid is None:
             return (NoAction(reason="warmup:no_market_mid_for_hole"),)
+        if state.last_yes_snapshot is None or state.last_yes_snapshot.ask is None:
+            return (NoAction(reason="warmup:no_executable_ask_for_hole"),)
 
         feature_values = _extract_features(payload)
         if feature_values is None:
@@ -160,18 +164,20 @@ class SportsHoleByHolePinStrategy(StrategyBase):
         if edge_bps < self.min_edge_bps:
             return (NoAction(reason=f"edge_below_threshold:{edge_bps:+.0f}bps"),)
 
-        self._fired_for_hole.add(fire_key)
+        client_order_id = ClientOrderId(uuid4().hex)
         return (
             PlaceOrder(
-                client_order_id=ClientOrderId(uuid4().hex),
+                client_order_id=client_order_id,
                 instrument_id=InstrumentId(
                     venue=self.venue, market_id=market_id
                 ),
                 outcome_side=OutcomeSide.YES,
                 order_side=OrderSide.BUY,
-                order_type=OrderType.MARKET,
+                order_type=OrderType.LIMIT,
                 time_in_force=TimeInForce.IOC,
                 quantity=self.static_clip_size,
+                price=state.last_yes_snapshot.ask.price,
+                market_snapshot=state.last_yes_snapshot,
                 reason=(
                     f"pin_access_edge:player={player_id} "
                     f"dist={feature_values.distance_to_pin_yards} "
@@ -181,8 +187,24 @@ class SportsHoleByHolePinStrategy(StrategyBase):
                 ),
                 expected_edge_bps=edge_bps,
                 priority=ExecutionPriority(tier=LatencyTier.FAST, max_delay_ms=20),
+                metadata={
+                    "fire_player_id": player_id,
+                    "fire_hole_event_token": fire_key[1],
+                },
             ),
         )
+
+    def on_feedback(self, feedback: StrategyFeedback, ctx: StrategyContext) -> None:
+        del ctx
+        if feedback.kind != "IntentAccepted":
+            return
+        decision = feedback.envelope.decision
+        if not isinstance(decision, PlaceOrder):
+            return
+        player_id = decision.metadata.get("fire_player_id")
+        hole_event_token = decision.metadata.get("fire_hole_event_token")
+        if isinstance(player_id, str) and isinstance(hole_event_token, str):
+            self._fired_for_hole.add((player_id, hole_event_token))
 
     def _implied_probability(
         self,
@@ -247,6 +269,10 @@ class SportsHoleByHolePinStrategy(StrategyBase):
             return
         state = self._markets.setdefault(quote.instrument_id.market_id, _MarketState())
         state.last_mid = (quote.bid.price + quote.ask.price) / Decimal("2")
+        state.last_yes_snapshot = market_snapshot_from_quote_event(
+            event,
+            side=OutcomeSide.YES,
+        )
 
 
 @dataclass(frozen=True)

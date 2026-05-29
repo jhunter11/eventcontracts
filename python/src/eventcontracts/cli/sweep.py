@@ -33,6 +33,7 @@ import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -43,7 +44,7 @@ from eventcontracts.cli.backtest import run_backtest
 from eventcontracts.config import load_sleeve_spec, load_strategy_spec
 from eventcontracts.domain.spec import StrategySpec
 
-ParamValue = str | int | float | bool
+ParamValue = str | int | Decimal | bool
 
 
 def register(subparsers: Any) -> None:
@@ -338,7 +339,7 @@ def _handle(args: argparse.Namespace) -> int:
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     table = pa.Table.from_pylist(rows, schema=RESULTS_SCHEMA)
-    pq.write_table(table, args.out, compression="snappy")  # type: ignore[no-untyped-call]
+    pq.write_table(table, args.out, compression="snappy")
     error_count = sum(1 for r in rows if r["error"])
     print(
         f"sweep: wrote {len(rows)} rows to {args.out}"

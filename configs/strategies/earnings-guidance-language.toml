@@ -1,0 +1,29 @@
+strategy_id = "earnings-guidance_language-v1"
+name = "earnings_guidance_language"
+version = "1.0.0"
+description = "Rules-mode earnings and filing language strategy for company event markets."
+feature_schema_id = "earnings_guidance_language_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXEARNINGS*", "KXCOMPANY*", "KXSTOCK*"]
+event_kinds = ["quote", "external"]
+external_sources = ["earnings-nlp"]
+
+[default_execution_priority]
+tier = "relaxed"
+max_delay_ms = 5000
+expires_after_ms = 3600000
+reason = "company-language signals are not latency critical"
+
+[parameters]
+signal_source = "earnings-nlp"
+min_edge_bps = "150"
+min_surprise_z = "0.75"
+size = "3"
+venue = "kalshi"
+
+[tags]
+family = "corporate"
+mode = "paper"
+research_doc = "docs/strategy-specs.md"

@@ -1,0 +1,19 @@
+sleeve_id = "sports-tennis-kalshi-paper-a"
+strategy_id = "sports-tennis-xgboost-v1"
+strategy_version = "1.0.0"
+venue = "kalshi"
+capital_allocation = "10000"
+currency = "USD"
+
+[risk]
+max_order_notional = "250"
+max_position_notional = "1000"
+max_daily_loss = "1250"
+max_open_orders = 20
+max_gross_exposure = "2500"
+currency = "USD"
+
+[tags]
+mode = "paper"
+family = "sports"
+sport = "tennis"

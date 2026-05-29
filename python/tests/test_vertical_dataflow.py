@@ -63,6 +63,24 @@ def _sleeve() -> SleeveSpec:
 
 def test_raw_capture_to_paper_fill_vertical_slice() -> None:
     now = datetime(2026, 1, 1, tzinfo=UTC)
+    raw_quote = EventEnvelope(
+        venue=Venue.KALSHI,
+        source="fixture",
+        channel="quote",
+        received_at=now,
+        exchange_ts=now,
+        payload={
+            "event_id": "raw-quote-1",
+            "market_id": "KXDEMO",
+            "side": "yes",
+            "bid_price": "0.39",
+            "bid_quantity": "100",
+            "ask_price": "0.40",
+            "ask_quantity": "100",
+        },
+        schema_version="raw-event-v1",
+        metadata={"source_sequence": "0"},
+    )
     raw_trade = EventEnvelope(
         venue=Venue.KALSHI,
         source="fixture",
@@ -84,13 +102,13 @@ def test_raw_capture_to_paper_fill_vertical_slice() -> None:
     store = InMemoryEventStore()
     ingestion = IngestionPipeline(
         store=store,
-        sources={"fixture": IterableCaptureSource(events=(raw_trade,))},
+        sources={"fixture": IterableCaptureSource(events=(raw_quote, raw_trade))},
     )
     job = IngestionJob(name="fixture-trades", venue=Venue.KALSHI, source="fixture")
-    assert ingestion.run(job) == 1
+    assert ingestion.run(job) == 2
 
     raw_replay = RawReplayEngine(store, source="fixture")
-    assert tuple(raw_replay.replay()) == (raw_trade,)
+    assert tuple(raw_replay.replay()) == (raw_quote, raw_trade)
 
     normalization = NormalizationPipeline(
         raw_store=store,
@@ -98,9 +116,9 @@ def test_raw_capture_to_paper_fill_vertical_slice() -> None:
         normalizer=EventNormalizer(BASIC_NORMALIZERS),
     )
     results = normalization.run(source="fixture")
-    assert len(results) == 1
-    assert results[0].accepted is True
-    assert results[0].normalized is not None
+    assert len(results) == 2
+    assert all(result.accepted for result in results)
+    assert all(result.normalized is not None for result in results)
 
     spec = _strategy_spec()
     sleeve = _sleeve()
@@ -135,10 +153,10 @@ def test_raw_capture_to_paper_fill_vertical_slice() -> None:
 
     summary = runner.run()
 
-    assert summary.events_processed == 1
-    assert summary.intents_dispatched == 1
+    assert summary.events_processed == 2
+    assert summary.intents_dispatched == 2
     assert summary.intents_rejected == 0
-    assert len(sink.envelopes) == 1
+    assert len(sink.envelopes) == 2
     assert len(broker.submitted) == 1
     assert len(broker.fills) == 1
     assert broker.submitted[0].metadata["client_order_id"]

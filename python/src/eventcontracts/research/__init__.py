@@ -25,16 +25,66 @@ from eventcontracts.cli.backtest import run_backtest
 from eventcontracts.config import load_sleeve_spec, load_strategy_spec
 from eventcontracts.domain.spec import SleeveSpec, StrategySpec
 from eventcontracts.execution import BacktestReport
+from eventcontracts.research.tennis_xgboost import (
+    FEATURE_SCHEMA_ID as TENNIS_XGBOOST_FEATURE_SCHEMA_ID,
+)
+from eventcontracts.research.tennis_xgboost import (
+    FEATURE_SCHEMA_VERSION as TENNIS_XGBOOST_FEATURE_SCHEMA_VERSION,
+)
+from eventcontracts.research.tennis_xgboost import (
+    TENNIS_XGBOOST_FEATURE_NAMES,
+    TENNIS_XGBOOST_FEATURES,
+    TennisEvaluation,
+    TennisFeatureSpec,
+    TennisMatchSnapshot,
+    build_sackmann_training_frame,
+    evaluate_probabilities,
+    export_xgboost_onnx,
+    feature_row,
+    feature_schema_document,
+    feature_vector,
+    onnx_deployment_metadata,
+    predict_onnx_probabilities,
+    predict_xgboost_probabilities,
+    snapshot_from_mapping,
+    snapshots_to_frame,
+    temporal_train_validation_test_split,
+    train_xgboost_binary,
+    write_feature_schema,
+    write_parity_cases,
+)
 from eventcontracts.runner.base import RunSummary
 
 __all__ = [
     "RunResult",
+    "TENNIS_XGBOOST_FEATURE_NAMES",
+    "TENNIS_XGBOOST_FEATURE_SCHEMA_ID",
+    "TENNIS_XGBOOST_FEATURE_SCHEMA_VERSION",
+    "TENNIS_XGBOOST_FEATURES",
+    "TennisEvaluation",
+    "TennisFeatureSpec",
+    "TennisMatchSnapshot",
     "backtest_one",
+    "build_sackmann_training_frame",
     "compare_runs",
+    "evaluate_probabilities",
+    "export_xgboost_onnx",
+    "feature_row",
+    "feature_schema_document",
+    "feature_vector",
     "load_partition_summary",
     "load_sweep_results",
+    "onnx_deployment_metadata",
+    "predict_onnx_probabilities",
+    "predict_xgboost_probabilities",
+    "snapshot_from_mapping",
     "plot_equity",
     "summarize_report",
+    "snapshots_to_frame",
+    "temporal_train_validation_test_split",
+    "train_xgboost_binary",
+    "write_feature_schema",
+    "write_parity_cases",
 ]
 
 
@@ -136,10 +186,7 @@ def compare_runs(
         for col in column_list:
             row.append(str(payload.get(col, "")))
         rows.append(row)
-    widths = [
-        max(len(header[i]), *(len(r[i]) for r in rows))
-        for i in range(len(header))
-    ]
+    widths = [max(len(header[i]), *(len(r[i]) for r in rows)) for i in range(len(header))]
     out = ["  ".join(c.ljust(widths[i]) for i, c in enumerate(header))]
     out.append("  ".join("-" * w for w in widths))
     for r in rows:
@@ -154,7 +201,7 @@ def load_sweep_results(path: str | Path) -> list[dict[str, Any]]:
     sets are re-parsed from ``params_json`` for convenience.
     """
 
-    table = pq.read_table(Path(path))  # type: ignore[no-untyped-call]
+    table = pq.read_table(Path(path))
     rows: list[dict[str, Any]] = list(table.to_pylist())
     for row in rows:
         params = row.get("params_json")
@@ -183,11 +230,7 @@ def load_partition_summary(data_root: str | Path) -> dict[str, Any]:
         return summary
     # Fallback: simple file walk grouped by partition kind.
     raw = list((root / "raw").rglob("*.parquet")) if (root / "raw").exists() else []
-    norm = (
-        list((root / "normalized").rglob("*.parquet"))
-        if (root / "normalized").exists()
-        else []
-    )
+    norm = list((root / "normalized").rglob("*.parquet")) if (root / "normalized").exists() else []
     summary["raw_files"] = len(raw)
     summary["normalized_files"] = len(norm)
     return summary
@@ -202,11 +245,10 @@ def plot_equity(report: BacktestReport) -> Any:  # noqa: ANN401 — returns a ma
     """
 
     try:
-        import matplotlib.pyplot as plt  # type: ignore[import-not-found]
+        import matplotlib.pyplot as plt
     except ImportError as exc:  # pragma: no cover - matplotlib is optional
         raise RuntimeError(
-            "matplotlib is required for plot_equity; "
-            "install with `pip install matplotlib` in your research env."
+            "matplotlib is required for plot_equity; install with `pip install matplotlib` in your research env."
         ) from exc
 
     fig, ax = plt.subplots(figsize=(6, 3.5))
@@ -229,12 +271,13 @@ def plot_equity(report: BacktestReport) -> Any:  # noqa: ANN401 — returns a ma
 
 def _replace_parameters(
     spec: StrategySpec,
-    overrides: Mapping[str, str | int | float | bool],
+    overrides: Mapping[str, str | int | float | Decimal | bool],
 ) -> StrategySpec:
     import dataclasses
 
-    merged: dict[str, str | int | float | bool] = dict(spec.parameters)
-    merged.update(overrides)
+    merged: dict[str, str | int | Decimal | bool] = dict(spec.parameters)
+    for key, value in overrides.items():
+        merged[key] = Decimal(str(value)) if isinstance(value, float) else value
     return dataclasses.replace(spec, parameters=merged)
 
 

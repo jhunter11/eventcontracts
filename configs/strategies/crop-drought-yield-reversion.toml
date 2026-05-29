@@ -1,0 +1,30 @@
+strategy_id = "crop-drought_yield_reversion-v1"
+name = "crop_drought_yield_reversion"
+version = "1.0.0"
+description = "Rules-mode crop yield and drought reversion strategy using weather and satellite signals."
+feature_schema_id = "crop_drought_yield_reversion_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXCROP*", "KXDROUGHT*", "KXYIELD*"]
+event_kinds = ["quote", "external"]
+external_sources = ["crop-water-balance"]
+
+[default_execution_priority]
+tier = "relaxed"
+max_delay_ms = 5000
+expires_after_ms = 3600000
+reason = "agricultural signals decay over hours"
+
+[parameters]
+signal_source = "crop-water-balance"
+min_edge_bps = "130"
+min_confidence = "0.55"
+size = "3"
+venue = "kalshi"
+
+[tags]
+archetype = "external_edge"
+family = "weather"
+mode = "paper"
+research_doc = "docs/strategy-specs.md"

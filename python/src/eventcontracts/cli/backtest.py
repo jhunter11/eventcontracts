@@ -18,6 +18,7 @@ import json
 from collections.abc import Iterable, Iterator
 from datetime import datetime
 from decimal import Decimal
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
@@ -25,12 +26,11 @@ from eventcontracts.adapters.venues.kalshi import KalshiFeeModel
 from eventcontracts.adapters.venues.polymarket import PolymarketFeeModel
 from eventcontracts.audit import audit_stamp_for
 from eventcontracts.config import load_sleeve_spec, load_strategy_spec
-from eventcontracts.domain.decisions import IntentEnvelope, PlaceOrder
+from eventcontracts.domain.decisions import IntentEnvelope
 from eventcontracts.domain.events import NormalizedEvent
 from eventcontracts.domain.fees import FeeModel
 from eventcontracts.domain.fills import Fill
 from eventcontracts.domain.models import Venue
-from eventcontracts.domain.positions import CashBalance
 from eventcontracts.domain.spec import SleeveSpec, StrategySpec
 from eventcontracts.execution import (
     BacktestReport,
@@ -38,7 +38,6 @@ from eventcontracts.execution import (
     FractionalQueueEstimator,
     MarketPaperSimulator,
     PnLTracker,
-    intent_to_order,
 )
 from eventcontracts.features import (
     DeterministicFeatureBuilder,
@@ -51,11 +50,11 @@ from eventcontracts.models import (
 )
 from eventcontracts.replay import NormalizedReplaySource
 from eventcontracts.risk import DailyLossLedger, SleeveRiskGate
-from eventcontracts.runner import StrategyRunner
+from eventcontracts.runner import StatefulContextProvider, StrategyRunner
 from eventcontracts.runner.base import RunSummary
 from eventcontracts.storage import ParquetEventStore
 from eventcontracts.strategy import create_from_spec
-from eventcontracts.testing import InMemoryClock, InMemoryContext, StaticContextProvider
+from eventcontracts.testing import InMemoryClock
 
 
 def register(subparsers: Any) -> None:
@@ -186,6 +185,19 @@ def run_backtest(
 
     daily_loss = DailyLossLedger()
     pnl = PnLTracker(currency=sleeve_spec.currency, daily_loss_ledger=daily_loss)
+    clock = InMemoryClock()
+    starting_cash = Decimal(str(starting_equity))
+    if starting_cash <= 0:
+        starting_cash = sleeve_spec.capital_allocation
+    ctx_provider = StatefulContextProvider(
+        strategy_id=strategy_spec.strategy_id,
+        sleeve_id=sleeve_spec.sleeve_id,
+        currency=sleeve_spec.currency,
+        starting_cash=starting_cash,
+        clock=clock.now,
+        pnl_tracker=pnl,
+        model_runner=model_runner,
+    )
     fee_model = _fee_model_for(sleeve_spec.venue)
     simulator = MarketPaperSimulator(
         fee_model=fee_model,
@@ -193,19 +205,14 @@ def run_backtest(
         queue_estimator=FractionalQueueEstimator(fraction=Decimal(str(queue_fraction))),
         strategy_id=strategy_spec.strategy_id,
         sleeve_id=sleeve_spec.sleeve_id,
-        fill_sink=pnl,
+        fill_sink=ctx_provider,
     )
 
     fills_collected: list[Fill] = []
 
     class _Sink:
         def emit(self, envelope: IntentEnvelope) -> None:
-            if not isinstance(envelope.decision, PlaceOrder):
-                return
-            intent = intent_to_order(envelope)
-            if intent is None:
-                return
-            fills_collected.extend(simulator.submit(intent, envelope.emitted_at))
+            fills_collected.extend(simulator.submit_envelope(envelope))
 
     def _filtered(events: Iterable[NormalizedEvent]) -> Iterator[NormalizedEvent]:
         for event in events:
@@ -216,41 +223,30 @@ def run_backtest(
                 continue
             yield event
 
-    clock = InMemoryClock()
-    starting_cash = Decimal(str(starting_equity))
-    if starting_cash <= 0:
-        starting_cash = sleeve_spec.capital_allocation
-
-    ctx = InMemoryContext(
-        strategy_id_value=strategy_spec.strategy_id,
-        sleeve_id_value=sleeve_spec.sleeve_id,
-        clock_now=clock.current,
-        model_runner=model_runner,
-        cash_by_ccy={
-            sleeve_spec.currency: CashBalance(
-                currency=sleeve_spec.currency,
-                total=starting_cash,
-                available=starting_cash,
-                held_for_orders=Decimal("0"),
-                settling=Decimal("0"),
-                updated_at=clock.current,
-            )
-        },
-    )
+    filtered_events = _filtered(base_source.stream())
+    first_event = next(filtered_events, None)
+    if first_event is not None:
+        first_ts = _event_time(first_event)
+        if first_ts is not None:
+            clock.set(first_ts)
+    elif start is not None:
+        clock.set(start)
 
     # Feature wiring: each emitted vector is persisted to the store and
-    # surfaced through ctx.features so the strategy sees real values.
+    # surfaced through the context provider so the strategy sees real values.
     active_store = feature_store if feature_store is not None else InMemoryFeatureStore()
-    feature_state: OnlineFeatureState | None = (
-        feature_builder.warmup(()) if feature_builder is not None else None
-    )
+    feature_state: OnlineFeatureState | None = feature_builder.warmup(()) if feature_builder is not None else None
 
     class _TeeSource:
         def stream(self) -> Iterator[NormalizedEvent]:
             nonlocal feature_state
-            for event in _filtered(base_source.stream()):
-                simulator.on_event(event)
-                pnl.on_event(event)
+            events = filtered_events if first_event is None else chain((first_event,), filtered_events)
+            for event in events:
+                ts = _event_time(event)
+                if ts is not None:
+                    clock.set(ts)
+                fills_collected.extend(simulator.on_event(event))
+                ctx_provider.on_event(event)
                 if feature_builder is not None and feature_state is not None:
                     feature_state = feature_builder.update(feature_state, event)
                     vector = feature_state.vector
@@ -259,16 +255,14 @@ def run_backtest(
                             vector,
                             audit=audit_stamp_for(
                                 vector,
-                                object_id=(
-                                    f"feature:{vector.schema_id}:{vector.timestamp.isoformat()}"
-                                ),
+                                object_id=(f"feature:{vector.schema_id}:{vector.timestamp.isoformat()}"),
                                 object_kind="feature_vector",
                                 schema_version=vector.schema_version,
                                 produced_at=vector.timestamp,
                                 producer=f"backtest:{type(feature_builder).__name__}",
                             ),
                         )
-                        ctx.features = vector
+                        ctx_provider.set_feature_vector(vector)
                 yield event
 
     runner = StrategyRunner(
@@ -279,10 +273,11 @@ def run_backtest(
         sink=_Sink(),
         risk=SleeveRiskGate(sleeve=sleeve_spec, daily_loss=daily_loss),
         clock=clock,
-        context_provider=StaticContextProvider(ctx),
+        context_provider=ctx_provider,
     )
 
     summary = runner.run()
+    fills_collected.extend(simulator.flush_inflight())
     report = BacktestReport.from_run(
         summary,
         pnl,
@@ -321,9 +316,7 @@ def _load_model_runner(model_paths: list[Path] | None) -> InProcessModelRunner |
         from eventcontracts.domain.ids import ModelName as _ModelName
         from eventcontracts.domain.ids import ModelVersion as _ModelVersion
 
-        created_at = datetime.fromisoformat(
-            str(payload["created_at"]).replace("Z", "+00:00")
-        )
+        created_at = datetime.fromisoformat(str(payload["created_at"]).replace("Z", "+00:00"))
         artifact = ModelArtifact(
             name=_ModelName(str(payload["model_name"])),
             version=_ModelVersion(str(payload["model_version"])),

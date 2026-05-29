@@ -1,0 +1,29 @@
+strategy_id = "flu-hospitalization_surge-v1"
+name = "flu_hospitalization_surge"
+version = "1.0.0"
+description = "Rules-mode public health nowcast strategy for hospitalization threshold markets."
+feature_schema_id = "flu_hospitalization_surge_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXFLU*", "KXHEALTH*", "KXHOSP*"]
+event_kinds = ["quote", "external"]
+external_sources = ["public-health-nowcast"]
+
+[default_execution_priority]
+tier = "relaxed"
+max_delay_ms = 5000
+expires_after_ms = 3600000
+reason = "public-health nowcasts are slow-moving"
+
+[parameters]
+signal_source = "public-health-nowcast"
+min_edge_bps = "150"
+size = "3"
+venue = "kalshi"
+
+[tags]
+archetype = "external_edge"
+family = "health"
+mode = "paper"
+research_doc = "docs/strategy-specs.md"

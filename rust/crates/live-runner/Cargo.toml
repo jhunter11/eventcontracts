@@ -7,20 +7,33 @@ publish.workspace = true
 
 [dependencies]
 eventcontracts-contracts = { path = "../contracts" }
+eventcontracts-feature-builder = { path = "../feature-builder" }
 eventcontracts-gateway = { path = "../gateway" }
 eventcontracts-kalshi = { path = "../kalshi" }
+eventcontracts-model-runtime = { path = "../model-runtime" }
 eventcontracts-oms = { path = "../oms" }
 eventcontracts-risk = { path = "../risk" }
 eventcontracts-runner = { path = "../runner" }
+eventcontracts-runtime-hot = { path = "../runtime-hot" }
 
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
 clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 time = { version = "0.3", default-features = false, features = ["std", "formatting", "macros"] }
+toml = "0.8"
+
+[dev-dependencies]
+criterion = { workspace = true }
 
 [[bin]]
 name = "eventcontracts-live-runner"
 path = "src/main.rs"
+
+[[bench]]
+name = "ws_lag_under_load"
+path = "benches/ws_lag_under_load.rs"
+harness = false
+ 

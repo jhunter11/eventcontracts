@@ -5,8 +5,28 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from eventcontracts.allocation import EqualWeightAllocator, InMemorySleeveRegistry
-from eventcontracts.domain import RiskProfile, SleeveId, SleeveSpec, StrategyId, Venue
+from eventcontracts.allocation import (
+    EqualWeightAllocator,
+    InMemorySleeveRegistry,
+    IntentOutcome,
+    PortfolioRiskAllocator,
+)
+from eventcontracts.domain import (
+    ClientOrderId,
+    CorrelationId,
+    IntentEnvelope,
+    OrderSide,
+    OrderType,
+    OutcomeSide,
+    PlaceOrder,
+    RiskProfile,
+    SleeveId,
+    SleeveSpec,
+    StrategyId,
+    TimeInForce,
+    Venue,
+)
+from eventcontracts.domain.models import InstrumentId
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -85,3 +105,75 @@ def test_equal_weight_allocator_apply_updates_snapshot() -> None:
 
     assert snapshot.allocated_capital == Decimal("1000")
     assert snapshot.audit.object_kind == "capital_snapshot"
+
+
+def test_portfolio_risk_allocator_reserves_by_sleeve_and_group() -> None:
+    allocator = PortfolioRiskAllocator(
+        total_capital=Decimal("100"),
+        currency="USD",
+        sleeve_budgets={SleeveId("sleeve-a"): Decimal("50")},
+        group_budgets={"macro-cpi": Decimal("25")},
+        clock=lambda: NOW,
+    )
+
+    reservation, reasons = allocator.reserve(_envelope("co-1"), event_group_id="macro-cpi")
+
+    assert reasons == ()
+    assert reservation is not None
+    assert reservation.amount == Decimal("20.00")
+    assert allocator.reserved_total() == Decimal("20.00")
+
+    second, reasons = allocator.reserve(_envelope("co-2"), event_group_id="macro-cpi")
+
+    assert second is None
+    assert reasons == ("event_group_budget",)
+
+
+def test_portfolio_risk_allocator_releases_reservations() -> None:
+    allocator = PortfolioRiskAllocator(
+        total_capital=Decimal("100"),
+        currency="USD",
+        sleeve_budgets={SleeveId("sleeve-a"): Decimal("50")},
+        clock=lambda: NOW,
+    )
+    reservation, reasons = allocator.reserve(_envelope("co-1"))
+
+    assert reasons == ()
+    assert reservation is not None
+    assert allocator.release(ClientOrderId("co-1")) == reservation
+    assert allocator.reserved_total() == Decimal("0")
+
+
+def test_portfolio_risk_allocator_releases_on_rejected_outcome() -> None:
+    allocator = PortfolioRiskAllocator(
+        total_capital=Decimal("100"),
+        currency="USD",
+        sleeve_budgets={SleeveId("sleeve-a"): Decimal("50")},
+        clock=lambda: NOW,
+    )
+    reservation, reasons = allocator.reserve(_envelope("co-1"))
+
+    assert reasons == ()
+    assert reservation is not None
+    assert allocator.on_intent_outcome(ClientOrderId("co-1"), IntentOutcome.REJECTED) == reservation
+    assert allocator.reserved_total() == Decimal("0")
+
+
+def _envelope(client_order_id: str) -> IntentEnvelope:
+    decision = PlaceOrder(
+        client_order_id=ClientOrderId(client_order_id),
+        instrument_id=InstrumentId(venue=Venue.KALSHI, market_id="KXCPI-HIGH"),
+        outcome_side=OutcomeSide.YES,
+        order_side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        time_in_force=TimeInForce.IOC,
+        quantity=Decimal("40"),
+        price=Decimal("0.50"),
+    )
+    return IntentEnvelope(
+        decision=decision,
+        strategy_id=StrategyId("strategy-a"),
+        sleeve_id=SleeveId("sleeve-a"),
+        correlation_id=CorrelationId(f"corr-{client_order_id}"),
+        emitted_at=NOW,
+    )

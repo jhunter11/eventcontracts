@@ -4,15 +4,15 @@
 use crate::auth::KalshiAuth;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::Message;
-use tokio_tungstenite::{
-    connect_async_tls_with_config, MaybeTlsStream, WebSocketStream,
-};
+use tokio_tungstenite::{connect_async_tls_with_config, MaybeTlsStream, WebSocketStream};
 
 const WS_SIGNING_PATH: &str = "/trade-api/ws/v2";
 
@@ -55,7 +55,7 @@ pub struct KalshiWsEnvelope {
     #[serde(default)]
     pub seq: Option<i64>,
     #[serde(default)]
-    pub msg: serde_json::Value,
+    pub msg: Option<Box<RawValue>>,
     #[serde(default)]
     pub id: Option<i64>,
 }
@@ -67,6 +67,8 @@ pub struct KalshiWsClient {
     pub auth: KalshiAuth,
     next_id: AtomicI64,
     stream: Option<WsStream>,
+    last_message_at: Option<Instant>,
+    idle_timeout: Duration,
 }
 
 impl KalshiWsClient {
@@ -76,6 +78,8 @@ impl KalshiWsClient {
             auth,
             next_id: AtomicI64::new(1),
             stream: None,
+            last_message_at: None,
+            idle_timeout: Duration::from_secs(20),
         }
     }
 
@@ -85,9 +89,9 @@ impl KalshiWsClient {
         for (k, v) in signed.as_pairs() {
             req.headers_mut().insert(k, HeaderValue::from_str(&v)?);
         }
-        let (stream, _resp) =
-            connect_async_tls_with_config(req, None, false, None).await?;
+        let (stream, _resp) = connect_async_tls_with_config(req, None, false, None).await?;
         self.stream = Some(stream);
+        self.last_message_at = Some(Instant::now());
         Ok(())
     }
 
@@ -115,18 +119,35 @@ impl KalshiWsClient {
     pub async fn next_envelope(&mut self) -> Result<Option<KalshiWsEnvelope>, WsError> {
         let stream = self.stream.as_mut().ok_or(WsError::Closed)?;
         loop {
-            let item = stream.next().await;
+            let item = match tokio::time::timeout(self.idle_timeout, stream.next()).await {
+                Ok(item) => item,
+                Err(_) => {
+                    stream.send(Message::Ping(Vec::new())).await?;
+                    match tokio::time::timeout(self.idle_timeout, stream.next()).await {
+                        Ok(item) => item,
+                        Err(_) => return Err(WsError::Closed),
+                    }
+                }
+            };
             match item {
                 Some(Ok(Message::Text(text))) => {
+                    self.last_message_at = Some(Instant::now());
                     let env: KalshiWsEnvelope = serde_json::from_str(&text)?;
                     return Ok(Some(env));
                 }
-                Some(Ok(Message::Binary(_))) => continue,
+                Some(Ok(Message::Binary(_))) => {
+                    self.last_message_at = Some(Instant::now());
+                    continue;
+                }
                 Some(Ok(Message::Ping(p))) => {
+                    self.last_message_at = Some(Instant::now());
                     stream.send(Message::Pong(p)).await?;
                     continue;
                 }
-                Some(Ok(Message::Pong(_))) => continue,
+                Some(Ok(Message::Pong(_))) => {
+                    self.last_message_at = Some(Instant::now());
+                    continue;
+                }
                 Some(Ok(Message::Frame(_))) => continue,
                 Some(Ok(Message::Close(_))) => return Err(WsError::Closed),
                 Some(Err(e)) => return Err(e.into()),

@@ -77,7 +77,7 @@ impl KalshiEnvironment {
 pub enum SignError {
     #[error("env var KALSHI_API_KEY_ID is missing")]
     MissingKeyId,
-    #[error("env var KALSHI_PRIVATE_KEY_PATH is missing")]
+    #[error("env var KALSHI_PRIVATE_KEY_PATH or KALSHI_PRIVATE_KEY_PEM is missing")]
     MissingKeyPath,
     #[error("could not read private key at `{path}`: {source}")]
     ReadKey {
@@ -109,6 +109,9 @@ impl std::fmt::Debug for KalshiAuth {
 impl KalshiAuth {
     pub fn from_env() -> Result<Self, SignError> {
         let api_key_id = std::env::var("KALSHI_API_KEY_ID").map_err(|_| SignError::MissingKeyId)?;
+        if let Ok(pem) = std::env::var("KALSHI_PRIVATE_KEY_PEM") {
+            return Self::from_pem_str(&api_key_id, &pem);
+        }
         let path_raw =
             std::env::var("KALSHI_PRIVATE_KEY_PATH").map_err(|_| SignError::MissingKeyPath)?;
         let path = PathBuf::from(path_raw);
@@ -197,6 +200,12 @@ mod tests {
     use rsa::pkcs1::EncodeRsaPrivateKey;
     use rsa::pss::VerifyingKey;
     use rsa::signature::Verifier;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     fn test_key_pem() -> String {
         let mut rng = rsa::rand_core::OsRng;
@@ -208,12 +217,14 @@ mod tests {
 
     #[test]
     fn env_defaults_to_demo() {
+        let _guard = env_lock();
         std::env::remove_var("KALSHI_ENV");
         assert_eq!(KalshiEnv::from_env_var(), KalshiEnv::Demo);
     }
 
     #[test]
     fn env_picks_prod_when_set() {
+        let _guard = env_lock();
         std::env::set_var("KALSHI_ENV", "prod");
         assert_eq!(KalshiEnv::from_env_var(), KalshiEnv::Prod);
         std::env::remove_var("KALSHI_ENV");
@@ -224,6 +235,21 @@ mod tests {
         let pem = test_key_pem();
         let auth = KalshiAuth::from_pem_str("kid-1", &pem).unwrap();
         assert_eq!(auth.api_key_id, "kid-1");
+    }
+
+    #[test]
+    fn loads_inline_pem_from_env() {
+        let _guard = env_lock();
+        let pem = test_key_pem();
+        std::env::set_var("KALSHI_API_KEY_ID", "kid-inline");
+        std::env::set_var("KALSHI_PRIVATE_KEY_PEM", &pem);
+        std::env::remove_var("KALSHI_PRIVATE_KEY_PATH");
+
+        let auth = KalshiAuth::from_env().unwrap();
+
+        assert_eq!(auth.api_key_id, "kid-inline");
+        std::env::remove_var("KALSHI_API_KEY_ID");
+        std::env::remove_var("KALSHI_PRIVATE_KEY_PEM");
     }
 
     #[test]

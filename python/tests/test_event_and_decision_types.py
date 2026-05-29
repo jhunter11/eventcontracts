@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
+
+import pytest
 
 from eventcontracts.domain import (
     Alert,
     AlertSeverity,
     CancelOrder,
     ClientOrderId,
+    CorrelationId,
     EventId,
     ExecutionPriority,
     InstrumentId,
+    IntentEnvelope,
     LatencyTier,
     Liquidity,
     MarketLifecycleEvent,
@@ -29,6 +33,8 @@ from eventcontracts.domain import (
     QuoteEvent,
     SettlementEvent,
     SettlementResolvedEvent,
+    SleeveId,
+    StrategyId,
     TimeInForce,
     TimerEvent,
     Trade,
@@ -37,6 +43,8 @@ from eventcontracts.domain import (
     decision_kind,
     decision_priority,
     event_kind,
+    new_client_order_id,
+    validate_client_order_id,
 )
 from eventcontracts.domain.events import NormalizedEvent
 
@@ -144,6 +152,43 @@ def test_decision_kind_covers_every_variant() -> None:
     assert decision_kind(no_action) == "no_action"
     assert decision_priority(place) == priority
     assert decision_priority(cancel).tier is LatencyTier.STANDARD
+
+
+def test_kind_helpers_reject_unknown_variants() -> None:
+    with pytest.raises(TypeError, match="unsupported decision variant"):
+        decision_kind(object())  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="unsupported event variant"):
+        event_kind(object())  # type: ignore[arg-type]
+
+
+def test_intent_envelope_requires_non_optional_aware_emitted_at() -> None:
+    with pytest.raises(ValueError, match="emitted_at must be timezone-aware"):
+        IntentEnvelope(
+            decision=NoAction(),
+            strategy_id=StrategyId("strategy"),
+            sleeve_id=SleeveId("sleeve"),
+            correlation_id=CorrelationId("corr"),
+            emitted_at=datetime(2026, 1, 1),
+        )
+
+
+def test_settlement_event_requires_utc_timestamp() -> None:
+    with pytest.raises(ValueError, match="settled_at must be UTC"):
+        SettlementEvent(
+            instrument_id=_instrument(),
+            resolved_side=OutcomeSide.YES,
+            payout_per_contract=Decimal("1"),
+            currency="USD",
+            settled_at=datetime(2026, 1, 1, tzinfo=timezone(timedelta(hours=-5))),
+            source="venue",
+        )
+
+
+def test_client_order_id_helper_builds_valid_bounded_ids() -> None:
+    coid = new_client_order_id("strategy name")
+    assert validate_client_order_id(str(coid)) == coid
+    with pytest.raises(ValueError, match="client_order_id"):
+        validate_client_order_id("bad id with spaces")
 
 
 def test_liquidity_enum_round_trips() -> None:

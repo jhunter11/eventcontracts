@@ -6,6 +6,8 @@ from eventcontracts.gateway.base import (
     GatewayAck,
     GatewayCommand,
     GatewayCommandKind,
+    GatewayLastLook,
+    GatewayLastLookPolicy,
     GatewayReconciler,
     IdempotencyStore,
     InMemoryIdempotencyStore,
@@ -13,6 +15,7 @@ from eventcontracts.gateway.base import (
     PriorityScheduler,
     RateLimitBudget,
     VenueGateway,
+    validate_gateway_last_look,
 )
 
 __all__ = [
@@ -21,6 +24,8 @@ __all__ = [
     "GatewayAck",
     "GatewayCommand",
     "GatewayCommandKind",
+    "GatewayLastLook",
+    "GatewayLastLookPolicy",
     "GatewayReconciler",
     "IdempotencyStore",
     "InMemoryIdempotencyStore",
@@ -28,4 +33,5 @@ __all__ = [
     "PriorityScheduler",
     "RateLimitBudget",
     "VenueGateway",
+    "validate_gateway_last_look",
 ]

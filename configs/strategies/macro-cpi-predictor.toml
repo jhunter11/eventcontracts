@@ -23,6 +23,7 @@ signal_source = "truflation"
 alpha = "0.60"
 min_shift_bps = "50"
 size = "5"
+order_ttl_ms = 5000
 
 [tags]
 family = "macro"

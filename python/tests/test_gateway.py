@@ -13,18 +13,23 @@ from eventcontracts.domain import (
     InstrumentId,
     IntentEnvelope,
     LatencyTier,
+    MarketSnapshot,
     NoAction,
+    OrderBookLevel,
     OutcomeSide,
+    PlaceOrder,
     SleeveId,
     StrategyId,
     Venue,
 )
-from eventcontracts.domain.orders import OrderSide
+from eventcontracts.domain.orders import OrderSide, OrderType, TimeInForce
 from eventcontracts.execution import OrderIntent
 from eventcontracts.gateway import (
     DryRunVenueGateway,
     GatewayCommand,
     GatewayCommandKind,
+    GatewayLastLook,
+    GatewayLastLookPolicy,
     InMemoryIdempotencyStore,
     InMemoryPriorityScheduler,
 )
@@ -46,9 +51,7 @@ def _envelope(correlation_id: str, priority: ExecutionPriority) -> IntentEnvelop
 
 def test_priority_scheduler_orders_by_tier_then_time() -> None:
     scheduler = InMemoryPriorityScheduler()
-    scheduler.enqueue(
-        _envelope("standard", ExecutionPriority(tier=LatencyTier.STANDARD))
-    )
+    scheduler.enqueue(_envelope("standard", ExecutionPriority(tier=LatencyTier.STANDARD)))
     scheduler.enqueue(_envelope("critical", ExecutionPriority(tier=LatencyTier.CRITICAL)))
     scheduler.enqueue(_envelope("fast", ExecutionPriority(tier=LatencyTier.FAST)))
 
@@ -89,6 +92,19 @@ def test_idempotency_store_reserves_once_and_returns_completed_ack() -> None:
     assert store.lookup("key-1") == ack
 
 
+def test_idempotency_store_evicts_by_ttl() -> None:
+    now = NOW
+
+    def clock() -> datetime:
+        return now
+
+    store = InMemoryIdempotencyStore(ttl=timedelta(seconds=1), clock=clock)
+    assert store.reserve("key-1", CorrelationId("corr-1")) is True
+    now = NOW + timedelta(seconds=2)
+
+    assert store.reserve("key-1", CorrelationId("corr-2")) is True
+
+
 def test_dry_run_gateway_records_without_live_send() -> None:
     command = _command()
     gateway = DryRunVenueGateway(clock=lambda: NOW)
@@ -99,6 +115,45 @@ def test_dry_run_gateway_records_without_live_send() -> None:
     assert ack.reasons == ("dry_run_submit",)
     assert gateway.commands == [command]
     assert ack.audit.parent_ids == (command.audit.object_id,)
+
+
+def test_dry_run_gateway_accepts_fresh_last_look() -> None:
+    command = _command_with_envelope()
+    latest = _snapshot(ask="0.515", received_at=NOW + timedelta(milliseconds=10))
+    gateway = DryRunVenueGateway(
+        clock=lambda: NOW + timedelta(milliseconds=10),
+        last_look=GatewayLastLook(
+            snapshot_for=lambda instrument, side: latest,
+            policy=GatewayLastLookPolicy(
+                max_price_movement=Decimal("0.01"),
+                max_spread=Decimal("0.05"),
+                max_slippage=Decimal("0.01"),
+            ),
+        ),
+    )
+
+    ack = gateway.submit(command)
+
+    assert ack.accepted is True
+    assert ack.reasons == ("dry_run_submit",)
+
+
+def test_dry_run_gateway_rejects_when_last_look_price_moved() -> None:
+    command = _command_with_envelope()
+    latest = _snapshot(bid="0.60", ask="0.62", received_at=NOW + timedelta(milliseconds=10))
+    gateway = DryRunVenueGateway(
+        clock=lambda: NOW + timedelta(milliseconds=10),
+        last_look=GatewayLastLook(
+            snapshot_for=lambda instrument, side: latest,
+            policy=GatewayLastLookPolicy(max_price_movement=Decimal("0.01")),
+        ),
+    )
+
+    ack = gateway.submit(command)
+
+    assert ack.accepted is False
+    assert "last_look_price_moved" in ack.reasons
+    assert ack.reject is not None
 
 
 def _command() -> GatewayCommand:
@@ -126,4 +181,54 @@ def _command() -> GatewayCommand:
         audit=audit,
         intent=intent,
         client_order_id=ClientOrderId("co-1"),
+    )
+
+
+def _command_with_envelope() -> GatewayCommand:
+    decision = PlaceOrder(
+        client_order_id=ClientOrderId("co-1"),
+        instrument_id=INSTR,
+        outcome_side=OutcomeSide.YES,
+        order_side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        time_in_force=TimeInForce.GTD,
+        quantity=Decimal("1"),
+        price=Decimal("0.51"),
+        expires_at=NOW + timedelta(seconds=1),
+        market_snapshot=_snapshot(),
+    )
+    envelope = IntentEnvelope(
+        decision=decision,
+        strategy_id=StrategyId("s"),
+        sleeve_id=SleeveId("sl"),
+        correlation_id=CorrelationId("corr-1"),
+        emitted_at=NOW,
+    )
+    command = _command()
+    return GatewayCommand(
+        kind=command.kind,
+        venue=command.venue,
+        correlation_id=command.correlation_id,
+        audit=command.audit,
+        intent=command.intent,
+        client_order_id=command.client_order_id,
+        envelope=envelope,
+    )
+
+
+def _snapshot(
+    *,
+    bid: str = "0.49",
+    ask: str = "0.51",
+    received_at: datetime = NOW,
+) -> MarketSnapshot:
+    return MarketSnapshot(
+        instrument_id=INSTR,
+        side=OutcomeSide.YES,
+        bid=OrderBookLevel(price=Decimal(bid), quantity=Decimal("100")),
+        ask=OrderBookLevel(price=Decimal(ask), quantity=Decimal("100")),
+        exchange_ts=received_at,
+        received_at=received_at,
+        source="fixture",
+        source_sequence="1",
     )

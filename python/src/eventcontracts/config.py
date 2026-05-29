@@ -29,7 +29,7 @@ from eventcontracts.domain.spec import (
 )
 
 ConfigModel = TypeVar("ConfigModel", bound=BaseModel)
-ParameterValue = str | int | float | bool
+ParameterValue = str | int | Decimal | bool
 
 
 class StrictConfig(BaseModel):
@@ -117,11 +117,7 @@ class StrategySpecConfig(StrictConfig):
             default_execution_priority=self.default_execution_priority.to_domain(),
             parameters=self.parameters,
             model=self.model.to_domain() if self.model is not None else None,
-            feature_schema_id=(
-                FeatureSchemaId(self.feature_schema_id)
-                if self.feature_schema_id is not None
-                else None
-            ),
+            feature_schema_id=(FeatureSchemaId(self.feature_schema_id) if self.feature_schema_id is not None else None),
             tags=self.tags,
         )
 
@@ -133,6 +129,11 @@ class RiskProfileConfig(StrictConfig):
     max_open_orders: int
     max_gross_exposure: Decimal
     currency: str
+    max_market_data_age_ms: int = 1000
+    max_spread: Decimal = Decimal("1")
+    max_order_lifetime_ms: int = 5000
+    allow_market_orders: bool = False
+    allow_unbounded_gtc: bool = False
 
     def to_domain(self) -> RiskProfile:
         return RiskProfile(
@@ -142,6 +143,11 @@ class RiskProfileConfig(StrictConfig):
             max_open_orders=self.max_open_orders,
             max_gross_exposure=self.max_gross_exposure,
             currency=self.currency,
+            max_market_data_age_ms=self.max_market_data_age_ms,
+            max_spread=self.max_spread,
+            max_order_lifetime_ms=self.max_order_lifetime_ms,
+            allow_market_orders=self.allow_market_orders,
+            allow_unbounded_gtc=self.allow_unbounded_gtc,
         )
 
 
@@ -209,7 +215,7 @@ def load_toml(path: str | Path) -> dict[str, Any]:
         raise FileNotFoundError(f"config file not found: {resolved}")
 
     with resolved.open("rb") as config_file:
-        return tomllib.load(config_file)
+        return tomllib.load(config_file, parse_float=Decimal)
 
 
 def load_typed_toml(path: str | Path, model: type[ConfigModel]) -> ConfigModel:

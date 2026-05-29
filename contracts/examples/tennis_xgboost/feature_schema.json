@@ -1,0 +1,147 @@
+{
+  "schema_id": "tennis_xgboost_match_features",
+  "schema_version": "1",
+  "description": "Pre-match ATP tennis features for the XGBoost match-winner model. All values are numeric and ordered for direct Rust runner parity.",
+  "features": [
+    {
+      "name": "elo_diff",
+      "dtype": "float32",
+      "description": "Overall Elo difference: player_1 minus player_2.",
+      "nullable": false,
+      "default": 0.0
+    },
+    {
+      "name": "surface_elo_diff",
+      "dtype": "float32",
+      "description": "Surface-specific Elo difference: player_1 minus player_2.",
+      "nullable": false,
+      "default": 0.0
+    },
+    {
+      "name": "rank_log_advantage",
+      "dtype": "float32",
+      "description": "Positive when player_1 has the better ATP rank, using log1p ranks.",
+      "nullable": false,
+      "default": 0.0
+    },
+    {
+      "name": "seed_advantage",
+      "dtype": "float32",
+      "description": "Positive when player_1 has the better tournament seed.",
+      "nullable": false,
+      "default": 0.0
+    },
+    {
+      "name": "age_diff",
+      "dtype": "float32",
+      "description": "Player_1 age minus player_2 age in years.",
+      "nullable": false,
+      "default": 0.0
+    },
+    {
+      "name": "height_cm_diff",
+      "dtype": "float32",
+      "description": "Player_1 listed height minus player_2 listed height in centimeters.",
+      "nullable": false,
+      "default": 0.0
+    },
+    {
+      "name": "h2h_win_pct_diff",
+      "dtype": "float32",
+      "description": "Smoothed head-to-head win-rate edge for player_1 before the match.",
+      "nullable": false,
+      "default": 0.0
+    },
+    {
+      "name": "recent_win_pct_diff",
+      "dtype": "float32",
+      "description": "Smoothed recent-form win-rate edge over the configured rolling window.",
+      "nullable": false,
+      "default": 0.0
+    },
+    {
+      "name": "recent_match_count_diff",
+      "dtype": "float32",
+      "description": "Difference in available recent-form sample counts.",
+      "nullable": false,
+      "default": 0.0
+    },
+    {
+      "name": "days_rest_diff",
+      "dtype": "float32",
+      "description": "Player_1 days since prior match minus player_2 days since prior match.",
+      "nullable": false,
+      "default": 0.0
+    },
+    {
+      "name": "best_of_5",
+      "dtype": "float32",
+      "description": "1 when the match is best-of-five, else 0.",
+      "nullable": false,
+      "default": 0.0
+    },
+    {
+      "name": "is_grand_slam",
+      "dtype": "float32",
+      "description": "1 when tourney_level is Grand Slam, else 0.",
+      "nullable": false,
+      "default": 0.0
+    },
+    {
+      "name": "p1_implied_prob",
+      "dtype": "float32",
+      "description": "Bookmaker implied probability for player_1 after overround normalization.",
+      "nullable": false,
+      "default": 0.5
+    },
+    {
+      "name": "implied_prob_diff",
+      "dtype": "float32",
+      "description": "Normalized implied probability edge: p1_implied_prob - p2_implied_prob.",
+      "nullable": false,
+      "default": 0.0
+    },
+    {
+      "name": "odds_overround",
+      "dtype": "float32",
+      "description": "Raw reciprocal-odds sum before normalization.",
+      "nullable": false,
+      "default": 0.0
+    },
+    {
+      "name": "surface_hard",
+      "dtype": "float32",
+      "description": "1 for hard-court matches, else 0.",
+      "nullable": false,
+      "default": 0.0
+    },
+    {
+      "name": "surface_clay",
+      "dtype": "float32",
+      "description": "1 for clay-court matches, else 0.",
+      "nullable": false,
+      "default": 0.0
+    },
+    {
+      "name": "surface_grass",
+      "dtype": "float32",
+      "description": "1 for grass-court matches, else 0.",
+      "nullable": false,
+      "default": 0.0
+    },
+    {
+      "name": "surface_carpet",
+      "dtype": "float32",
+      "description": "1 for carpet matches, else 0.",
+      "nullable": false,
+      "default": 0.0
+    },
+    {
+      "name": "surface_unknown",
+      "dtype": "float32",
+      "description": "1 when the surface is missing or outside the known surface set.",
+      "nullable": false,
+      "default": 0.0
+    }
+  ]
+}

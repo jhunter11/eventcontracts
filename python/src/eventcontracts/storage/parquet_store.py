@@ -2,11 +2,11 @@
 
 Raw and normalized events both land here. The layout is::
 
-    <root>/raw/venue=<venue>/source=<source>/date=YYYY-MM-DD/part-NNNN.parquet
-    <root>/normalized/kind=<kind>/date=YYYY-MM-DD/part-NNNN.parquet
+    <root>/raw/venue=<venue>/source=<source>/date=YYYY-MM-DD/part-<uuid>.parquet
+    <root>/normalized/kind=<kind>/date=YYYY-MM-DD/part-<uuid>.parquet
 
 Each ``append*`` call buffers in memory; :meth:`flush` writes a new
-``part-NNNN.parquet`` file under the appropriate partition directory.
+``part-<uuid>.parquet`` file under the appropriate partition directory.
 Readers use :class:`ParquetEventStore.read` (or the DuckDB store) to
 re-materialize the events in deterministic order.
 
@@ -16,12 +16,16 @@ both Python and Rust can read identical bytes.
 
 from __future__ import annotations
 
+import hashlib
 import json
-from collections.abc import Iterable, Iterator
-from datetime import UTC, date, datetime
+import os
+from collections.abc import Iterable, Iterator, Mapping
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from heapq import merge
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pyarrow as _pa_mod
 import pyarrow.parquet as _pq_mod
@@ -33,6 +37,7 @@ from eventcontracts.domain.events import (
 )
 from eventcontracts.domain.models import Venue
 from eventcontracts.domain.serialization import to_primitive
+from eventcontracts.domain.validation import require_not_future_datetime
 from eventcontracts.storage.interfaces import (
     EventEnvelope,
     EventStore,
@@ -40,11 +45,49 @@ from eventcontracts.storage.interfaces import (
     NormalizationRejectStore,
     NormalizedEventStore,
 )
+from eventcontracts.storage.sorting import (
+    envelope_sort_key,
+    normalization_reject_sort_key,
+    normalized_event_sort_key,
+)
 
 # pyarrow does not ship strict type stubs; treat the modules as Any so the
 # rest of this file stays strict-mypy clean without scattering type:ignore.
 pa: Any = _pa_mod
 pq: Any = _pq_mod
+
+PARQUET_SCHEMA_METADATA_KEY = b"eventcontracts.schema_version"
+RAW_PARQUET_SCHEMA_VERSION = 1
+NORMALIZED_PARQUET_SCHEMA_VERSION = 1
+REJECT_PARQUET_SCHEMA_VERSION = 1
+PRIVATE_CHANNEL_HINTS = frozenset(
+    {
+        "fill",
+        "fills",
+        "order",
+        "orders",
+        "own_fill",
+        "own_order",
+        "own_order_update",
+        "own_order_reject",
+    }
+)
+SENSITIVE_PAYLOAD_KEYS = frozenset(
+    {
+        "account",
+        "account_id",
+        "api_key",
+        "email",
+        "key_id",
+        "order_id",
+        "private_key",
+        "secret",
+        "token",
+        "user_id",
+        "venue_order_id",
+        "wallet",
+    }
+)
 
 
 def _parse_decimal(value: Any, field_name: str) -> Decimal:
@@ -70,6 +113,7 @@ def _parse_required_datetime(value: Any, field_name: str) -> datetime:
 
 RAW_SCHEMA = pa.schema(
     [
+        ("_schema_version", pa.int16()),
         ("venue", pa.string()),
         ("source", pa.string()),
         ("channel", pa.string()),
@@ -79,11 +123,14 @@ RAW_SCHEMA = pa.schema(
         ("schema_version", pa.string()),
         ("metadata_json", pa.string()),
     ]
+    ,
+    metadata={PARQUET_SCHEMA_METADATA_KEY: str(RAW_PARQUET_SCHEMA_VERSION).encode("ascii")},
 )
 
 
 NORMALIZED_SCHEMA = pa.schema(
     [
+        ("_schema_version", pa.int16()),
         ("kind", pa.string()),
         ("event_id", pa.string()),
         ("exchange_ts", pa.timestamp("us", tz="UTC")),
@@ -92,11 +139,14 @@ NORMALIZED_SCHEMA = pa.schema(
         ("channel", pa.string()),
         ("payload_json", pa.string()),
     ]
+    ,
+    metadata={PARQUET_SCHEMA_METADATA_KEY: str(NORMALIZED_PARQUET_SCHEMA_VERSION).encode("ascii")},
 )
 
 
 REJECT_SCHEMA = pa.schema(
     [
+        ("_schema_version", pa.int16()),
         ("venue", pa.string()),
         ("source", pa.string()),
         ("channel", pa.string()),
@@ -109,6 +159,8 @@ REJECT_SCHEMA = pa.schema(
         ("payload_json", pa.string()),
         ("metadata_json", pa.string()),
     ]
+    ,
+    metadata={PARQUET_SCHEMA_METADATA_KEY: str(REJECT_PARQUET_SCHEMA_VERSION).encode("ascii")},
 )
 
 
@@ -143,19 +195,63 @@ def _partition_dir_reject(root: Path, venue: Venue | None, source: str, channel:
 
 def _next_part_path(directory: Path) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
-    existing = sorted(directory.glob("part-*.parquet"))
-    next_index = len(existing)
-    return directory / f"part-{next_index:05d}.parquet"
+    while True:
+        path = directory / f"part-{uuid4().hex}.parquet"
+        if not path.exists():
+            return path
+
+
+def _payload_for_storage(env: EventEnvelope) -> Mapping[str, Any]:
+    if not _is_private_payload(env):
+        return env.payload
+    redacted = _redact_private_payload(to_primitive(env.payload))
+    if not isinstance(redacted, Mapping):
+        raise ValueError("event payload must be a mapping")
+    return redacted
+
+
+def _is_private_payload(env: EventEnvelope) -> bool:
+    source = env.source.lower()
+    channel = env.channel.lower()
+    return (
+        "private" in source
+        or "portfolio" in source
+        or channel in PRIVATE_CHANNEL_HINTS
+        or channel.startswith("own_")
+    )
+
+
+def _redact_private_payload(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _redacted_marker(item)
+            if str(key).lower() in SENSITIVE_PAYLOAD_KEYS
+            else _redact_private_payload(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_private_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_private_payload(item) for item in value)
+    return value
+
+
+def _redacted_marker(value: Any) -> str:
+    digest = hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
 
 
 def _envelope_to_row(env: EventEnvelope) -> dict[str, Any]:
+    require_not_future_datetime(env.received_at, "received_at")
+    payload = _payload_for_storage(env)
     return {
+        "_schema_version": RAW_PARQUET_SCHEMA_VERSION,
         "venue": env.venue.value if env.venue is not None else None,
         "source": env.source,
         "channel": env.channel,
         "received_at": _utc_microsecond(env.received_at),
         "exchange_ts": _utc_microsecond(env.exchange_ts),
-        "payload_json": json.dumps(to_primitive(env.payload), sort_keys=True),
+        "payload_json": json.dumps(to_primitive(payload), sort_keys=True),
         "schema_version": env.schema_version,
         "metadata_json": json.dumps(to_primitive(env.metadata), sort_keys=True),
     }
@@ -184,7 +280,10 @@ def _row_to_envelope(row: dict[str, Any]) -> EventEnvelope:
 
 def _reject_to_row(reject: NormalizationReject) -> dict[str, Any]:
     raw = reject.raw
+    require_not_future_datetime(raw.received_at, "received_at")
+    payload = _payload_for_storage(raw)
     return {
+        "_schema_version": REJECT_PARQUET_SCHEMA_VERSION,
         "venue": raw.venue.value if raw.venue is not None else None,
         "source": raw.source,
         "channel": raw.channel,
@@ -194,7 +293,7 @@ def _reject_to_row(reject: NormalizationReject) -> dict[str, Any]:
         "normalizer_version": reject.normalizer_version,
         "raw_sha256": reject.raw_sha256,
         "reasons_json": json.dumps(tuple(reject.reasons), sort_keys=True),
-        "payload_json": json.dumps(to_primitive(raw.payload), sort_keys=True),
+        "payload_json": json.dumps(to_primitive(payload), sort_keys=True),
         "metadata_json": json.dumps(to_primitive(raw.metadata), sort_keys=True),
     }
 
@@ -238,7 +337,9 @@ def _normalized_event_to_row(event: NormalizedEvent) -> dict[str, Any]:
     payload = _normalized_kind_to_payload(event)
     provenance = payload.get("provenance", {})
     timestamps = _extract_event_timestamps(event)
+    require_not_future_datetime(timestamps[1], "received_at")
     return {
+        "_schema_version": NORMALIZED_PARQUET_SCHEMA_VERSION,
         "kind": kind,
         "event_id": str(event.event_id),
         "exchange_ts": _utc_microsecond(timestamps[0]),
@@ -391,20 +492,8 @@ class ParquetEventStore(EventStore, NormalizedEventStore, NormalizationRejectSto
         return self._yield_envelopes(files)
 
     def _yield_envelopes(self, files: list[Path]) -> Iterator[EventEnvelope]:
-        envelopes: list[EventEnvelope] = []
-        for path in files:
-            table = pq.ParquetFile(str(path)).read()
-            for row in table.to_pylist():
-                envelopes.append(_row_to_envelope(row))
-        envelopes.sort(
-            key=lambda e: (
-                e.exchange_ts or e.received_at,
-                e.received_at,
-                e.source,
-                e.channel,
-            )
-        )
-        yield from envelopes
+        iterators = (_sorted_envelopes_from_file(path) for path in files)
+        yield from merge(*iterators, key=envelope_sort_key)
 
     def read_normalized(self) -> Iterable[NormalizedEvent]:
         self.flush()
@@ -427,38 +516,224 @@ class ParquetEventStore(EventStore, NormalizedEventStore, NormalizationRejectSto
         return self._yield_rejects(files)
 
     def _yield_rejects(self, files: list[Path]) -> Iterator[NormalizationReject]:
-        rejects: list[NormalizationReject] = []
-        for path in files:
-            table = pq.ParquetFile(str(path)).read()
-            for row in table.to_pylist():
-                rejects.append(_row_to_reject(row))
-        rejects.sort(
-            key=lambda reject: (
-                reject.raw.exchange_ts or reject.raw.received_at,
-                reject.raw.received_at,
-                reject.raw.source,
-                reject.raw.channel,
-                reject.raw_sha256,
-            )
-        )
-        yield from rejects
+        iterators = (_sorted_rejects_from_file(path) for path in files)
+        yield from merge(*iterators, key=normalization_reject_sort_key)
 
     def _yield_normalized(self, files: list[Path]) -> Iterator[NormalizedEvent]:
-        rows: list[tuple[datetime, datetime, str, dict[str, Any]]] = []
-        for path in files:
-            table = pq.ParquetFile(str(path)).read()
-            for row in table.to_pylist():
-                payload = json.loads(row["payload_json"])
-                ex_ts = row.get("exchange_ts")
-                rx_ts = row["received_at"]
-                if isinstance(ex_ts, datetime) and ex_ts.tzinfo is None:
-                    ex_ts = ex_ts.replace(tzinfo=UTC)
-                if isinstance(rx_ts, datetime) and rx_ts.tzinfo is None:
-                    rx_ts = rx_ts.replace(tzinfo=UTC)
-                rows.append((ex_ts or rx_ts, rx_ts, row["kind"], payload))
-        rows.sort(key=lambda t: (t[0], t[1], t[3].get("event_id", "")))
-        for _ex_ts, _rx_ts, kind, payload in rows:
-            yield _deserialize_normalized(kind, payload)
+        iterators = (_sorted_normalized_from_file(path) for path in files)
+        yield from merge(*iterators, key=normalized_event_sort_key)
+
+    def expire_private_partitions(
+        self,
+        *,
+        retention_days: int,
+        now: datetime | None = None,
+    ) -> int:
+        """Delete private raw/reject parquet files older than the TTL.
+
+        Raw partitions do not include channel in the path, so raw TTL applies
+        to sources marked private/portfolio. Reject partitions include both
+        source and channel and use either signal.
+        """
+
+        if retention_days < 0:
+            raise ValueError("retention_days must be non-negative")
+        self.flush()
+        reference = (now or datetime.now(UTC)).astimezone(UTC).date()
+        cutoff = reference - timedelta(days=retention_days)
+        deleted = 0
+        for file_path in list((self.root / "raw").rglob("*.parquet")):
+            if _private_partition_file(file_path, include_channel=False) and _partition_day(file_path) < cutoff:
+                file_path.unlink()
+                deleted += 1
+                _prune_empty_parents(file_path.parent, stop=self.root)
+        for file_path in list((self.root / "normalization_rejects").rglob("*.parquet")):
+            if _private_partition_file(file_path, include_channel=True) and _partition_day(file_path) < cutoff:
+                file_path.unlink()
+                deleted += 1
+                _prune_empty_parents(file_path.parent, stop=self.root)
+        return deleted
+
+
+def _sorted_envelopes_from_file(path: Path) -> Iterator[EventEnvelope]:
+    rows = [
+        _row_to_envelope(row)
+        for row in _read_table_checked(path, RAW_PARQUET_SCHEMA_VERSION).to_pylist()
+    ]
+    rows.sort(key=envelope_sort_key)
+    yield from rows
+
+
+def _sorted_rejects_from_file(path: Path) -> Iterator[NormalizationReject]:
+    rows = [
+        _row_to_reject(row)
+        for row in _read_table_checked(path, REJECT_PARQUET_SCHEMA_VERSION).to_pylist()
+    ]
+    rows.sort(key=normalization_reject_sort_key)
+    yield from rows
+
+
+def _sorted_normalized_from_file(path: Path) -> Iterator[NormalizedEvent]:
+    rows: list[NormalizedEvent] = []
+    for row in _read_table_checked(path, NORMALIZED_PARQUET_SCHEMA_VERSION).to_pylist():
+        payload = json.loads(row["payload_json"])
+        rows.append(_deserialize_normalized(row["kind"], payload))
+    rows.sort(key=normalized_event_sort_key)
+    yield from rows
+
+
+def _partition_day(path: Path) -> date:
+    for part in path.parts:
+        if part.startswith("date="):
+            return date.fromisoformat(part.removeprefix("date="))
+    raise ValueError(f"partition path missing date segment: {path}")
+
+
+def _private_partition_file(path: Path, *, include_channel: bool) -> bool:
+    source_private = False
+    channel_private = False
+    for part in path.parts:
+        lowered = part.lower()
+        if lowered.startswith("source="):
+            source = lowered.removeprefix("source=")
+            source_private = "private" in source or "portfolio" in source
+        if include_channel and lowered.startswith("channel="):
+            channel = lowered.removeprefix("channel=")
+            channel_private = channel in PRIVATE_CHANNEL_HINTS or channel.startswith("own_")
+    return source_private or channel_private
+
+
+def _prune_empty_parents(path: Path, *, stop: Path) -> None:
+    stop = stop.resolve()
+    current = path.resolve()
+    while current != stop and _is_relative_to(current, stop):
+        try:
+            current.rmdir()
+        except OSError:
+            return
+        current = current.parent
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _parse_schema_version(raw: Any) -> int | None:
+    """Decode the KV schema-version marker, or ``None`` if absent/unparseable.
+
+    A missing or unparseable marker means a *legacy* file written before the
+    version marker existed; callers treat that as "older, read tolerantly".
+    """
+
+    if raw is None:
+        return None
+    try:
+        return int(raw.decode("ascii") if isinstance(raw, bytes) else str(raw))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _read_table_checked(path: Path, expected_version: int) -> Any:
+    """Read a parquet partition, tolerating legacy/older schema versions.
+
+    Forward-compatibility is the rule the data lake needs: a schema bump must
+    not brick previously-captured data. So:
+
+    * version == expected -> strict path (require the integrity column too);
+    * version missing or < expected -> *upcast*: read the data as-is. The data
+      columns are read-compatible; row deserializers fill any newer optional
+      fields with defaults. Run ``ec migrate-data`` to stamp the current marker;
+    * version > expected -> hard fail (the file was written by a newer build).
+    """
+
+    parquet_file = pq.ParquetFile(str(path))
+    metadata = parquet_file.metadata.metadata or {}
+    actual_version = _parse_schema_version(metadata.get(PARQUET_SCHEMA_METADATA_KEY))
+    if actual_version is not None and actual_version > expected_version:
+        raise ValueError(
+            f"parquet schema_version newer than supported for {path}: "
+            f"{actual_version} > {expected_version}; upgrade eventcontracts to read it"
+        )
+    table = parquet_file.read()
+    if actual_version == expected_version:
+        # A current-version file must carry the integrity column verbatim.
+        if "_schema_version" not in table.column_names:
+            raise ValueError(f"parquet schema_version column missing: {path}")
+        versions = set(table.column("_schema_version").to_pylist())
+        if versions != {expected_version}:
+            raise ValueError(
+                f"mixed parquet schema_version values for {path}: {sorted(versions)}"
+            )
+    # Legacy/older files are read tolerantly; their absent integrity column is
+    # not required (the data columns themselves are compatible).
+    return table
+
+
+def _migrate_partition_file(path: Path, target_version: int) -> bool:
+    """Stamp a legacy/older parquet file with the current schema marker in place.
+
+    Returns ``True`` if the file was rewritten, ``False`` if already current.
+    Type-preserving: it only adds the ``_schema_version`` integrity column (when
+    absent) and the KV metadata marker, then atomically replaces the file. It
+    does not re-run redaction or re-serialize payloads.
+    """
+
+    # Read the file fully into memory first: this releases the OS file handle
+    # before os.replace (Windows blocks replacing an open file), and reading a
+    # single ParquetFile (not a dataset path) avoids hive-partition inference
+    # that would clash the `venue=` directory with the file's own `venue` column.
+    with open(path, "rb") as handle:
+        raw_bytes = handle.read()
+    parquet_file = pq.ParquetFile(pa.BufferReader(raw_bytes))
+    metadata = parquet_file.metadata.metadata or {}
+    actual_version = _parse_schema_version(metadata.get(PARQUET_SCHEMA_METADATA_KEY))
+    table = parquet_file.read()
+    has_column = "_schema_version" in table.column_names
+    if actual_version == target_version and has_column:
+        return False
+
+    if "_schema_version" not in table.column_names:
+        version_column = pa.array([target_version] * table.num_rows, type=pa.int16())
+        table = table.add_column(
+            0, pa.field("_schema_version", pa.int16()), version_column
+        )
+    schema_metadata = dict(table.schema.metadata or {})
+    schema_metadata[PARQUET_SCHEMA_METADATA_KEY] = str(target_version).encode("ascii")
+    table = table.replace_schema_metadata(schema_metadata)
+
+    tmp_path = path.with_name(path.name + ".migrate.tmp")
+    pq.write_table(table, str(tmp_path))
+    os.replace(tmp_path, path)
+    return True
+
+
+def migrate_event_lake(root: Path | str) -> dict[str, int]:
+    """Upgrade every legacy/older partition under ``root`` to the current schema.
+
+    Walks raw, normalized, and reject partition trees and stamps any file whose
+    schema marker is missing or older. Idempotent: re-running migrates nothing.
+    """
+
+    root = Path(root)
+    targets = (
+        ("raw", root / "raw", RAW_PARQUET_SCHEMA_VERSION),
+        ("normalized", root / "normalized", NORMALIZED_PARQUET_SCHEMA_VERSION),
+        ("rejects", root / "normalization_rejects", REJECT_PARQUET_SCHEMA_VERSION),
+    )
+    counts = {"raw": 0, "normalized": 0, "rejects": 0, "skipped": 0}
+    for label, subtree, version in targets:
+        if not subtree.exists():
+            continue
+        for file_path in sorted(subtree.rglob("*.parquet")):
+            if _migrate_partition_file(file_path, version):
+                counts[label] += 1
+            else:
+                counts["skipped"] += 1
+    return counts
 
 
 def _deserialize_normalized(kind: str, payload: dict[str, Any]) -> NormalizedEvent:

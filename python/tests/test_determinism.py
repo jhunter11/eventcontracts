@@ -42,7 +42,6 @@ from eventcontracts.execution import (
     FractionalQueueEstimator,
     MarketPaperSimulator,
     PnLTracker,
-    intent_to_order,
 )
 from eventcontracts.plugins.strategies import example_threshold  # noqa: F401
 from eventcontracts.replay import NormalizedReplaySource
@@ -144,10 +143,7 @@ def _run_one_pass(root: Path) -> BacktestReport:
         def emit(self, envelope: IntentEnvelope) -> None:
             if not isinstance(envelope.decision, PlaceOrder):
                 return
-            intent = intent_to_order(envelope)
-            if intent is None:
-                return
-            fills_recorded.extend(simulator.submit(intent, envelope.emitted_at))
+            fills_recorded.extend(simulator.submit_envelope(envelope))
 
     source = NormalizedReplaySource(ParquetEventStore(root))
 

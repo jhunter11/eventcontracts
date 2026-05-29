@@ -1,0 +1,29 @@
+strategy_id = "shipping-chokepoint_delay-v1"
+name = "shipping_chokepoint_delay"
+version = "1.0.0"
+description = "Rules-mode AIS congestion strategy for shipping delay and disruption markets."
+feature_schema_id = "shipping_chokepoint_delay_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXSHIP*", "KXSUPPLY*", "KXPORT*"]
+event_kinds = ["quote", "external"]
+external_sources = ["ais-chokepoint"]
+
+[default_execution_priority]
+tier = "relaxed"
+max_delay_ms = 5000
+expires_after_ms = 3600000
+reason = "AIS congestion signals evolve over minutes"
+
+[parameters]
+signal_source = "ais-chokepoint"
+min_edge_bps = "120"
+min_queue_z = "1.0"
+size = "4"
+venue = "kalshi"
+
+[tags]
+family = "logistics"
+mode = "paper"
+research_doc = "docs/strategy-specs.md"

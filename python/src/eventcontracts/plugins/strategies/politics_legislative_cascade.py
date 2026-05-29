@@ -25,6 +25,7 @@ Required spec parameters:
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 
@@ -40,7 +41,7 @@ from eventcontracts.domain.latency import ExecutionPriority, LatencyTier
 from eventcontracts.domain.models import InstrumentId, OutcomeSide, Venue
 from eventcontracts.domain.orders import OrderSide, OrderType, TimeInForce
 from eventcontracts.domain.spec import StrategySpec
-from eventcontracts.strategy.base import StrategyBase
+from eventcontracts.strategy.base import StrategyBase, StrategyFeedback
 from eventcontracts.strategy.context import StrategyContext
 from eventcontracts.strategy.registry import register
 
@@ -56,6 +57,7 @@ class PoliticsLegislativeCascadeStrategy(StrategyBase):
             str(spec.parameters.get("negative_threshold", "-1.5"))
         )
         self.size = Decimal(str(spec.parameters.get("size", "10")))
+        self.score_ttl_secs = int(spec.parameters.get("score_ttl_secs", 86400))
         protective = spec.parameters.get("protective_yes_coid")
         self.protective_yes_coid = (
             ClientOrderId(str(protective)) if protective else None
@@ -69,7 +71,7 @@ class PoliticsLegislativeCascadeStrategy(StrategyBase):
         # Cumulative weighted sentiment across observed senators.
         self._cumulative_score: Decimal = Decimal("0")
         # Per-senator latest score so re-observations replace prior values.
-        self._per_senator: dict[str, Decimal] = {}
+        self._per_senator: dict[str, tuple[Decimal, datetime]] = {}
 
     def on_event(
         self, event: NormalizedEvent, ctx: StrategyContext
@@ -78,6 +80,7 @@ class PoliticsLegislativeCascadeStrategy(StrategyBase):
             return (NoAction(reason="ignored:not_external_signal"),)
         if event.source != self.signal_source:
             return (NoAction(reason=f"ignored:source!={self.signal_source}"),)
+        self._evict_expired_scores(ctx.now)
 
         payload = event.payload
         if payload.get("bill_market_id") != self.bill_market_id:
@@ -94,9 +97,9 @@ class PoliticsLegislativeCascadeStrategy(StrategyBase):
         except (ValueError, ArithmeticError):
             return (NoAction(reason="censored:unparsable_sentiment"),)
 
-        prior = self._per_senator.get(senator_id, Decimal("0"))
+        prior = self._per_senator.get(senator_id, (Decimal("0"), ctx.now))[0]
         weighted = sentiment_d * leverage_d
-        self._per_senator[senator_id] = weighted
+        self._per_senator[senator_id] = (weighted, ctx.now)
         self._cumulative_score = self._cumulative_score - prior + weighted
 
         if self._cumulative_score >= self.negative_threshold:
@@ -127,6 +130,26 @@ class PoliticsLegislativeCascadeStrategy(StrategyBase):
             )
         )
         return tuple(decisions)
+
+    def on_feedback(self, feedback: StrategyFeedback, ctx: StrategyContext) -> None:
+        del ctx
+        if feedback.kind not in {"IntentAccepted", "VenueAcked"}:
+            return
+        if self.protective_yes_coid is None:
+            return
+        decision = feedback.envelope.decision
+        if (
+            isinstance(decision, CancelOrder)
+            and decision.client_order_id == self.protective_yes_coid
+        ):
+            self.protective_yes_coid = None
+
+    def _evict_expired_scores(self, now: datetime) -> None:
+        cutoff = now - timedelta(seconds=self.score_ttl_secs)
+        for senator_id, (score, updated_at) in list(self._per_senator.items()):
+            if updated_at < cutoff:
+                self._per_senator.pop(senator_id, None)
+                self._cumulative_score -= score
 
 
 @register("politics_legislative_cascade")

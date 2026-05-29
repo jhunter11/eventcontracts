@@ -93,8 +93,8 @@ class DepthQueueEstimator:
     ) -> QueueEstimate:
         if book is None:
             return QueueEstimate(
-                ahead_quantity=Decimal("0"),
-                confidence=Decimal("0.1"),
+                ahead_quantity=quantity,
+                confidence=Decimal("0"),
                 source=self.name,
             )
         levels = _select_levels(book, side, order_side)
@@ -138,8 +138,8 @@ class FractionalQueueEstimator:
     ) -> QueueEstimate:
         if book is None:
             return QueueEstimate(
-                ahead_quantity=Decimal("0"),
-                confidence=Decimal("0.05"),
+                ahead_quantity=quantity,
+                confidence=Decimal("0"),
                 source=self.name,
             )
         levels = _select_levels(book, side, order_side)

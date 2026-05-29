@@ -12,6 +12,8 @@
 //! - a `ContractError` enum that pinpoints the first failing field.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -28,10 +30,7 @@ pub enum ContractError {
     #[error("unsupported schema_version `{0}`")]
     UnsupportedSchema(String),
     #[error("invalid enum value `{value}` for field `{field}`")]
-    InvalidEnum {
-        field: &'static str,
-        value: String,
-    },
+    InvalidEnum { field: &'static str, value: String },
     #[error("field `{0}` must be a non-negative decimal string")]
     InvalidDecimal(&'static str),
     #[error("field `{0}` must be an RFC3339 UTC timestamp")]
@@ -126,6 +125,73 @@ pub fn require_rfc3339(field: &'static str, value: &str) -> Result<(), ContractE
         return Err(ContractError::InvalidTimestamp(field));
     }
     Ok(())
+}
+
+/// Serialize a value into canonical (sorted-keys, no-whitespace) JSON and
+/// return its SHA-256 digest as 64-char lowercase hex.
+///
+/// Single-pass: serializes the input to a `Value` once, then walks it
+/// in-place writing canonical bytes directly into the hasher — no
+/// intermediate `Vec<u8>` and no second `Value` allocation.
+///
+/// Rust and Python both treat this canonical form as the audit boundary;
+/// identical logical records produce identical hashes regardless of map
+/// insertion order.
+pub fn canonical_sha256<T: Serialize>(value: &T) -> Result<String, ContractError> {
+    let value = serde_json::to_value(value)?;
+    let mut hasher = Sha256::new();
+    write_canonical_into(&value, &mut hasher);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn write_canonical_into(value: &Value, hasher: &mut Sha256) {
+    match value {
+        Value::Null => hasher.update(b"null"),
+        Value::Bool(true) => hasher.update(b"true"),
+        Value::Bool(false) => hasher.update(b"false"),
+        Value::Number(n) => hasher.update(n.to_string().as_bytes()),
+        Value::String(s) => {
+            // Use serde_json's string escaper for spec-compliant quoting
+            // (handles \", \\, \n, etc.). A 1-shot allocation, but cheap
+            // compared to a full Value round-trip.
+            hasher.update(
+                serde_json::to_string(s)
+                    .unwrap_or_else(|_| String::from("\"\""))
+                    .as_bytes(),
+            );
+        }
+        Value::Array(values) => {
+            hasher.update(b"[");
+            for (i, item) in values.iter().enumerate() {
+                if i > 0 {
+                    hasher.update(b",");
+                }
+                write_canonical_into(item, hasher);
+            }
+            hasher.update(b"]");
+        }
+        Value::Object(map) => {
+            // Canonical = lexicographic key order. BTreeMap entries iterate
+            // sorted; serde_json::Map preserves insertion order, so we
+            // collect keys, sort, and walk in sorted order.
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable();
+            hasher.update(b"{");
+            for (i, key) in keys.iter().enumerate() {
+                if i > 0 {
+                    hasher.update(b",");
+                }
+                hasher.update(
+                    serde_json::to_string(key.as_str())
+                        .unwrap_or_else(|_| String::from("\"\""))
+                        .as_bytes(),
+                );
+                hasher.update(b":");
+                write_canonical_into(&map[*key], hasher);
+            }
+            hasher.update(b"}");
+        }
+    }
 }
 
 pub trait Contract {
@@ -365,8 +431,8 @@ mod tests {
             schema_version: "intent-envelope-v1".into(),
             produced_at: "2026-05-26T12:00:00Z".into(),
             producer: "runner".into(),
-            canonical_sha256:
-                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            canonical_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .into(),
             parent_ids: vec![],
             trace_id: None,
             metadata: Metadata::new(),
@@ -518,6 +584,22 @@ mod tests {
         let s = to_json_string(&raw).unwrap();
         let back: RawEnvelope = from_json_str(&s).unwrap();
         assert_eq!(back, raw);
+    }
+
+    #[test]
+    fn canonical_sha256_sorts_object_keys_recursively() {
+        let left = serde_json::json!({
+            "b": 2,
+            "a": {"d": 4, "c": 3},
+        });
+        let right = serde_json::json!({
+            "a": {"c": 3, "d": 4},
+            "b": 2,
+        });
+        let l = canonical_sha256(&left).unwrap();
+        let r = canonical_sha256(&right).unwrap();
+        assert_eq!(l, r);
+        require_sha256("hash", &l).unwrap();
     }
 
     #[test]

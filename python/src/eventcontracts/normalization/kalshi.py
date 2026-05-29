@@ -59,29 +59,81 @@ class KalshiNormalizer:
             ("kalshi-rest-v1", "trade"): self.normalize_trade,
         }
 
-    def normalize_ticker(self, raw: EventEnvelope) -> QuoteEvent:
+    def normalize_ticker(self, raw: EventEnvelope) -> tuple[QuoteEvent, ...]:
         msg = _message(raw)
-        bid_price = msg.get("yes_bid_dollars")
-        ask_price = msg.get("yes_ask_dollars")
-        bid_size = msg.get("yes_bid_size_fp", "1")
-        ask_size = msg.get("yes_ask_size_fp", "1")
-        quote = Quote(
-            instrument_id=_instrument(msg),
-            side=OutcomeSide.YES,
-            bid=(
-                OrderBookLevel(price=Decimal(str(bid_price)), quantity=Decimal(str(bid_size)))
-                if bid_price is not None
-                else None
-            ),
-            ask=(
-                OrderBookLevel(price=Decimal(str(ask_price)), quantity=Decimal(str(ask_size)))
-                if ask_price is not None
-                else None
-            ),
-            exchange_ts=_message_time(msg) or raw.exchange_ts,
-            received_at=raw.received_at,
+        instrument = _instrument(msg)
+        exchange_ts = _message_time(msg) or raw.exchange_ts
+        yes_bid = _optional_decimal(msg.get("yes_bid_dollars"))
+        yes_ask = _optional_decimal(msg.get("yes_ask_dollars"))
+        yes_bid_size_raw = msg.get("yes_bid_size_fp")
+        yes_ask_size_raw = msg.get("yes_ask_size_fp")
+        yes_bid_size = _optional_decimal(yes_bid_size_raw or "1")
+        yes_ask_size = _optional_decimal(yes_ask_size_raw or "1")
+
+        explicit_no_bid = _optional_decimal(msg.get("no_bid_dollars"))
+        explicit_no_ask = _optional_decimal(msg.get("no_ask_dollars"))
+        no_bid = explicit_no_bid if explicit_no_bid is not None else _invert_probability(yes_ask)
+        no_ask = explicit_no_ask if explicit_no_ask is not None else _invert_probability(yes_bid)
+        no_bid_size_raw = msg.get("no_bid_size_fp")
+        no_ask_size_raw = msg.get("no_ask_size_fp")
+        no_bid_size = _optional_decimal(
+            no_bid_size_raw or (yes_ask_size_raw if explicit_no_bid is None else None) or "1"
         )
-        return QuoteEvent(event_id=_event_id(raw, msg), quote=quote, provenance=_provenance(raw))
+        no_ask_size = _optional_decimal(
+            no_ask_size_raw or (yes_bid_size_raw if explicit_no_ask is None else None) or "1"
+        )
+        synthetic_liquidity = (
+            (yes_bid is not None and yes_bid_size_raw is None)
+            or (yes_ask is not None and yes_ask_size_raw is None)
+            or (explicit_no_bid is not None and no_bid_size_raw is None)
+            or (explicit_no_ask is not None and no_ask_size_raw is None)
+            or (no_bid is not None and explicit_no_bid is None and yes_ask_size_raw is None)
+            or (no_ask is not None and explicit_no_ask is None and yes_bid_size_raw is None)
+        )
+        provenance = _provenance(
+            raw,
+            extra_metadata=(
+                {
+                    "synthetic_liquidity": True,
+                    "liquidity_source": "ticker_missing_size",
+                }
+                if synthetic_liquidity
+                else None
+            ),
+        )
+
+        events: list[QuoteEvent] = []
+        if yes_bid is not None or yes_ask is not None:
+            events.append(
+                QuoteEvent(
+                    event_id=_event_id_with_suffix(raw, msg, "yes"),
+                    quote=Quote(
+                        instrument_id=instrument,
+                        side=OutcomeSide.YES,
+                        bid=_level(yes_bid, yes_bid_size),
+                        ask=_level(yes_ask, yes_ask_size),
+                        exchange_ts=exchange_ts,
+                        received_at=raw.received_at,
+                    ),
+                    provenance=provenance,
+                )
+            )
+        if no_bid is not None or no_ask is not None:
+            events.append(
+                QuoteEvent(
+                    event_id=_event_id_with_suffix(raw, msg, "no"),
+                    quote=Quote(
+                        instrument_id=instrument,
+                        side=OutcomeSide.NO,
+                        bid=_level(no_bid, no_bid_size),
+                        ask=_level(no_ask, no_ask_size),
+                        exchange_ts=exchange_ts,
+                        received_at=raw.received_at,
+                    ),
+                    provenance=provenance,
+                )
+            )
+        return tuple(events)
 
     def normalize_trade(self, raw: EventEnvelope) -> TradeEvent:
         msg = _message(raw)
@@ -89,19 +141,33 @@ class KalshiNormalizer:
         side = OutcomeSide(str(side_raw)) if side_raw else OutcomeSide.YES
         yes_price = msg.get("yes_price_dollars") or msg.get("yes_price")
         no_price = msg.get("no_price_dollars") or msg.get("no_price")
-        price_source = no_price if side is OutcomeSide.NO and no_price is not None else yes_price or msg.get("price")
+        quantity_raw = msg.get("count_fp") or msg.get("quantity") or msg.get("count")
         trade = Trade(
             instrument_id=_instrument(msg),
             side=side,
-            price=Decimal(str(price_source)),
-            quantity=Decimal(str(msg.get("count_fp") or msg.get("quantity") or msg.get("count") or "1")),
+            price=_trade_price(side=side, yes_price=yes_price, no_price=no_price, fallback=msg.get("price")),
+            quantity=Decimal(str(quantity_raw or "1")),
             trade_id=str(msg["trade_id"]) if msg.get("trade_id") is not None else None,
             exchange_ts=_message_time(msg) or raw.exchange_ts,
             received_at=raw.received_at,
             aggressor_side=side,
-            metadata={"raw_schema_version": raw.schema_version},
+            metadata={
+                "raw_schema_version": raw.schema_version,
+                **({"synthetic_quantity": True} if quantity_raw is None else {}),
+            },
         )
-        return TradeEvent(event_id=_event_id(raw, msg), trade=trade, provenance=_provenance(raw))
+        return TradeEvent(
+            event_id=_event_id(raw, msg),
+            trade=trade,
+            provenance=_provenance(
+                raw,
+                extra_metadata=(
+                    {"synthetic_quantity": True, "liquidity_source": "trade_missing_quantity"}
+                    if quantity_raw is None
+                    else None
+                ),
+            ),
+        )
 
     def normalize_rest_orderbook(self, raw: EventEnvelope) -> OrderBookEvent:
         payload = dict(raw.payload)
@@ -212,7 +278,18 @@ def _event_id(raw: EventEnvelope, msg: Mapping[str, Any]) -> EventId:
     return EventId(f"{raw.source}:{raw.channel}:{_market_ticker(msg)}:{raw.received_at.isoformat()}")
 
 
-def _provenance(raw: EventEnvelope) -> EventProvenance:
+def _event_id_with_suffix(raw: EventEnvelope, msg: Mapping[str, Any], suffix: str) -> EventId:
+    return EventId(f"{_event_id(raw, msg)}:{suffix}")
+
+
+def _provenance(
+    raw: EventEnvelope,
+    *,
+    extra_metadata: Mapping[str, Any] | None = None,
+) -> EventProvenance:
+    metadata: dict[str, Any] = {"ws_type": str(raw.metadata.get("ws_type", ""))} if "ws_type" in raw.metadata else {}
+    if extra_metadata:
+        metadata.update(extra_metadata)
     return EventProvenance(
         source=raw.source,
         channel=raw.channel,
@@ -220,7 +297,7 @@ def _provenance(raw: EventEnvelope) -> EventProvenance:
         venue=raw.venue,
         source_sequence=str(raw.metadata["source_sequence"]) if "source_sequence" in raw.metadata else None,
         normalization_version="kalshi-v1",
-        metadata={"ws_type": str(raw.metadata.get("ws_type", ""))} if "ws_type" in raw.metadata else {},
+        metadata=metadata,
     )
 
 
@@ -254,25 +331,67 @@ def _book_from_ladders(
     exchange_ts: datetime | None,
     received_at: datetime,
 ) -> OrderBook:
-    yes_asks = tuple(
-        OrderBookLevel(price=Decimal("1") - level.price, quantity=level.quantity)
-        for level in reversed(no_bids)
-        if Decimal("0") <= Decimal("1") - level.price <= Decimal("1")
-    )
-    no_asks = tuple(
-        OrderBookLevel(price=Decimal("1") - level.price, quantity=level.quantity)
-        for level in reversed(yes_bids)
-        if Decimal("0") <= Decimal("1") - level.price <= Decimal("1")
-    )
+    sorted_yes_bids = _sort_levels(yes_bids, descending=True)
+    sorted_no_bids = _sort_levels(no_bids, descending=True)
     return OrderBook(
         instrument_id=instrument_id,
-        yes_bids=yes_bids,
-        yes_asks=yes_asks,
-        no_bids=no_bids,
-        no_asks=no_asks,
+        yes_bids=sorted_yes_bids,
+        yes_asks=_inverted_ask_levels(sorted_no_bids),
+        no_bids=sorted_no_bids,
+        no_asks=_inverted_ask_levels(sorted_yes_bids),
         exchange_ts=exchange_ts,
         received_at=received_at,
     )
+
+
+def _optional_decimal(value: object) -> Decimal | None:
+    if value is None:
+        return None
+    return Decimal(str(value))
+
+
+def _invert_probability(value: Decimal | None) -> Decimal | None:
+    if value is None:
+        return None
+    return Decimal("1") - value
+
+
+def _level(price: Decimal | None, quantity: Decimal | None) -> OrderBookLevel | None:
+    if price is None:
+        return None
+    return OrderBookLevel(price=price, quantity=quantity or Decimal("1"))
+
+
+def _sort_levels(levels: Sequence[OrderBookLevel], *, descending: bool) -> tuple[OrderBookLevel, ...]:
+    return tuple(sorted(levels, key=lambda level: level.price, reverse=descending))
+
+
+def _inverted_ask_levels(bids: Sequence[OrderBookLevel]) -> tuple[OrderBookLevel, ...]:
+    levels = tuple(
+        OrderBookLevel(price=Decimal("1") - level.price, quantity=level.quantity)
+        for level in bids
+        if Decimal("0") <= Decimal("1") - level.price <= Decimal("1")
+    )
+    return _sort_levels(levels, descending=False)
+
+
+def _trade_price(
+    *,
+    side: OutcomeSide,
+    yes_price: object,
+    no_price: object,
+    fallback: object,
+) -> Decimal:
+    if side is OutcomeSide.NO:
+        if no_price is not None:
+            return Decimal(str(no_price))
+        if yes_price is not None:
+            return Decimal("1") - Decimal(str(yes_price))
+    if yes_price is not None:
+        return Decimal(str(yes_price))
+    if no_price is not None:
+        return Decimal("1") - Decimal(str(no_price))
+    return Decimal(str(fallback))
 
 
 def _message_time(message: Mapping[str, Any]) -> datetime | None:
@@ -294,9 +413,9 @@ def _lifecycle_kind(event_type: str) -> MarketLifecycleKind:
         "created": MarketLifecycleKind.LISTED,
         "activated": MarketLifecycleKind.OPENED,
         "deactivated": MarketLifecycleKind.PAUSED,
-        "close_date_updated": MarketLifecycleKind.CLOSED,
+        "close_date_updated": MarketLifecycleKind.METADATA_UPDATED,
         "determined": MarketLifecycleKind.DETERMINED,
         "settled": MarketLifecycleKind.FINALIZED,
-        "metadata_updated": MarketLifecycleKind.LISTED,
+        "metadata_updated": MarketLifecycleKind.METADATA_UPDATED,
     }
     return mapping.get(event_type, MarketLifecycleKind.LISTED)

@@ -15,7 +15,8 @@ from eventcontracts.storage.interfaces import (
     NormalizedEventStore,
 )
 
-NormalizeFn = Callable[[EventEnvelope], NormalizedEvent]
+NormalizedBatch = NormalizedEvent | tuple[NormalizedEvent, ...]
+NormalizeFn = Callable[[EventEnvelope], NormalizedBatch]
 NormalizerKey = tuple[str, str]
 
 
@@ -27,6 +28,13 @@ class NormalizationResult:
     normalized: NormalizedEvent | None
     accepted: bool
     reasons: tuple[str, ...] = ()
+    normalized_events: tuple[NormalizedEvent, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.normalized_events:
+            return
+        if self.normalized is not None:
+            object.__setattr__(self, "normalized_events", (self.normalized,))
 
 
 class EventNormalizer:
@@ -60,7 +68,20 @@ class EventNormalizer:
                 accepted=False,
                 reasons=(f"normalization failed: {type(exc).__name__}: {exc}",),
             )
-        return NormalizationResult(raw=raw, normalized=normalized, accepted=True)
+        events = normalized if isinstance(normalized, tuple) else (normalized,)
+        if not events:
+            return NormalizationResult(
+                raw=raw,
+                normalized=None,
+                accepted=False,
+                reasons=("normalizer emitted no events",),
+            )
+        return NormalizationResult(
+            raw=raw,
+            normalized=events[0],
+            accepted=True,
+            normalized_events=events,
+        )
 
 
 class NormalizationPipeline:
@@ -83,8 +104,9 @@ class NormalizationPipeline:
         for raw in self.raw_store.read(source):
             result = self.normalizer.normalize(raw)
             results.append(result)
-            if result.normalized is not None:
-                self.normalized_store.append_normalized(result.normalized)
+            if result.normalized_events:
+                for event in result.normalized_events:
+                    self.normalized_store.append_normalized(event)
             elif self.reject_store is not None:
                 self.reject_store.append_normalization_reject(
                     NormalizationReject(

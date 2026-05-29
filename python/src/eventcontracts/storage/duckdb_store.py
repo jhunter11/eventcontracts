@@ -79,7 +79,8 @@ class DuckDbEventStore:
         """Run an ad-hoc SQL query. Returns rows as tuples."""
 
         self._ensure_views()
-        return self._conn.execute(sql, list(args)).fetchall()
+        rows: list[tuple[Any, ...]] = self._conn.execute(sql, list(args)).fetchall()
+        return rows
 
     def raw_count(self) -> int:
         rows = self.query("SELECT COUNT(*) FROM raw_events")

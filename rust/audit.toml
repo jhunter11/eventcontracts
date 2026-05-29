@@ -1,0 +1,9 @@
+[advisories]
+# Keep this list intentionally explicit. Add RUSTSEC IDs only after verifying
+# the vulnerable path is not reachable, and include a revisit date in the PR.
+#
+# RUSTSEC-2023-0071: `rsa` Marvin timing side channel. Kalshi auth uses RSA-PSS
+# signing only; there is no RSA decryption/unpadding path in the process.
+# Revisit by 2026-08-31 or earlier if Kalshi auth can move to a maintained
+# signing backend.
+ignore = ["RUSTSEC-2023-0071"]

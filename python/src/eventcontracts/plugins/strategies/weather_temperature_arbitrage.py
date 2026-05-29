@@ -19,6 +19,8 @@ decision shape (PlaceOrder vs NoAction) is unchanged.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal
 from uuid import uuid4
 
@@ -32,13 +34,15 @@ from eventcontracts.domain.events import (
     NormalizedEvent,
     QuoteEvent,
     SettlementResolvedEvent,
+    market_snapshot_from_quote_event,
 )
 from eventcontracts.domain.ids import ClientOrderId
-from eventcontracts.domain.models import InstrumentId, OutcomeSide
+from eventcontracts.domain.models import InstrumentId, MarketSnapshot, OrderBookLevel, OutcomeSide
 from eventcontracts.domain.orders import OrderSide, OrderType, TimeInForce
 from eventcontracts.domain.spec import StrategySpec
-from eventcontracts.strategy.base import StrategyBase
+from eventcontracts.strategy.base import StrategyBase, StrategyFeedback
 from eventcontracts.strategy.context import StrategyContext
+from eventcontracts.strategy.pricing import buy_limit_from_fair
 from eventcontracts.strategy.registry import register
 
 
@@ -49,6 +53,7 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
         super().__init__(spec)
         self.min_edge_bps = Decimal(str(spec.parameters.get("min_edge_bps", "75")))
         self.max_size = Decimal(str(spec.parameters.get("max_size", "10")))
+        self.order_ttl_ms = int(spec.parameters.get("order_ttl_ms", 5000))
         self.kelly_fraction = Decimal(str(spec.parameters.get("kelly_fraction", "0.10")))
         self.capital_base = Decimal(str(spec.parameters.get("capital_base", "0")))
         self.capital_source = str(spec.parameters.get("capital_source", "context_cash")).lower()
@@ -73,16 +78,17 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
         # Last known market mid per instrument; updated on QuoteEvent.
         self._mid_by_instrument: dict[InstrumentId, Decimal] = {}
         self._quote_by_instrument: dict[InstrumentId, tuple[Decimal, Decimal]] = {}
+        self._snapshot_by_instrument: dict[InstrumentId, MarketSnapshot] = {}
         self._submitted_notional_by_ladder: dict[str, Decimal] = {}
         self._submitted_notional_by_instrument: dict[InstrumentId, Decimal] = {}
         self._active_notional = Decimal("0")
         self._submitted_orders_by_ladder: dict[str, int] = {}
         self._submitted_orders_by_instrument: dict[InstrumentId, int] = {}
         self._last_trade_signal_by_instrument: dict[InstrumentId, tuple[Decimal, Decimal]] = {}
+        self._pending_notional_by_client_order_id: dict[ClientOrderId, _PendingWeatherOrder] = {}
+        self._accepted_notional_by_client_order_id: dict[ClientOrderId, _PendingWeatherOrder] = {}
 
-    def on_event(
-        self, event: NormalizedEvent, ctx: StrategyContext
-    ) -> Sequence[StrategyDecision]:
+    def on_event(self, event: NormalizedEvent, ctx: StrategyContext) -> Sequence[StrategyDecision]:
         if isinstance(event, SettlementResolvedEvent):
             released = self._release_settled_notional(event.settlement.instrument_id)
             return (NoAction(reason=f"settlement_released_notional_{released}"),)
@@ -119,7 +125,13 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
             return (NoAction(reason="censored:no_available_cash"),)
 
         if self.execution_mode == "taker_if_edge":
-            decision = self._taker_decision(instrument_id, forecast_prob, event.payload, capital_base)
+            decision = self._taker_decision(
+                instrument_id,
+                forecast_prob,
+                event.payload,
+                capital_base,
+                now=ctx.now,
+            )
             if decision is None:
                 return (NoAction(reason="edge_below_executable_threshold"),)
             return (decision,)
@@ -130,7 +142,9 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
 
         side = OutcomeSide.YES if edge_bps > 0 else OutcomeSide.NO
         order_side = OrderSide.BUY
-        limit_price = mid if side is OutcomeSide.YES else Decimal("1") - mid
+        # V6-C3: floor the per-side BUY limit to the venue cent (edge-preserving,
+        # venue-valid). Raw mid can be a half-cent on an odd tick-sum book.
+        limit_price = buy_limit_from_fair(mid if side is OutcomeSide.YES else Decimal("1") - mid)
         size = self._size_for_edge(edge_bps=edge_bps, price=limit_price, capital_base=capital_base)
         if size <= 0:
             return (NoAction(reason="sizing_zero"),)
@@ -142,9 +156,14 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
                 outcome_side=side,
                 order_side=order_side,
                 order_type=OrderType.LIMIT,
-                time_in_force=TimeInForce.GTC,
+                time_in_force=TimeInForce.GTD,
                 quantity=size,
                 price=limit_price,
+                expires_at=ctx.now + timedelta(milliseconds=self.order_ttl_ms),
+                market_snapshot=_snapshot_for_side(
+                    self._snapshot_by_instrument.get(instrument_id),
+                    side,
+                ),
                 reason=f"edge_{edge_bps:+.0f}bps_vs_mid_{mid}",
                 expected_edge_bps=edge_bps,
             ),
@@ -157,6 +176,7 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
         mid = (quote.bid.price + quote.ask.price) / Decimal("2")
         self._mid_by_instrument[quote.instrument_id] = mid
         self._quote_by_instrument[quote.instrument_id] = (quote.bid.price, quote.ask.price)
+        self._snapshot_by_instrument[quote.instrument_id] = market_snapshot_from_quote_event(event)
 
     def _taker_decision(
         self,
@@ -164,6 +184,7 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
         forecast_prob: Decimal,
         payload: Mapping[str, object],
         capital_base: Decimal,
+        now: datetime,
     ) -> PlaceOrder | None:
         quote = self._quote_by_instrument.get(instrument_id)
         if quote is None:
@@ -192,6 +213,7 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
                 forecast_prob=forecast_prob,
                 ladder_key=self._ladder_key(instrument_id, payload),
                 capital_base=capital_base,
+                now=now,
             )
         return self._place_order(
             instrument_id=instrument_id,
@@ -202,6 +224,7 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
             forecast_prob=forecast_prob,
             ladder_key=self._ladder_key(instrument_id, payload),
             capital_base=capital_base,
+            now=now,
         )
 
     def _place_order(
@@ -215,6 +238,7 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
         forecast_prob: Decimal,
         ladder_key: str,
         capital_base: Decimal,
+        now: datetime,
     ) -> PlaceOrder | None:
         if not self._can_retrade(instrument_id, price, forecast_prob):
             return None
@@ -226,20 +250,17 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
             return None
         if not self._can_add_active_exposure(notional, capital_base):
             return None
-        self._submitted_notional_by_ladder[ladder_key] = (
-            self._submitted_notional_by_ladder.get(ladder_key, Decimal("0")) + notional
+        client_order_id = ClientOrderId(uuid4().hex)
+        fair_price = forecast_prob if side is OutcomeSide.YES else Decimal("1") - forecast_prob
+        self._pending_notional_by_client_order_id[client_order_id] = _PendingWeatherOrder(
+            ladder_key=ladder_key,
+            instrument_id=instrument_id,
+            notional=notional,
+            price=price,
+            forecast_prob=forecast_prob,
         )
-        self._submitted_notional_by_instrument[instrument_id] = (
-            self._submitted_notional_by_instrument.get(instrument_id, Decimal("0")) + notional
-        )
-        self._active_notional += notional
-        self._submitted_orders_by_ladder[ladder_key] = self._submitted_orders_by_ladder.get(ladder_key, 0) + 1
-        self._submitted_orders_by_instrument[instrument_id] = (
-            self._submitted_orders_by_instrument.get(instrument_id, 0) + 1
-        )
-        self._last_trade_signal_by_instrument[instrument_id] = (price, forecast_prob)
         return PlaceOrder(
-            client_order_id=ClientOrderId(uuid4().hex),
+            client_order_id=client_order_id,
             instrument_id=instrument_id,
             outcome_side=side,
             order_side=OrderSide.BUY,
@@ -247,9 +268,94 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
             time_in_force=TimeInForce.IOC,
             quantity=size,
             price=price,
+            expires_at=now + timedelta(milliseconds=self.order_ttl_ms),
+            market_snapshot=_snapshot_for_side(
+                self._snapshot_by_instrument.get(instrument_id),
+                side,
+            ),
             reason=f"executable_edge_{edge_bps:+.0f}bps_vs_ask_{reason_price}",
             expected_edge_bps=edge_bps,
-            metadata={"ladder_key": ladder_key},
+            metadata={
+                "ladder_key": ladder_key,
+                "fair_price": str(fair_price),
+                "min_executable_edge_ticks": str(int(self.min_edge_bps)),
+                "fee_rate_bps": "700",
+            },
+        )
+
+    def on_feedback(self, feedback: StrategyFeedback, ctx: StrategyContext) -> None:
+        del ctx
+        if feedback.client_order_id is None:
+            return
+        if feedback.kind == "IntentAccepted":
+            pending = self._pending_notional_by_client_order_id.pop(
+                feedback.client_order_id, None
+            )
+            if pending is not None:
+                self._record_accepted_order(feedback.client_order_id, pending)
+            return
+        if feedback.kind not in {"IntentRejected", "VenueRejected", "VenueTerminal"}:
+            return
+        pending = self._pending_notional_by_client_order_id.pop(
+            feedback.client_order_id, None
+        )
+        if pending is not None:
+            return
+        accepted = self._accepted_notional_by_client_order_id.pop(
+            feedback.client_order_id, None
+        )
+        if accepted is not None:
+            self._release_accepted_order(accepted)
+
+    def _record_accepted_order(
+        self, client_order_id: ClientOrderId, pending: _PendingWeatherOrder
+    ) -> None:
+        self._accepted_notional_by_client_order_id[client_order_id] = pending
+        self._submitted_notional_by_ladder[pending.ladder_key] = (
+            self._submitted_notional_by_ladder.get(pending.ladder_key, Decimal("0"))
+            + pending.notional
+        )
+        self._submitted_notional_by_instrument[pending.instrument_id] = (
+            self._submitted_notional_by_instrument.get(
+                pending.instrument_id, Decimal("0")
+            )
+            + pending.notional
+        )
+        self._active_notional += pending.notional
+        self._submitted_orders_by_ladder[pending.ladder_key] = (
+            self._submitted_orders_by_ladder.get(pending.ladder_key, 0) + 1
+        )
+        self._submitted_orders_by_instrument[pending.instrument_id] = (
+            self._submitted_orders_by_instrument.get(pending.instrument_id, 0) + 1
+        )
+        self._last_trade_signal_by_instrument[pending.instrument_id] = (
+            pending.price,
+            pending.forecast_prob,
+        )
+
+    def _release_accepted_order(self, accepted: _PendingWeatherOrder) -> None:
+        self._submitted_notional_by_ladder[accepted.ladder_key] = max(
+            self._submitted_notional_by_ladder.get(accepted.ladder_key, Decimal("0"))
+            - accepted.notional,
+            Decimal("0"),
+        )
+        self._submitted_notional_by_instrument[accepted.instrument_id] = max(
+            self._submitted_notional_by_instrument.get(
+                accepted.instrument_id, Decimal("0")
+            )
+            - accepted.notional,
+            Decimal("0"),
+        )
+        self._active_notional = max(
+            self._active_notional - accepted.notional, Decimal("0")
+        )
+        self._submitted_orders_by_ladder[accepted.ladder_key] = max(
+            self._submitted_orders_by_ladder.get(accepted.ladder_key, 0) - 1,
+            0,
+        )
+        self._submitted_orders_by_instrument[accepted.instrument_id] = max(
+            self._submitted_orders_by_instrument.get(accepted.instrument_id, 0) - 1,
+            0,
         )
 
     def _required_edge_bps(self, spread: Decimal) -> Decimal:
@@ -264,9 +370,7 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
             target_notional = max_trade_notional * edge_fraction * self.kelly_fraction
             raw_size = (target_notional / price).to_integral_value(rounding=ROUND_FLOOR)
         else:
-            raw_size = (edge_fraction * self.kelly_fraction * self.max_size).to_integral_value(
-                rounding=ROUND_FLOOR
-            )
+            raw_size = (edge_fraction * self.kelly_fraction * self.max_size).to_integral_value(rounding=ROUND_FLOOR)
         size = max(raw_size, Decimal("1"))
         size = min(size, self.max_size)
         return self._cap_size_by_trade_notional(size=size, price=price, capital_base=capital_base)
@@ -376,3 +480,40 @@ def factory(spec: StrategySpec) -> WeatherTemperatureArbitrageStrategy:
 
 def _truthy(value: object) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _snapshot_for_side(
+    snapshot: MarketSnapshot | None,
+    side: OutcomeSide,
+) -> MarketSnapshot | None:
+    if snapshot is None or snapshot.side is side:
+        return snapshot
+    return MarketSnapshot(
+        instrument_id=snapshot.instrument_id,
+        side=side,
+        bid=(
+            OrderBookLevel(price=Decimal("1") - snapshot.ask.price, quantity=snapshot.ask.quantity)
+            if snapshot.ask is not None
+            else None
+        ),
+        ask=(
+            OrderBookLevel(price=Decimal("1") - snapshot.bid.price, quantity=snapshot.bid.quantity)
+            if snapshot.bid is not None
+            else None
+        ),
+        exchange_ts=snapshot.exchange_ts,
+        received_at=snapshot.received_at,
+        source=snapshot.source,
+        source_sequence=snapshot.source_sequence,
+        sequence_gap=snapshot.sequence_gap,
+        metadata=snapshot.metadata,
+    )
+
+
+@dataclass(frozen=True)
+class _PendingWeatherOrder:
+    ladder_key: str
+    instrument_id: InstrumentId
+    notional: Decimal
+    price: Decimal
+    forecast_prob: Decimal

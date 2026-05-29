@@ -321,9 +321,8 @@ def _rules_mode_probability(
     if state.strokes_to_cut is None:
         return None
     # `strokes_to_cut`: positive = above the cutline (BAD for YES).
-    base = Decimal(
-        str(1.0 / (1.0 + exp(float(state.strokes_to_cut) / 2.0)))
-    )
+    sigmoid_arg = max(-50.0, min(50.0, float(state.strokes_to_cut) / 2.0))
+    base = Decimal(str(1.0 / (1.0 + exp(sigmoid_arg))))
     sg_delta = (
         (state.sg_approach or Decimal("0"))
         - (state.sg_putting or Decimal("0"))

@@ -10,7 +10,7 @@ loses too much in a single day cannot keep trading.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from eventcontracts.domain.decisions import IntentEnvelope, PlaceOrder
@@ -24,7 +24,7 @@ from eventcontracts.domain.ids import (
     StrategyId,
     VenueOrderId,
 )
-from eventcontracts.domain.models import InstrumentId, OutcomeSide, Venue
+from eventcontracts.domain.models import InstrumentId, MarketSnapshot, OrderBookLevel, OutcomeSide, Venue
 from eventcontracts.domain.orders import Liquidity, OrderSide, OrderType, TimeInForce
 from eventcontracts.domain.positions import CashBalance
 from eventcontracts.domain.spec import RiskProfile, SleeveSpec
@@ -77,16 +77,28 @@ def _fill(price: str, qty: str, side: OrderSide, fill_id: str = "f-1") -> Fill:
 
 
 def _envelope_buy() -> IntentEnvelope:
+    snapshot = MarketSnapshot(
+        instrument_id=INSTR,
+        side=OutcomeSide.YES,
+        bid=OrderBookLevel(price=Decimal("0.49"), quantity=Decimal("100")),
+        ask=OrderBookLevel(price=Decimal("0.51"), quantity=Decimal("100")),
+        exchange_ts=NOW,
+        received_at=NOW,
+        source="fixture",
+        source_sequence="1",
+    )
     return IntentEnvelope(
         decision=PlaceOrder(
             instrument_id=INSTR,
             outcome_side=OutcomeSide.YES,
             order_side=OrderSide.BUY,
             order_type=OrderType.LIMIT,
-            time_in_force=TimeInForce.GTC,
+            time_in_force=TimeInForce.GTD,
             quantity=Decimal("10"),
             price=Decimal("0.50"),
             client_order_id=ClientOrderId("co-new"),
+            expires_at=NOW + timedelta(seconds=1),
+            market_snapshot=snapshot,
         ),
         strategy_id=StrategyId("strat-1"),
         sleeve_id=SleeveId("s-1"),

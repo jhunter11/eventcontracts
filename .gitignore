@@ -1,6 +1,8 @@
 .DS_Store
 .env
+.env.*
 ecmodel.txt
+demokey.txt
 *.pem
 *.key
 *.p8
@@ -25,6 +27,8 @@ data/live-paper-smoke/
 data/live-paper-overnight/
 data/live-paper-nyc/
 data/live-paper-nyc-smoke/
+data/
+*.parquet
 notebooks/.ipynb_checkpoints/
 rust/target/
 

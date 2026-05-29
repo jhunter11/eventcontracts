@@ -33,10 +33,11 @@ from __future__ import annotations
 
 from abc import abstractmethod
 from collections import deque
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 from eventcontracts.domain.events import (
     LifecycleEvent,
@@ -197,6 +198,7 @@ class _RollingState:
     as_of: datetime
     # Last seen ewma mid (price).
     ewma_mid: Decimal | None = None
+    last_mid_ts: datetime | None = None
     # Trade deque of (timestamp, price, qty) for VWAP window.
     trade_window: deque[tuple[datetime, Decimal, Decimal]] = field(default_factory=deque)
     last_imbalance: Decimal | None = None
@@ -223,7 +225,6 @@ class RollingMidVwapImbalanceBuilder(DeterministicFeatureBuilder):
         self.window = timedelta(seconds=window_seconds)
         self.half_life = timedelta(seconds=ewma_half_life_seconds)
         self._instrument_filter = instrument_id
-        self._states: dict[InstrumentId | None, _RollingState] = {}
 
     def schema(self) -> FeatureSchema:
         return FeatureSchema(
@@ -258,6 +259,7 @@ class RollingMidVwapImbalanceBuilder(DeterministicFeatureBuilder):
         return OnlineFeatureState(
             instrument_id=self._instrument_filter,
             as_of=datetime(1970, 1, 1, tzinfo=UTC),
+            builder_state={},
         )
 
     def _compute(
@@ -274,12 +276,19 @@ class RollingMidVwapImbalanceBuilder(DeterministicFeatureBuilder):
                     instrument_id=state.instrument_id,
                     as_of=ts,
                     last_event=event,
+                    vector=state.vector,
+                    builder_state=state.builder_state,
+                    audit=state.audit,
+                    notes=state.notes,
                 ),
                 None,
             )
-        per = self._states.setdefault(
-            instrument,
-            _RollingState(instrument_id=instrument, as_of=ts),
+        state_key = _state_key(instrument)
+        builder_state = dict(state.builder_state)
+        per = _rolling_from_payload(
+            instrument=instrument,
+            fallback_as_of=ts,
+            payload=builder_state.get(state_key),
         )
         per.as_of = ts
 
@@ -287,14 +296,28 @@ class RollingMidVwapImbalanceBuilder(DeterministicFeatureBuilder):
             quote = event.quote
             mid = _mid_from_quote(quote.bid, quote.ask)
             if mid is not None:
-                per.ewma_mid = _ewma_step(per.ewma_mid, mid, per.as_of, self.half_life)
+                per.ewma_mid = _ewma_step(
+                    previous=per.ewma_mid,
+                    sample=mid,
+                    previous_at=per.last_mid_ts,
+                    now=ts,
+                    half_life=self.half_life,
+                )
+                per.last_mid_ts = ts
         elif isinstance(event, OrderBookEvent):
             book = event.book
             top_bid = book.yes_bids[0] if book.yes_bids else None
             top_ask = book.yes_asks[0] if book.yes_asks else None
             mid = _mid_from_quote(top_bid, top_ask)
             if mid is not None:
-                per.ewma_mid = _ewma_step(per.ewma_mid, mid, per.as_of, self.half_life)
+                per.ewma_mid = _ewma_step(
+                    previous=per.ewma_mid,
+                    sample=mid,
+                    previous_at=per.last_mid_ts,
+                    now=ts,
+                    half_life=self.half_life,
+                )
+                per.last_mid_ts = ts
             if top_bid is not None and top_ask is not None:
                 total = top_bid.quantity + top_ask.quantity
                 if total > 0:
@@ -309,11 +332,13 @@ class RollingMidVwapImbalanceBuilder(DeterministicFeatureBuilder):
                 per.trade_window.popleft()
 
         vector = self._emit_vector(per)
+        builder_state[state_key] = _rolling_to_payload(per)
         new_state = OnlineFeatureState(
             instrument_id=per.instrument_id,
             as_of=per.as_of,
             last_event=event,
             vector=vector,
+            builder_state=builder_state,
         )
         return new_state, vector
 
@@ -354,6 +379,74 @@ def _instrument_of(event: NormalizedEvent) -> InstrumentId | None:
     return None
 
 
+def _state_key(instrument: InstrumentId | None) -> str:
+    if instrument is None:
+        return "__none__"
+    return f"{instrument.venue.value}:{instrument.market_id}:{instrument.outcome_id or ''}"
+
+
+def _rolling_to_payload(per: _RollingState) -> dict[str, Any]:
+    return {
+        "as_of": per.as_of,
+        "ewma_mid": per.ewma_mid,
+        "last_mid_ts": per.last_mid_ts,
+        "trade_window": tuple(per.trade_window),
+        "last_imbalance": per.last_imbalance,
+    }
+
+
+def _rolling_from_payload(
+    *,
+    instrument: InstrumentId | None,
+    fallback_as_of: datetime,
+    payload: Any,
+) -> _RollingState:
+    if not isinstance(payload, Mapping):
+        return _RollingState(instrument_id=instrument, as_of=fallback_as_of)
+    as_of = _datetime_value(payload.get("as_of")) or fallback_as_of
+    trade_window: deque[tuple[datetime, Decimal, Decimal]] = deque()
+    raw_window = payload.get("trade_window", ())
+    if isinstance(raw_window, Iterable) and not isinstance(raw_window, str | bytes):
+        for item in raw_window:
+            if not isinstance(item, tuple | list) or len(item) != 3:
+                continue
+            raw_ts, raw_price, raw_qty = item
+            item_ts = _datetime_value(raw_ts)
+            if item_ts is None:
+                continue
+            trade_window.append(
+                (item_ts, _decimal_or_zero(raw_price), _decimal_or_zero(raw_qty))
+            )
+    return _RollingState(
+        instrument_id=instrument,
+        as_of=as_of,
+        ewma_mid=_optional_decimal(payload.get("ewma_mid")),
+        last_mid_ts=_datetime_value(payload.get("last_mid_ts")),
+        trade_window=trade_window,
+        last_imbalance=_optional_decimal(payload.get("last_imbalance")),
+    )
+
+
+def _datetime_value(value: object) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(str(value))
+
+
+def _optional_decimal(value: object) -> Decimal | None:
+    if value is None:
+        return None
+    return _decimal_or_zero(value)
+
+
+def _decimal_or_zero(value: object) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
 def _mid_from_quote(
     bid: object | None, ask: object | None
 ) -> Decimal | None:
@@ -369,21 +462,24 @@ def _mid_from_quote(
 
 
 def _ewma_step(
+    *,
     previous: Decimal | None,
     sample: Decimal,
+    previous_at: datetime | None,
     now: datetime,
     half_life: timedelta,
 ) -> Decimal:
-    """Single EWMA update; first sample seeds the average."""
+    """Elapsed-time EWMA update; first sample seeds the average."""
 
-    if previous is None:
+    if previous is None or previous_at is None:
         return sample
-    # Use a fixed-step weight to keep the computation deterministic without
-    # relying on the inter-event interval; a more sophisticated builder
-    # would weight by elapsed time. The fixed weight here is the standard
-    # EWMA alpha derived from one half-life step.
-    alpha = Decimal("0.5") ** (Decimal("1") / Decimal(max(1, half_life.seconds)))
-    return alpha * previous + (Decimal("1") - alpha) * sample
+    elapsed = max((now - previous_at).total_seconds(), 0.0)
+    if elapsed == 0:
+        return previous
+    half_life_seconds = Decimal(str(max(half_life.total_seconds(), 1e-9)))
+    elapsed_seconds = Decimal(str(elapsed))
+    decay = Decimal("0.5") ** (elapsed_seconds / half_life_seconds)
+    return decay * previous + (Decimal("1") - decay) * sample
 
 
 def _vwap(trades: Iterable[tuple[datetime, Decimal, Decimal]]) -> Decimal:

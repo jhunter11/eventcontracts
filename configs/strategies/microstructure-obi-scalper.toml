@@ -21,6 +21,10 @@ imbalance_threshold = "0.70"
 cancel_threshold = "0.30"
 clip_size = "5"
 max_spread_bps = "100"
+model_kind = "classification"
+model_long_threshold = "0.60"
+model_cancel_threshold = "0.40"
+model_long_bps_threshold = "5"
 
 [tags]
 family = "microstructure"

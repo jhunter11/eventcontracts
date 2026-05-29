@@ -200,6 +200,14 @@ class AuditTrailValidator:
                 )
 
             for parent_id in stamp.parent_ids:
+                parent_stamp = self.trail.get_stamp(parent_id)
+                if parent_stamp is not None and parent_stamp.produced_at > stamp.produced_at:
+                    issues.append(
+                        AuditValidationIssue(
+                            current_id,
+                            f"parent {parent_id} produced after child",
+                        )
+                    )
                 walk(parent_id)
 
             visiting.remove(current_id)

@@ -136,7 +136,7 @@ end = "2026-01-02T00:00:00Z"
     assert rc == 0
     assert results_path.exists()
 
-    table = pq.read_table(results_path)  # type: ignore[no-untyped-call]
+    table = pq.read_table(results_path)
     rows = table.to_pylist()
     # 2 buy_below × 2 size × 1 window = 4 rows.
     assert len(rows) == 4

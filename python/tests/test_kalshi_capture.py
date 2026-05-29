@@ -12,18 +12,31 @@ from typing import Any
 
 import httpx
 
-from eventcontracts.adapters.venues.kalshi import KalshiPublicClient, KalshiWebSocketClient
+from eventcontracts.adapters.venues.kalshi import KalshiAuth, KalshiPublicClient, KalshiWebSocketClient
 from eventcontracts.cli.capture import capture_kalshi_fixture, capture_kalshi_rest_polls, resolve_kalshi_tickers
 from eventcontracts.cli.main import main as cli
 from eventcontracts.config import load_strategy_spec
 from eventcontracts.domain import LifecycleEvent, OrderBookEvent, QuoteEvent, TradeEvent
-from eventcontracts.domain.models import InstrumentId, Venue
+from eventcontracts.domain.lifecycle import MarketLifecycleKind
+from eventcontracts.domain.models import InstrumentId, OutcomeSide, Venue
 from eventcontracts.ingestion import SubscriptionPlanner
-from eventcontracts.normalization import EventNormalizer, kalshi_normalizers
+from eventcontracts.normalization import EventNormalizer, KalshiNormalizer, kalshi_normalizers
 from eventcontracts.storage import EventEnvelope, ParquetEventStore
 from tests.conftest import REPO_ROOT
 
 FIXTURES = REPO_ROOT / "python/tests/fixtures/kalshi"
+
+
+def test_auth_loads_inline_private_key_pem_from_env(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "kid-inline")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PEM", "-----BEGIN RSA PRIVATE KEY-----\nredacted\n")
+    monkeypatch.delenv("KALSHI_PRIVATE_KEY_PATH", raising=False)
+
+    auth = KalshiAuth.from_env()
+
+    assert auth.api_key_id == "kid-inline"
+    assert auth.private_key_path is None
+    assert auth.private_key_pem is not None
 
 
 def test_rest_client_paginates_and_maps_market_book_and_trades() -> None:
@@ -31,9 +44,7 @@ def test_rest_client_paginates_and_maps_market_book_and_trades() -> None:
         client = _mock_rest_client()
 
         markets = await client.list_markets()
-        book = await client.get_order_book(
-            InstrumentId(venue=Venue.KALSHI, market_id="KXHIGHNY-26MAY24-B75")
-        )
+        book = await client.get_order_book(InstrumentId(venue=Venue.KALSHI, market_id="KXHIGHNY-26MAY24-B75"))
         trades = await client.get_recent_trades("KXHIGHNY-26MAY24-B75")
 
         assert [market.instrument_id.market_id for market in markets] == [
@@ -41,9 +52,37 @@ def test_rest_client_paginates_and_maps_market_book_and_trades() -> None:
             "KXFED-26JUN-T4.50",
         ]
         assert book.yes_bids[0].price == Decimal("0.4500")
-        assert book.yes_asks[0].price == Decimal("0.4900")
+        assert book.yes_asks[0].price == Decimal("0.4800")
         assert trades[0].trade_id == "trade-rest-1"
         assert trades[0].price == Decimal("0.4700")
+
+    asyncio.run(run())
+
+
+def test_rest_client_sorts_synthetic_ask_ladders_lowest_price_first() -> None:
+    async def run() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/orderbook"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "orderbook": {
+                            "yes": [["0.50", "5"], ["0.40", "10"]],
+                            "no": [["0.40", "3"], ["0.30", "4"]],
+                        }
+                    },
+                )
+            return httpx.Response(404, json={"error": "not found"})
+
+        client = KalshiPublicClient(
+            base_url="https://example.test/trade-api/v2",
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+
+        book = await client.get_order_book(InstrumentId(venue=Venue.KALSHI, market_id="KXTEST-1"))
+
+        assert [level.price for level in book.yes_asks] == [Decimal("0.60"), Decimal("0.70")]
+        assert [level.price for level in book.no_asks] == [Decimal("0.50"), Decimal("0.60")]
 
     asyncio.run(run())
 
@@ -122,6 +161,21 @@ def test_websocket_subscribe_command_and_sequence_gap_detection() -> None:
     assert second.metadata["actual_sequence"] == 3
 
 
+def test_websocket_sequence_cache_evicts_old_sids() -> None:
+    client = KalshiWebSocketClient(max_sequence_cache_size=2)
+    for sid in (1, 2, 3):
+        client.message_to_envelope(
+            {
+                "type": "ticker",
+                "sid": sid,
+                "seq": 1,
+                "msg": {"market_ticker": f"KX{sid}", "ts_ms": 1779631200000},
+            }
+        )
+
+    assert tuple(client._last_seq_by_sid) == (2, 3)
+
+
 def test_websocket_stream_reconnects_after_connection_failure() -> None:
     async def run() -> None:
         connector = _FailOnceConnector()
@@ -179,6 +233,123 @@ def test_kalshi_normalizer_handles_recorded_ws_payloads() -> None:
     assert book_events[-1].book.yes_bids[0].quantity == Decimal("17.00")
 
 
+def test_kalshi_normalizer_sorts_synthetic_ask_ladders_lowest_price_first() -> None:
+    raw = EventEnvelope(
+        venue=Venue.KALSHI,
+        source="kalshi-ws",
+        channel="orderbook_snapshot",
+        received_at=datetime(2026, 5, 24, 12, 0, tzinfo=UTC),
+        exchange_ts=None,
+        payload={
+            "market_ticker": "KXTEST-1",
+            "yes": [["0.50", "5"], ["0.40", "10"]],
+            "no": [["0.40", "3"], ["0.30", "4"]],
+        },
+        schema_version="kalshi-ws-v1",
+    )
+
+    book = KalshiNormalizer().normalize_orderbook_snapshot(raw).book
+
+    assert [level.price for level in book.yes_asks] == [Decimal("0.60"), Decimal("0.70")]
+    assert [level.price for level in book.no_asks] == [Decimal("0.50"), Decimal("0.60")]
+
+
+def test_kalshi_ticker_normalizer_emits_yes_and_no_quotes() -> None:
+    raw = EventEnvelope(
+        venue=Venue.KALSHI,
+        source="kalshi-ws",
+        channel="ticker",
+        received_at=datetime(2026, 5, 24, 12, 0, tzinfo=UTC),
+        exchange_ts=None,
+        payload={
+            "market_ticker": "KXTEST-1",
+            "yes_bid_dollars": "0.42",
+            "yes_ask_dollars": "0.47",
+            "yes_bid_size_fp": "12",
+            "yes_ask_size_fp": "8",
+        },
+        schema_version="kalshi-ws-v1",
+    )
+
+    events = KalshiNormalizer().normalize_ticker(raw)
+
+    assert len(events) == 2
+    yes, no = events
+    assert yes.quote.side is OutcomeSide.YES
+    assert yes.quote.bid is not None and yes.quote.bid.price == Decimal("0.42")
+    assert yes.quote.ask is not None and yes.quote.ask.price == Decimal("0.47")
+    assert no.quote.side is OutcomeSide.NO
+    assert no.quote.bid is not None and no.quote.bid.price == Decimal("0.53")
+    assert no.quote.bid.quantity == Decimal("8")
+    assert no.quote.ask is not None and no.quote.ask.price == Decimal("0.58")
+    assert no.quote.ask.quantity == Decimal("12")
+
+
+def test_kalshi_ticker_normalizer_marks_synthetic_size_defaults() -> None:
+    raw = EventEnvelope(
+        venue=Venue.KALSHI,
+        source="kalshi-ws",
+        channel="ticker",
+        received_at=datetime(2026, 5, 24, 12, 0, tzinfo=UTC),
+        exchange_ts=None,
+        payload={
+            "market_ticker": "KXTEST-1",
+            "yes_bid_dollars": "0.42",
+            "yes_ask_dollars": "0.47",
+        },
+        schema_version="kalshi-ws-v1",
+    )
+
+    events = KalshiNormalizer().normalize_ticker(raw)
+
+    assert events
+    assert all(event.provenance.metadata["synthetic_liquidity"] is True for event in events)
+
+
+def test_kalshi_trade_normalizer_inverts_missing_no_price_from_yes_price() -> None:
+    raw = EventEnvelope(
+        venue=Venue.KALSHI,
+        source="kalshi-ws",
+        channel="trade",
+        received_at=datetime(2026, 5, 24, 12, 0, tzinfo=UTC),
+        exchange_ts=None,
+        payload={
+            "market_ticker": "KXTEST-1",
+            "trade_id": "tr-no-1",
+            "taker_outcome_side": "no",
+            "yes_price_dollars": "0.37",
+            "count": "10",
+        },
+        schema_version="kalshi-ws-v1",
+    )
+
+    event = KalshiNormalizer().normalize_trade(raw)
+
+    assert event.trade.side is OutcomeSide.NO
+    assert event.trade.price == Decimal("0.63")
+
+
+def test_close_date_updated_is_metadata_lifecycle_not_closed() -> None:
+    raw = EventEnvelope(
+        venue=Venue.KALSHI,
+        source="kalshi-ws",
+        channel="market_lifecycle_v2",
+        received_at=datetime(2026, 5, 24, 12, 0, tzinfo=UTC),
+        exchange_ts=None,
+        payload={
+            "market_ticker": "KXTEST-1",
+            "event_type": "close_date_updated",
+        },
+        schema_version="kalshi-ws-v1",
+    )
+
+    event = KalshiNormalizer().normalize_lifecycle(raw)
+
+    assert isinstance(event, LifecycleEvent)
+    assert event.lifecycle.kind is MarketLifecycleKind.METADATA_UPDATED
+    assert event.lifecycle.reason == "close_date_updated"
+
+
 def test_capture_fixture_writes_raw_parquet(tmp_path: Path) -> None:
     count = capture_kalshi_fixture(FIXTURES / "ws_messages.jsonl", tmp_path)
 
@@ -209,9 +380,35 @@ def test_rest_poll_capture_records_books_and_dedupes_recent_trades(tmp_path: Pat
         assert [event.channel for event in envelopes].count("trade") == 1
         assert [event.metadata["poll_index"] for event in envelopes if event.channel == "book"] == [0, 1]
         assert any(
-            event.metadata.get("trade_key") == "KXHIGHNY-26MAY24-B75:trade_id:trade-rest-1"
-            for event in envelopes
+            event.metadata.get("trade_key") == "KXHIGHNY-26MAY24-B75:trade_id:trade-rest-1" for event in envelopes
         )
+
+    asyncio.run(run())
+
+
+def test_rest_poll_capture_sleeps_to_absolute_deadline(tmp_path: Path) -> None:
+    async def run() -> None:
+        sleeps: list[float] = []
+        now = 100.0
+
+        def monotonic() -> float:
+            return now
+
+        async def sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        await capture_kalshi_rest_polls(
+            _mock_rest_client(),
+            store=ParquetEventStore(tmp_path),
+            tickers=("KXHIGHNY-26MAY24-B75",),
+            max_polls=3,
+            poll_interval_seconds=10,
+            trades_limit=100,
+            monotonic=monotonic,
+            sleep=sleep,
+        )
+
+        assert sleeps == [10, 20]
 
     asyncio.run(run())
 
@@ -288,7 +485,7 @@ def test_normalize_cli_converts_captured_kalshi_raw_to_normalized(
     assert summary["processed"] == 5
     assert summary["accepted"] == 5
     assert summary["rejected"] == 0
-    assert len(list(ParquetEventStore(tmp_path).read_normalized())) == 5
+    assert len(list(ParquetEventStore(tmp_path).read_normalized())) == 6
 
 
 def test_capture_cli_fixture_can_normalize_and_write_manifest(
@@ -311,7 +508,7 @@ def test_capture_cli_fixture_can_normalize_and_write_manifest(
     assert rc == 0
     assert "manifest" in capsys.readouterr().out
     assert len(list(ParquetEventStore(tmp_path).read(source="kalshi-ws"))) == 5
-    assert len(list(ParquetEventStore(tmp_path).read_normalized())) == 5
+    assert len(list(ParquetEventStore(tmp_path).read_normalized())) == 6
     manifests = tuple((tmp_path / "manifests").glob("capture-*.json"))
     assert len(manifests) == 1
     manifest = json.loads(manifests[0].read_text())
@@ -378,7 +575,7 @@ def test_inspect_data_cli_reports_raw_normalized_and_reject_counts(
     assert rc == 0
     summary = json.loads(capsys.readouterr().out)
     assert summary["raw_count"] == 5
-    assert summary["normalized_count"] == 5
+    assert summary["normalized_count"] == 6
     assert summary["reject_count"] == 0
     assert summary["raw_by_source"] == {"kalshi-ws": 5}
     assert summary["normalized_by_kind"]["book"] == 2

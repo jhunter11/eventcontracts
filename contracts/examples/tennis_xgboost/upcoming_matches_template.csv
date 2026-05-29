@@ -1,0 +1,2 @@
+market_id,match_id,match_date,p1_id,p2_id,p1_name,p2_name,surface,tourney_level,best_of,p1_elo,p2_elo,p1_surface_elo,p2_surface_elo,p1_rank,p2_rank,p1_seed,p2_seed,p1_age,p2_age,p1_height_cm,p2_height_cm,p1_h2h_wins,p2_h2h_wins,p1_recent_wins,p2_recent_wins,p1_recent_matches,p2_recent_matches,p1_days_since_match,p2_days_since_match,p1_decimal_odds,p2_decimal_odds
+KX-ATP-EXAMPLE,example-match,2026-06-01,player-a,player-b,Player A,Player B,Hard,A,3,1500,1500,1500,1500,10,25,,,,,,,,,,,,,,,,

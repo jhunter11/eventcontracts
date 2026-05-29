@@ -35,10 +35,16 @@ def test_kalshi_fee_rounds_up_to_cent() -> None:
     assert est.amount == Decimal("0.02")
 
 
-def test_kalshi_maker_fee_is_zero() -> None:
+def test_kalshi_maker_fee_uses_configured_maker_curve() -> None:
     model = KalshiFeeModel()
     est = model.estimate(_fill("0.50", "100", liquidity="maker"))
-    assert est.amount == Decimal("0")
+    assert est.amount == Decimal("0.44")
+
+
+def test_kalshi_maker_fee_can_be_disabled_for_no_maker_fee_series() -> None:
+    model = KalshiFeeModel(maker_rate=Decimal("0"))
+    est = model.estimate(_fill("0.50", "100", liquidity="maker"))
+    assert est.amount == Decimal("0.00")
 
 
 def test_polymarket_taker_default_2_percent() -> None:

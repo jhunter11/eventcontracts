@@ -19,14 +19,13 @@ EXPECTED_NOT_IMPLEMENTED = {
     "src/eventcontracts/features/pipeline.py": 7,
     "src/eventcontracts/gateway/base.py": 14,
     "src/eventcontracts/ledger/accounting.py": 12,
-    "src/eventcontracts/markets/detection.py": 2,
+    "src/eventcontracts/markets/detection.py": 4,
     "src/eventcontracts/models/pipeline.py": 9,
     "src/eventcontracts/normalization/contracts.py": 1,
     "src/eventcontracts/normalization/cross_venue.py": 1,
     "src/eventcontracts/observability/telemetry.py": 10,
     "src/eventcontracts/oms/state.py": 11,
     "src/eventcontracts/replay/engine.py": 1,
-    "src/eventcontracts/risk/compliance.py": 1,
 }
 
 

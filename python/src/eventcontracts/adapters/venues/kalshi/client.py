@@ -14,6 +14,7 @@ import json
 import os
 import random
 import time
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -63,19 +64,29 @@ class KalshiAuth:
 
     api_key_id: str | None = None
     private_key_path: Path | None = None
+    private_key_pem: str | None = None
 
     @classmethod
     def from_env(cls) -> KalshiAuth:
         key_id = os.getenv("KALSHI_API_KEY_ID") or None
         private_key = os.getenv("KALSHI_PRIVATE_KEY_PATH") or None
-        return cls(api_key_id=key_id, private_key_path=Path(private_key).expanduser() if private_key else None)
+        private_key_pem = os.getenv("KALSHI_PRIVATE_KEY_PEM") or None
+        return cls(
+            api_key_id=key_id,
+            private_key_path=Path(private_key).expanduser() if private_key else None,
+            private_key_pem=private_key_pem,
+        )
 
     def headers(self, method: str, url_or_path: str, *, timestamp_ms: int | None = None) -> dict[str, str]:
-        if not self.api_key_id or self.private_key_path is None:
+        if not self.api_key_id or (self.private_key_path is None and self.private_key_pem is None):
             return {}
         timestamp = str(timestamp_ms if timestamp_ms is not None else int(time.time() * 1000))
         path = _signing_path(url_or_path)
-        signature = _sign_pss_sha256(self.private_key_path, f"{timestamp}{method.upper()}{path}".encode())
+        signature = _sign_pss_sha256(
+            self.private_key_path,
+            self.private_key_pem,
+            f"{timestamp}{method.upper()}{path}".encode(),
+        )
         return {
             "KALSHI-ACCESS-KEY": self.api_key_id,
             "KALSHI-ACCESS-TIMESTAMP": timestamp,
@@ -319,6 +330,7 @@ class KalshiWebSocketClient:
         source: str = "kalshi-ws",
         base_backoff_seconds: float = 0.5,
         max_backoff_seconds: float = 30.0,
+        max_sequence_cache_size: int = 4096,
     ) -> None:
         self.ws_url = ws_url
         self.auth = auth or KalshiAuth()
@@ -326,8 +338,9 @@ class KalshiWebSocketClient:
         self.source = source
         self.base_backoff_seconds = base_backoff_seconds
         self.max_backoff_seconds = max_backoff_seconds
+        self.max_sequence_cache_size = max_sequence_cache_size
         self._next_command_id = 1
-        self._last_seq_by_sid: dict[int, int] = {}
+        self._last_seq_by_sid: OrderedDict[int, int] = OrderedDict()
 
     @classmethod
     def from_env(cls) -> KalshiWebSocketClient:
@@ -413,7 +426,7 @@ class KalshiWebSocketClient:
                     metadata["sequence_gap"] = True
                     metadata["expected_sequence"] = expected + 1
                     metadata["actual_sequence"] = seq_value
-                self._last_seq_by_sid[sid_value] = seq_value
+                self._remember_sequence(sid_value, seq_value)
 
         exchange_ts = _message_time(msg)
         return EventEnvelope(
@@ -430,6 +443,12 @@ class KalshiWebSocketClient:
     def _backoff_delay(self, attempt: int) -> float:
         capped = min(self.max_backoff_seconds, self.base_backoff_seconds * (2 ** max(0, attempt - 1)))
         return cast(float, capped + (random.random() * (capped / 4)))
+
+    def _remember_sequence(self, sid: int, sequence: int) -> None:
+        self._last_seq_by_sid[sid] = sequence
+        self._last_seq_by_sid.move_to_end(sid)
+        while len(self._last_seq_by_sid) > self.max_sequence_cache_size:
+            self._last_seq_by_sid.popitem(last=False)
 
 
 def rest_envelope(
@@ -454,7 +473,12 @@ def rest_envelope(
 
 def _default_websocket_connector(url: str, headers: Mapping[str, str]) -> Any:
     websockets = importlib.import_module("websockets")
-    return websockets.connect(url, additional_headers=dict(headers))
+    return websockets.connect(
+        url,
+        additional_headers=dict(headers),
+        ping_interval=20,
+        ping_timeout=10,
+    )
 
 
 def _signing_path(url_or_path: str) -> str:
@@ -464,13 +488,16 @@ def _signing_path(url_or_path: str) -> str:
     return url_or_path.split("?", 1)[0]
 
 
-def _sign_pss_sha256(private_key_path: Path, message: bytes) -> str:
-    if not private_key_path.exists():
-        raise FileNotFoundError(f"Kalshi private key file not found: {private_key_path}")
+def _sign_pss_sha256(private_key_path: Path | None, private_key_pem: str | None, message: bytes) -> str:
+    if private_key_pem is not None:
+        key_data = private_key_pem.encode()
+    else:
+        if private_key_path is None or not private_key_path.exists():
+            raise FileNotFoundError(f"Kalshi private key file not found: {private_key_path}")
+        key_data = private_key_path.read_bytes()
     serialization = importlib.import_module("cryptography.hazmat.primitives.serialization")
     hashes = importlib.import_module("cryptography.hazmat.primitives.hashes")
     padding = importlib.import_module("cryptography.hazmat.primitives.asymmetric.padding")
-    key_data = private_key_path.read_bytes()
     private_key = serialization.load_pem_private_key(key_data, password=None)
     signature = private_key.sign(
         message,
@@ -622,25 +649,30 @@ def _book_from_bid_ladders(
     exchange_ts: datetime | None,
     received_at: datetime,
 ) -> OrderBook:
-    yes_asks = tuple(
-        OrderBookLevel(price=Decimal("1") - level.price, quantity=level.quantity)
-        for level in reversed(no_bids)
-        if Decimal("0") <= Decimal("1") - level.price <= Decimal("1")
-    )
-    no_asks = tuple(
-        OrderBookLevel(price=Decimal("1") - level.price, quantity=level.quantity)
-        for level in reversed(yes_bids)
-        if Decimal("0") <= Decimal("1") - level.price <= Decimal("1")
-    )
+    sorted_yes_bids = _sort_levels(yes_bids, descending=True)
+    sorted_no_bids = _sort_levels(no_bids, descending=True)
     return OrderBook(
         instrument_id=instrument_id,
-        yes_bids=yes_bids,
-        yes_asks=yes_asks,
-        no_bids=no_bids,
-        no_asks=no_asks,
+        yes_bids=sorted_yes_bids,
+        yes_asks=_inverted_ask_levels(sorted_no_bids),
+        no_bids=sorted_no_bids,
+        no_asks=_inverted_ask_levels(sorted_yes_bids),
         exchange_ts=exchange_ts,
         received_at=received_at,
     )
+
+
+def _sort_levels(levels: Sequence[OrderBookLevel], *, descending: bool) -> tuple[OrderBookLevel, ...]:
+    return tuple(sorted(levels, key=lambda level: level.price, reverse=descending))
+
+
+def _inverted_ask_levels(bids: Sequence[OrderBookLevel]) -> tuple[OrderBookLevel, ...]:
+    levels = tuple(
+        OrderBookLevel(price=Decimal("1") - level.price, quantity=level.quantity)
+        for level in bids
+        if Decimal("0") <= Decimal("1") - level.price <= Decimal("1")
+    )
+    return _sort_levels(levels, descending=False)
 
 
 def _levels(raw_levels: Any) -> tuple[OrderBookLevel, ...]:
@@ -660,8 +692,7 @@ def _trade_from_payload(payload: Mapping[str, Any], *, received_at: datetime) ->
     side = OutcomeSide(str(side_raw)) if side_raw else OutcomeSide.YES
     yes_price = payload.get("yes_price_dollars") or payload.get("yes_price")
     no_price = payload.get("no_price_dollars") or payload.get("no_price")
-    price_source = no_price if side is OutcomeSide.NO and no_price is not None else yes_price or payload.get("price")
-    price = Decimal(str(price_source))
+    price = _trade_price(side=side, yes_price=yes_price, no_price=no_price, fallback=payload.get("price"))
     quantity = Decimal(str(payload.get("count_fp") or payload.get("quantity") or payload.get("count") or "0"))
     trade_ts = _message_time(payload) or received_at
     return Trade(
@@ -675,3 +706,22 @@ def _trade_from_payload(payload: Mapping[str, Any], *, received_at: datetime) ->
         aggressor_side=side,
         metadata={"raw_venue": "kalshi"},
     )
+
+
+def _trade_price(
+    *,
+    side: OutcomeSide,
+    yes_price: object,
+    no_price: object,
+    fallback: object,
+) -> Decimal:
+    if side is OutcomeSide.NO:
+        if no_price is not None:
+            return Decimal(str(no_price))
+        if yes_price is not None:
+            return Decimal("1") - Decimal(str(yes_price))
+    if yes_price is not None:
+        return Decimal(str(yes_price))
+    if no_price is not None:
+        return Decimal("1") - Decimal(str(no_price))
+    return Decimal(str(fallback))

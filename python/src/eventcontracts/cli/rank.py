@@ -128,7 +128,7 @@ def _handle(args: argparse.Namespace) -> int:
     if not args.results.exists():
         print(f"error: results file not found: {args.results}")
         return 2
-    table = pq.read_table(args.results)  # type: ignore[no-untyped-call]
+    table = pq.read_table(args.results)
     rows: list[dict[str, Any]] = list(table.to_pylist())
     if not rows:
         print(f"rank: {args.results} contains 0 rows")

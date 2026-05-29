@@ -14,13 +14,22 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, TypeAlias
 
 from eventcontracts.domain.fills import Fill
 from eventcontracts.domain.ids import EventId
 from eventcontracts.domain.lifecycle import MarketLifecycleEvent, SettlementEvent
 from eventcontracts.domain.metadata import FrozenMap, freeze_mapping
-from eventcontracts.domain.models import OrderBook, Quote, Trade, Venue
+from eventcontracts.domain.models import (
+    MarketSnapshot,
+    OrderBook,
+    OrderBookLevel,
+    OutcomeSide,
+    Quote,
+    Trade,
+    Venue,
+)
 from eventcontracts.domain.orders import Order, OrderReject
 from eventcontracts.domain.validation import (
     require_aware_datetime,
@@ -216,3 +225,65 @@ def event_kind(event: NormalizedEvent) -> str:
             return "own_order_update"
         case OwnOrderRejectEvent():
             return "own_order_reject"
+        case _:
+            raise TypeError(f"unsupported event variant: {type(event).__name__}")
+
+
+def market_snapshot_from_quote_event(
+    event: QuoteEvent,
+    *,
+    side: OutcomeSide | None = None,
+) -> MarketSnapshot:
+    """Build executable BBO evidence from a normalized quote event."""
+
+    quote = event.quote
+    snapshot_side = side or quote.side
+    bid = quote.bid
+    ask = quote.ask
+    if snapshot_side is not quote.side:
+        bid = (
+            OrderBookLevel(price=Decimal("1") - quote.ask.price, quantity=quote.ask.quantity)
+            if quote.ask is not None
+            else None
+        )
+        ask = (
+            OrderBookLevel(price=Decimal("1") - quote.bid.price, quantity=quote.bid.quantity)
+            if quote.bid is not None
+            else None
+        )
+    return MarketSnapshot(
+        instrument_id=quote.instrument_id,
+        side=snapshot_side,
+        bid=bid,
+        ask=ask,
+        exchange_ts=quote.exchange_ts,
+        received_at=quote.received_at,
+        source=event.provenance.source,
+        source_sequence=event.provenance.source_sequence,
+        sequence_gap=bool(event.provenance.metadata.get("sequence_gap", False)),
+        metadata={"event_id": str(event.event_id), "channel": event.provenance.channel},
+    )
+
+
+def market_snapshot_from_book_event(
+    event: OrderBookEvent,
+    *,
+    side: OutcomeSide,
+) -> MarketSnapshot:
+    """Build executable top-of-book evidence from a normalized order book."""
+
+    book = event.book
+    bids = book.yes_bids if side is OutcomeSide.YES else book.no_bids
+    asks = book.yes_asks if side is OutcomeSide.YES else book.no_asks
+    return MarketSnapshot(
+        instrument_id=book.instrument_id,
+        side=side,
+        bid=bids[0] if bids else None,
+        ask=asks[0] if asks else None,
+        exchange_ts=book.exchange_ts,
+        received_at=book.received_at,
+        source=event.provenance.source,
+        source_sequence=event.provenance.source_sequence,
+        sequence_gap=bool(event.provenance.metadata.get("sequence_gap", False)),
+        metadata={"event_id": str(event.event_id), "channel": event.provenance.channel},
+    )

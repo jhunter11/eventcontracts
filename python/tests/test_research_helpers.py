@@ -6,9 +6,16 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
-from eventcontracts.domain.events import EventProvenance, TradeEvent
+from eventcontracts.domain.events import EventProvenance, QuoteEvent, TradeEvent
 from eventcontracts.domain.ids import EventId
-from eventcontracts.domain.models import InstrumentId, OutcomeSide, Trade, Venue
+from eventcontracts.domain.models import (
+    InstrumentId,
+    OrderBookLevel,
+    OutcomeSide,
+    Quote,
+    Trade,
+    Venue,
+)
 from eventcontracts.research import (
     backtest_one,
     compare_runs,
@@ -21,15 +28,33 @@ from tests.conftest import REPO_ROOT
 
 def _seed(root: Path) -> None:
     store = ParquetEventStore(root)
+    instrument = InstrumentId(venue=Venue.KALSHI, market_id="M-1", outcome_id=None)
     for i, price in enumerate(["0.46", "0.44", "0.42", "0.40"]):
         ts = datetime(2026, 1, 1, second=i, tzinfo=UTC)
+        store.append_normalized(
+            QuoteEvent(
+                event_id=EventId(f"q-{i:03d}"),
+                quote=Quote(
+                    instrument_id=instrument,
+                    side=OutcomeSide.YES,
+                    bid=OrderBookLevel(price=Decimal("0.39"), quantity=Decimal("100")),
+                    ask=OrderBookLevel(price=Decimal("0.40"), quantity=Decimal("100")),
+                    exchange_ts=ts,
+                    received_at=ts,
+                ),
+                provenance=EventProvenance(
+                    source="fixture",
+                    channel="quote",
+                    venue=Venue.KALSHI,
+                    source_sequence=f"q-{i}",
+                ),
+            )
+        )
         store.append_normalized(
             TradeEvent(
                 event_id=EventId(f"t-{i:03d}"),
                 trade=Trade(
-                    instrument_id=InstrumentId(
-                        venue=Venue.KALSHI, market_id="M-1", outcome_id=None
-                    ),
+                    instrument_id=instrument,
                     side=OutcomeSide.YES,
                     price=Decimal(price),
                     quantity=Decimal("10"),

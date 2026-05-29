@@ -16,6 +16,7 @@ from eventcontracts.domain.validation import (
     require_non_empty,
     require_optional_aware_datetime,
     require_probability_decimal,
+    require_utc_datetime,
 )
 
 
@@ -24,6 +25,7 @@ class MarketLifecycleKind(str, Enum):
     OPENED = "opened"
     PAUSED = "paused"
     RESUMED = "resumed"
+    METADATA_UPDATED = "metadata_updated"
     CLOSED = "closed"
     DETERMINED = "determined"
     DISPUTED = "disputed"
@@ -59,6 +61,6 @@ class SettlementEvent:
 
     def __post_init__(self) -> None:
         require_probability_decimal(self.payout_per_contract, "payout_per_contract")
-        require_aware_datetime(self.settled_at, "settled_at")
+        require_utc_datetime(self.settled_at, "settled_at")
         require_non_empty(self.source, "source")
         object.__setattr__(self, "metadata", freeze_mapping(self.metadata))

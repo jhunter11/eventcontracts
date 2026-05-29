@@ -22,12 +22,28 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from eventcontracts.domain.decisions import StrategyDecision
+from eventcontracts.domain.decisions import IntentEnvelope, StrategyDecision
 from eventcontracts.domain.events import NormalizedEvent
+from eventcontracts.domain.ids import ClientOrderId
 from eventcontracts.domain.spec import StrategySpec
 from eventcontracts.strategy.context import StrategyContext
+
+
+@dataclass(frozen=True)
+class StrategyFeedback:
+    """Runner feedback about an emitted decision.
+
+    Strategies may use this to advance local pending state only after the
+    framework has accepted, rejected, or terminally resolved an intent.
+    """
+
+    kind: str
+    envelope: IntentEnvelope
+    client_order_id: ClientOrderId | None = None
+    reasons: tuple[str, ...] = ()
 
 
 @runtime_checkable
@@ -41,6 +57,8 @@ class Strategy(Protocol):
     ) -> Sequence[StrategyDecision]: ...
 
     def on_shutdown(self, ctx: StrategyContext) -> None: ...
+
+    def on_feedback(self, feedback: StrategyFeedback, ctx: StrategyContext) -> None: ...
 
     def snapshot(self) -> bytes: ...
 
@@ -66,6 +84,9 @@ class StrategyBase(ABC):
     ) -> Sequence[StrategyDecision]: ...
 
     def on_shutdown(self, ctx: StrategyContext) -> None:
+        return None
+
+    def on_feedback(self, feedback: StrategyFeedback, ctx: StrategyContext) -> None:
         return None
 
     def snapshot(self) -> bytes:

@@ -16,6 +16,7 @@ dependencies = []
 
 [project.scripts]
 eventcontracts = "eventcontracts.cli:main"
+ec = "eventcontracts.cli:main"
 
 [project.entry-points."eventcontracts.strategies"]
 example_threshold = "eventcontracts.plugins.strategies.example_threshold"
@@ -46,3 +47,19 @@ known-first-party = ["eventcontracts", "tests"]
 python_version = "3.11"
 strict = true
 files = ["src/eventcontracts", "tests"]
+# Third-party deps (pyarrow / polars / duckdb) lack type stubs in our env.
+# Globally ignore missing imports — `strict = true` still enforces our own
+# code, but unwrapped third-party imports won't error. Per-module overrides
+# didn't suppress the `import-untyped` / `import-not-found` codes from
+# mypy 1.x's strict mode reliably.
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# pyarrow / duckdb / polars now ship a partial `py.typed`, so strict mode's
+# `disallow_untyped_calls` flags every call into them even though the call sites
+# are correct. They are untyped C-extension boundaries (the code already casts
+# `pa`/`pq` to Any by hand). Treat them as Any so our own strictness is
+# preserved without spurious `no-untyped-call` noise on third-party calls.
+module = ["pyarrow.*", "duckdb.*", "polars.*"]
+follow_imports = "skip"
+follow_imports_for_stubs = true

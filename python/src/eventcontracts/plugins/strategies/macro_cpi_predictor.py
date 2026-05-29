@@ -26,6 +26,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import timedelta
 from decimal import Decimal
 from uuid import uuid4
 
@@ -39,10 +40,11 @@ from eventcontracts.domain.events import (
     NormalizedEvent,
     QuoteEvent,
     TimerEvent,
+    market_snapshot_from_quote_event,
 )
 from eventcontracts.domain.ids import ClientOrderId
 from eventcontracts.domain.latency import ExecutionPriority, LatencyTier
-from eventcontracts.domain.models import InstrumentId, OutcomeSide, Venue
+from eventcontracts.domain.models import InstrumentId, MarketSnapshot, OutcomeSide, Venue
 from eventcontracts.domain.orders import OrderSide, OrderType, TimeInForce
 from eventcontracts.domain.spec import StrategySpec
 from eventcontracts.strategy.base import StrategyBase
@@ -72,6 +74,7 @@ class MacroCpiPredictorStrategy(StrategyBase):
         self.alpha = Decimal(str(spec.parameters.get("alpha", "0.6")))
         self.min_shift_bps = Decimal(str(spec.parameters.get("min_shift_bps", "50")))
         self.size = Decimal(str(spec.parameters.get("size", "5")))
+        self.order_ttl_ms = int(spec.parameters.get("order_ttl_ms", 5000))
         venue_value = str(spec.parameters.get("venue", "kalshi"))
         try:
             self.venue = Venue(venue_value)
@@ -83,10 +86,9 @@ class MacroCpiPredictorStrategy(StrategyBase):
         self._kalshi_implied_mean: Decimal | None = None
         # Latest implied probability per bracket market_id.
         self._bracket_implied: dict[str, Decimal] = {}
+        self._bracket_snapshots: dict[str, MarketSnapshot] = {}
 
-    def on_event(
-        self, event: NormalizedEvent, ctx: StrategyContext
-    ) -> Sequence[StrategyDecision]:
+    def on_event(self, event: NormalizedEvent, ctx: StrategyContext) -> Sequence[StrategyDecision]:
         if isinstance(event, ExternalSignalEvent):
             self._update_signal(event)
             return (NoAction(reason="signal_updated"),)
@@ -104,10 +106,7 @@ class MacroCpiPredictorStrategy(StrategyBase):
         ):
             return (NoAction(reason="warmup:insufficient_state"),)
 
-        model_mean = (
-            self.alpha * self._alt_inflation
-            + (Decimal("1") - self.alpha) * self._cleveland_nowcast
-        )
+        model_mean = self.alpha * self._alt_inflation + (Decimal("1") - self.alpha) * self._cleveland_nowcast
         # Implied current mean = sum of (bracket midpoint * implied probability).
         if self._kalshi_implied_mean is None:
             implied_mean = sum(
@@ -134,22 +133,22 @@ class MacroCpiPredictorStrategy(StrategyBase):
         target_price = self._bracket_implied.get(target_bracket.market_id)
         if target_price is None:
             return (NoAction(reason="warmup:target_bracket_mid_unknown"),)
+        snapshot = self._bracket_snapshots.get(target_bracket.market_id)
 
         return (
             PlaceOrder(
                 client_order_id=ClientOrderId(uuid4().hex),
-                instrument_id=InstrumentId(
-                    venue=self.venue, market_id=target_bracket.market_id
-                ),
+                instrument_id=InstrumentId(venue=self.venue, market_id=target_bracket.market_id),
                 outcome_side=OutcomeSide.YES,
                 order_side=OrderSide.BUY,
                 order_type=OrderType.LIMIT,
-                time_in_force=TimeInForce.GTC,
+                time_in_force=TimeInForce.GTD,
                 quantity=self.size,
                 price=target_price,
+                expires_at=ctx.now + timedelta(milliseconds=self.order_ttl_ms),
+                market_snapshot=snapshot,
                 reason=(
-                    f"cpi_model_mean_{model_mean:.4f}_implied_{implied_mean:.4f}"
-                    f"_target_{target_bracket.market_id}"
+                    f"cpi_model_mean_{model_mean:.4f}_implied_{implied_mean:.4f}_target_{target_bracket.market_id}"
                 ),
                 expected_edge_bps=shift_bps,
                 priority=ExecutionPriority(tier=LatencyTier.RELAXED),
@@ -181,6 +180,10 @@ class MacroCpiPredictorStrategy(StrategyBase):
             return
         mid = (quote.bid.price + quote.ask.price) / Decimal("2")
         self._bracket_implied[quote.instrument_id.market_id] = mid
+        self._bracket_snapshots[quote.instrument_id.market_id] = market_snapshot_from_quote_event(
+            event,
+            side=OutcomeSide.YES,
+        )
 
 
 @register("macro_cpi_predictor")
@@ -197,10 +200,7 @@ def _parse_brackets(raw: str) -> tuple[_Bracket, ...]:
             continue
         parts = [part.strip() for part in item.split(":")]
         if len(parts) != 3 or not all(parts):
-            raise ValueError(
-                "brackets must be semicolon-separated "
-                "market_id:lower_bound:upper_bound entries"
-            )
+            raise ValueError("brackets must be semicolon-separated market_id:lower_bound:upper_bound entries")
         market_id, lower_bound, upper_bound = parts
         brackets.append(
             _Bracket(

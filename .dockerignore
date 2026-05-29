@@ -1,0 +1,33 @@
+# Build caches
+target
+rust/target
+.git
+.venv
+__pycache__
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Secrets and credential material — never bake into image layers.
+.env
+.env.*
+*.pem
+*.key
+*.p8
+*.p12
+demokey.txt
+ecmodel.txt
+*credentials*
+*secret*
+
+# Data + research artifacts (not needed at runtime; mounted explicitly if so)
+data/
+notebooks/
+artifacts/
+*.parquet
+*.ipynb
+
+# Documentation + tooling
+docs/
+*.md
+.github/

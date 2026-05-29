@@ -21,9 +21,8 @@ pub trait FromSpec: Sized {
     fn from_spec(spec: &StrategySpecArtifact) -> Result<Self, SpecError>;
 }
 
-type Factory = Box<
-    dyn Fn(&StrategySpecArtifact) -> Result<Box<dyn StrategyRuntime>, SpecError> + Send + Sync,
->;
+type Factory =
+    Box<dyn Fn(&StrategySpecArtifact) -> Result<Box<dyn StrategyRuntime>, SpecError> + Send + Sync>;
 
 pub struct StrategyRegistry {
     factories: HashMap<String, Factory>,
@@ -52,14 +51,23 @@ impl StrategyRegistry {
         &self,
         spec: &StrategySpecArtifact,
     ) -> Result<Box<dyn StrategyRuntime>, SpecError> {
-        let factory = self
-            .factories
-            .get(spec.name.as_str())
-            .ok_or_else(|| SpecError::UnknownStrategy {
-                name: spec.name.clone(),
-                version: spec.version.clone(),
-            })?;
-        factory(spec)
+        if let Some(factory) = self.factories.get(spec.name.as_str()) {
+            return factory(spec);
+        }
+        let archetype = spec
+            .tags
+            .get("archetype")
+            .or_else(|| spec.tags.get("strategy_archetype"))
+            .map(String::as_str);
+        if archetype == Some("external_edge")
+            || spec.param_str_or("archetype", "") == "external_edge"
+        {
+            return Ok(Box::new(crate::ExternalEdgeStrategy::from_spec(spec)?));
+        }
+        Err(SpecError::UnknownStrategy {
+            name: spec.name.clone(),
+            version: spec.version.clone(),
+        })
     }
 
     pub fn registered_names(&self) -> Vec<&str> {
@@ -92,6 +100,9 @@ pub fn default_registry() -> StrategyRegistry {
     r.register("example_threshold", |spec| {
         Ok(Box::new(crate::ThresholdStrategy::from_spec(spec)?))
     });
+    r.register("sports_tennis_xgboost", |spec| {
+        Ok(Box::new(crate::TennisXgboostStrategy::from_spec(spec)?))
+    });
     r
 }
 
@@ -121,6 +132,7 @@ size = "10"
         let names = r.registered_names();
         assert!(names.contains(&"weather_threshold"));
         assert!(names.contains(&"example_threshold"));
+        assert!(names.contains(&"sports_tennis_xgboost"));
     }
 
     #[test]
@@ -128,6 +140,46 @@ size = "10"
         let r = default_registry();
         let strat = r.instantiate(&weather_spec()).unwrap();
         assert_eq!(strat.strategy_id(), "weather-threshold-v1");
+    }
+
+    #[test]
+    fn instantiate_returns_runtime_for_tennis_strategy() {
+        let r = default_registry();
+        let spec = StrategySpecArtifact::from_toml_str(
+            r#"
+strategy_id = "sports-tennis-xgboost-v1"
+name = "sports_tennis_xgboost"
+version = "1.0.0"
+[parameters]
+prediction_source = "tennis_xgboost_onnx"
+min_edge_bps = "150"
+size = "5"
+"#,
+        )
+        .unwrap();
+        let strat = r.instantiate(&spec).unwrap();
+        assert_eq!(strat.strategy_id(), "sports-tennis-xgboost-v1");
+    }
+
+    #[test]
+    fn unknown_external_edge_archetype_instantiates_config_only_runtime() {
+        let r = default_registry();
+        let spec = StrategySpecArtifact::from_toml_str(
+            r#"
+strategy_id = "flu-hospitalization-surge-v1"
+name = "flu_hospitalization_surge"
+version = "1.0.0"
+[parameters]
+signal_source = "public-health-nowcast"
+min_edge_bps = "150"
+size = "3"
+[tags]
+archetype = "external_edge"
+"#,
+        )
+        .unwrap();
+        let strat = r.instantiate(&spec).unwrap();
+        assert_eq!(strat.strategy_id(), "flu-hospitalization-surge-v1");
     }
 
     #[test]

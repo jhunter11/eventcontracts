@@ -18,11 +18,14 @@ from eventcontracts.cli import capture_weather as capture_weather_cmd
 from eventcontracts.cli import gen_windows as gen_windows_cmd
 from eventcontracts.cli import inspect_data as inspect_data_cmd
 from eventcontracts.cli import live_paper as live_paper_cmd
+from eventcontracts.cli import migrate_data as migrate_data_cmd
 from eventcontracts.cli import normalize as normalize_cmd
 from eventcontracts.cli import rank as rank_cmd
 from eventcontracts.cli import replay as replay_cmd
 from eventcontracts.cli import sports_golf as sports_golf_cmd
+from eventcontracts.cli import strategy_tools as strategy_tools_cmd
 from eventcontracts.cli import sweep as sweep_cmd
+from eventcontracts.cli import tennis_xgboost as tennis_xgboost_cmd
 from eventcontracts.cli import train as train_cmd
 from eventcontracts.cli import validate_bundle as validate_bundle_cmd
 from eventcontracts.cli import weather as weather_cmd
@@ -49,9 +52,7 @@ def _handle_check_config(args: argparse.Namespace) -> int:
 
 
 def _register_validate_config(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    parser = subparsers.add_parser(
-        "validate-config", help="Validate a TOML config against a known schema."
-    )
+    parser = subparsers.add_parser("validate-config", help="Validate a TOML config against a known schema.")
     parser.add_argument("kind", choices=("strategy", "sleeve", "storage", "venue"))
     parser.add_argument("path", type=Path)
     parser.set_defaults(handler=_handle_validate_config)
@@ -79,13 +80,16 @@ def build_parser() -> argparse.ArgumentParser:
     capture_weather_cmd.register(subparsers)
     live_paper_cmd.register(subparsers)
     normalize_cmd.register(subparsers)
+    migrate_data_cmd.register(subparsers)
     inspect_data_cmd.register(subparsers)
     replay_cmd.register(subparsers)
     sweep_cmd.register(subparsers)
     gen_windows_cmd.register(subparsers)
     rank_cmd.register(subparsers)
     train_cmd.register(subparsers)
+    tennis_xgboost_cmd.register(subparsers)
     sports_golf_cmd.register(subparsers)
+    strategy_tools_cmd.register(subparsers)
     weather_cmd.register(subparsers)
     validate_bundle_cmd.register(subparsers)
 

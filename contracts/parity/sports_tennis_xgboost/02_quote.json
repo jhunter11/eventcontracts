@@ -1,0 +1,52 @@
+{
+  "case_id": "sports_tennis_xgboost_02_quote",
+  "event": {
+    "event_id": "tennis:quote:1",
+    "event_kind": "quote",
+    "payload_json": "{\"instrument\":\"kalshi:KX-ATP-DEMO\",\"bid\":\"0.55\",\"ask\":\"0.57\"}",
+    "provenance": {
+      "source": "kalshi-ws",
+      "channel": "ticker",
+      "schema_version": "kalshi-ws-v1",
+      "venue": "kalshi",
+      "source_sequence": "2",
+      "normalization_version": "kalshi-ws-v1",
+      "metadata": {}
+    },
+    "audit": {
+      "object_id": "tennis:quote:1",
+      "object_kind": "normalized_event",
+      "schema_version": "normalized-event-v1",
+      "produced_at": "2026-05-26T12:00:01Z",
+      "producer": "external-fixture",
+      "canonical_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "parent_ids": [],
+      "trace_id": null,
+      "metadata": {}
+    }
+  },
+  "feature_vector": null,
+  "expected_decisions": [
+    {
+      "strategy_id": "sports-tennis-xgboost-v1",
+      "sleeve_id": "sports-tennis-xgboost-v1-sleeve",
+      "correlation_id": "expected-1",
+      "emitted_at": "2026-05-26T12:00:01Z",
+      "decision_kind": "place_order",
+      "decision_json": "{\"kind\":\"place_order\",\"client_order_id\":\"c-tennis-buy-00000001\",\"instrument_id\":\"kalshi:KX-ATP-DEMO\",\"outcome_side\":\"Yes\",\"side\":\"Buy\",\"price\":\"0.57\",\"quantity\":\"5\",\"fair_price\":\"0.7\",\"min_executable_edge_ticks\":150,\"time_in_force\":\"Ioc\"}",
+      "priority_tier": "relaxed",
+      "audit": {
+        "object_id": "expected-1",
+        "object_kind": "intent",
+        "schema_version": "intent-envelope-v1",
+        "produced_at": "2026-05-26T12:00:01Z",
+        "producer": "external-fixture",
+        "canonical_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "parent_ids": [],
+        "trace_id": null,
+        "metadata": {}
+      }
+    }
+  ],
+  "tolerance_bps": "0"
+}

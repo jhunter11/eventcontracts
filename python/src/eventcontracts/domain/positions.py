@@ -34,6 +34,9 @@ class Position:
         require_non_negative_decimal(self.quantity, "quantity")
         require_non_negative_decimal(self.average_price, "average_price")
         require_aware_datetime(self.updated_at, "updated_at")
+        if self.quantity == Decimal("0"):
+            object.__setattr__(self, "average_price", Decimal("0"))
+            object.__setattr__(self, "unrealized_pnl", Decimal("0"))
 
 
 @dataclass(frozen=True)

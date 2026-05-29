@@ -8,7 +8,7 @@ currency = "USD"
 [risk]
 max_order_notional = "400"
 max_position_notional = "2000"
-max_daily_loss = "400"
+max_daily_loss = "2000"
 max_open_orders = 15
 max_gross_exposure = "2000"
 currency = "USD"

@@ -2,8 +2,8 @@
 
 Subscribes to fills and quote events. Maintains per-(instrument, side)
 positions with weighted-average cost basis, accumulates realized PnL
-on closing fills, and marks open positions to the latest quote mid for
-unrealized PnL.
+on closing fills, and marks open positions to the latest quote. Reporting
+defaults to mid marks; risk drawdown is fed from liquidation marks.
 
 This is the in-process accountant used by backtests. A live sleeve
 would replace this with a service backed by a double-entry ledger, but
@@ -18,6 +18,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from eventcontracts.domain.events import NormalizedEvent, QuoteEvent, SettlementResolvedEvent
+from eventcontracts.domain.fees import FeeModel, FillContext
 from eventcontracts.domain.fills import Fill
 from eventcontracts.domain.lifecycle import SettlementEvent
 from eventcontracts.domain.models import InstrumentId, OutcomeSide
@@ -36,6 +37,7 @@ class PositionRecord:
     average_price: Decimal = Decimal("0")
     realized_pnl: Decimal = Decimal("0")
     mark_price: Decimal | None = None
+    liquidation_mark_price: Decimal | None = None
     updated_at: datetime | None = None
 
     def to_position(self, now: datetime) -> Position:
@@ -55,6 +57,14 @@ class PositionRecord:
             updated_at=self.updated_at or now,
         )
 
+    def unrealized_pnl(self, *, mode: str = "mid") -> Decimal:
+        if self.quantity <= 0:
+            return Decimal("0")
+        mark = self.liquidation_mark_price if mode == "liquidation" else self.mark_price
+        if mark is None:
+            mark = self.average_price
+        return (mark - self.average_price) * self.quantity
+
 
 @dataclass
 class PnLTracker:
@@ -62,9 +72,15 @@ class PnLTracker:
 
     currency: str = "USD"
     daily_loss_ledger: DailyLossLedger | None = None
+    settlement_fee_model: FeeModel | None = None
+    mark_mode: str = "mid"
     records: dict[tuple[InstrumentId, OutcomeSide], PositionRecord] = field(default_factory=dict)
     total_fees_paid: Decimal = Decimal("0")
     cumulative_realized: Decimal = Decimal("0")
+
+    def __post_init__(self) -> None:
+        if self.mark_mode not in {"mid", "liquidation"}:
+            raise ValueError("mark_mode must be 'mid' or 'liquidation'")
 
     def _record(self, instrument_id: InstrumentId, side: OutcomeSide) -> PositionRecord:
         key = (instrument_id, side)
@@ -105,6 +121,8 @@ class PnLTracker:
         if fill.order_side is OrderSide.BUY:
             rec.realized_pnl -= fill.fee_amount
             self.cumulative_realized -= fill.fee_amount
+            if self.daily_loss_ledger is not None and fill.fee_amount > 0:
+                self.daily_loss_ledger.record_realized_pnl(-fill.fee_amount, fill.filled_at)
 
         rec.updated_at = fill.filled_at
 
@@ -113,14 +131,28 @@ class PnLTracker:
 
         if isinstance(event, QuoteEvent):
             quote = event.quote
-            rec = self._record(quote.instrument_id, quote.side)
+            rec = self.records.get((quote.instrument_id, quote.side))
+            if rec is None:
+                return
+            mid_mark: Decimal | None = None
+            liquidation_mark: Decimal | None = None
             if quote.bid is not None and quote.ask is not None:
-                rec.mark_price = (quote.bid.price + quote.ask.price) / Decimal("2")
+                mid_mark = (quote.bid.price + quote.ask.price) / Decimal("2")
+                liquidation_mark = quote.bid.price
             elif quote.bid is not None:
-                rec.mark_price = quote.bid.price
+                mid_mark = quote.bid.price
+                liquidation_mark = quote.bid.price
             elif quote.ask is not None:
-                rec.mark_price = quote.ask.price
+                mid_mark = quote.ask.price
+                liquidation_mark = quote.ask.price
+            rec.mark_price = liquidation_mark if self.mark_mode == "liquidation" else mid_mark
+            rec.liquidation_mark_price = liquidation_mark
             rec.updated_at = quote.received_at
+            if self.daily_loss_ledger is not None:
+                self.daily_loss_ledger.record_unrealized_pnl(
+                    self.unrealized_pnl(now=quote.received_at, mark_mode="liquidation"),
+                    quote.received_at,
+                )
         elif isinstance(event, SettlementResolvedEvent):
             self.on_settlement(event.settlement)
 
@@ -147,15 +179,42 @@ class PnLTracker:
                 if side is settlement.resolved_side
                 else Decimal("0")
             )
-            realized = (payout - rec.average_price) * rec.quantity
+            settlement_fee = self._settlement_fee(
+                settlement.instrument_id,
+                side,
+                payout,
+                rec.quantity,
+            )
+            realized = ((payout - rec.average_price) * rec.quantity) - settlement_fee
             rec.realized_pnl += realized
             self.cumulative_realized += realized
+            self.total_fees_paid += settlement_fee
             if self.daily_loss_ledger is not None:
                 self.daily_loss_ledger.record_realized_pnl(realized, settlement.settled_at)
             rec.quantity = Decimal("0")
             rec.average_price = Decimal("0")
             rec.mark_price = payout
             rec.updated_at = settlement.settled_at
+
+    def _settlement_fee(
+        self,
+        instrument_id: InstrumentId,
+        side: OutcomeSide,
+        payout: Decimal,
+        quantity: Decimal,
+    ) -> Decimal:
+        if self.settlement_fee_model is None:
+            return Decimal("0")
+        estimate = self.settlement_fee_model.estimate(
+            FillContext(
+                instrument_id=instrument_id,
+                side=side,
+                price=payout,
+                quantity=quantity,
+                liquidity="settlement",
+            )
+        )
+        return estimate.amount
 
     # ---------- inspection ----------
 
@@ -175,12 +234,12 @@ class PnLTracker:
         )
 
     def total_pnl(self, *, now: datetime) -> Decimal:
-        unrealized = sum(
-            (
-                rec.to_position(now).unrealized_pnl
-                for rec in self.records.values()
-                if rec.quantity > 0
-            ),
+        return self.cumulative_realized + self.unrealized_pnl(now=now)
+
+    def unrealized_pnl(self, *, now: datetime, mark_mode: str | None = None) -> Decimal:
+        del now
+        mode = mark_mode or self.mark_mode
+        return sum(
+            (rec.unrealized_pnl(mode=mode) for rec in self.records.values() if rec.quantity > 0),
             Decimal("0"),
         )
-        return self.cumulative_realized + unrealized

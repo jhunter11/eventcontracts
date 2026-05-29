@@ -73,3 +73,22 @@ def test_market_detector_filters_status_and_limits_results() -> None:
 
     assert len(candidates) == 1
     assert candidates[0].market.status is MarketStatus.OPEN
+
+
+def test_market_catalog_refresh_and_ticker_rename() -> None:
+    old = InstrumentId(venue=Venue.KALSHI, market_id="WEATHER-OLD")
+    new = InstrumentId(venue=Venue.KALSHI, market_id="WEATHER-NEW")
+    catalog = InMemoryMarketCatalog([_market(old.market_id)])
+
+    catalog.on_ticker_rename(old, new)
+
+    assert catalog.get(old) is None
+    renamed = catalog.get(new)
+    assert renamed is not None
+    assert renamed.instrument_id == new
+
+    catalog.refresh([_market("WEATHER-REFRESHED")])
+    assert catalog.get(new) is None
+    assert [market.instrument_id.market_id for market in catalog.list_markets()] == [
+        "WEATHER-REFRESHED"
+    ]

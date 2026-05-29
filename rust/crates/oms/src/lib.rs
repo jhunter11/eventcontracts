@@ -19,8 +19,10 @@
 //! ```
 
 use eventcontracts_contracts::{require_decimal_string, require_non_empty, ContractError};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use thiserror::Error;
 
 // ---------- error ----------
@@ -39,6 +41,8 @@ pub enum OmsError {
         fill: String,
         remaining: String,
     },
+    #[error("decimal parse failed for field `{field}` with value `{value}`")]
+    Decimal { field: &'static str, value: String },
     #[error("contract validation failed: {0}")]
     Contract(#[from] ContractError),
 }
@@ -52,6 +56,16 @@ pub enum Side {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum OutcomeSide {
+    Yes,
+    No,
+}
+
+fn default_outcome_side() -> OutcomeSide {
+    OutcomeSide::Yes
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum TimeInForce {
     Gtc,
     Ioc,
@@ -62,6 +76,7 @@ pub enum TimeInForce {
 pub enum OrderState {
     Created,
     Submitted,
+    SubmitUnknown,
     Acked,
     PartiallyFilled,
     Filled,
@@ -84,6 +99,8 @@ pub struct Order {
     pub client_order_id: String,
     pub venue_order_id: Option<String>,
     pub instrument_id: String,
+    #[serde(default = "default_outcome_side")]
+    pub outcome_side: OutcomeSide,
     pub side: Side,
     pub price: String,
     pub quantity: String,
@@ -105,6 +122,29 @@ impl Order {
         tif: TimeInForce,
         created_at: impl Into<String>,
     ) -> Result<Self, OmsError> {
+        Self::new_with_outcome(
+            client_order_id,
+            instrument_id,
+            OutcomeSide::Yes,
+            side,
+            price,
+            quantity,
+            tif,
+            created_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_outcome(
+        client_order_id: impl Into<String>,
+        instrument_id: impl Into<String>,
+        outcome_side: OutcomeSide,
+        side: Side,
+        price: impl Into<String>,
+        quantity: impl Into<String>,
+        tif: TimeInForce,
+        created_at: impl Into<String>,
+    ) -> Result<Self, OmsError> {
         let client_order_id = client_order_id.into();
         let instrument_id = instrument_id.into();
         let price = price.into();
@@ -118,6 +158,7 @@ impl Order {
             client_order_id,
             venue_order_id: None,
             instrument_id,
+            outcome_side,
             side,
             price,
             quantity,
@@ -130,8 +171,9 @@ impl Order {
         })
     }
 
-    pub fn remaining(&self) -> f64 {
-        parse_decimal(&self.quantity) - parse_decimal(&self.filled_quantity)
+    pub fn remaining(&self) -> Result<Decimal, OmsError> {
+        Ok(parse_decimal("quantity", &self.quantity)?
+            - parse_decimal("filled_quantity", &self.filled_quantity)?)
     }
 }
 
@@ -152,16 +194,32 @@ fn transition_allowed(from: OrderState, to: OrderState) -> bool {
     matches!(
         (from, to),
         (Created, Submitted)
+            | (Submitted, SubmitUnknown)
+            | (SubmitUnknown, Acked)
+            | (SubmitUnknown, Rejected)
+            | (SubmitUnknown, Canceled)
+            | (SubmitUnknown, Expired)
+            | (SubmitUnknown, PartiallyFilled)
+            | (SubmitUnknown, Filled)
             | (Submitted, Acked)
             | (Submitted, Rejected)
             | (Submitted, Canceled)
+            | (Submitted, Expired)
+            // Venues can deliver fills before the "resting"/"acked" status
+            // update, especially on IOC and crossable limits. Allow direct
+            // Submitted → PartiallyFilled / Filled rather than stalling the
+            // OMS with IllegalTransition when the fill arrives first.
+            | (Submitted, PartiallyFilled)
+            | (Submitted, Filled)
             | (Acked, PartiallyFilled)
             | (Acked, Filled)
             | (Acked, Canceled)
+            | (Acked, Rejected)
             | (Acked, Expired)
             | (PartiallyFilled, PartiallyFilled)
             | (PartiallyFilled, Filled)
             | (PartiallyFilled, Canceled)
+            | (PartiallyFilled, Rejected)
             | (PartiallyFilled, Expired)
     )
 }
@@ -172,6 +230,11 @@ fn transition_allowed(from: OrderState, to: OrderState) -> bool {
 pub struct InMemoryOms {
     orders: HashMap<String, Order>,
     applied_fills: HashSet<(String, String)>,
+    /// Running count of non-terminal orders, maintained on every transition
+    /// so callers don't have to iterate the full `orders` HashMap to ask
+    /// "how many are live?". The previous `open_orders().count()` was O(N)
+    /// in cumulative orders ever created.
+    open_count: u64,
 }
 
 impl InMemoryOms {
@@ -179,9 +242,38 @@ impl InMemoryOms {
         Self::default()
     }
 
+    /// O(1) — non-terminal order count. Source of truth for `open_orders`
+    /// sleeve-state field. Maintained by `open_order` + `transition` +
+    /// `apply_fill`.
+    pub fn open_count(&self) -> u64 {
+        self.open_count
+    }
+
     pub fn open_order(&mut self, order: Order) -> Result<(), OmsError> {
         if self.orders.contains_key(&order.client_order_id) {
             return Err(OmsError::DuplicateOrder(order.client_order_id.clone()));
+        }
+        // New orders start in `Created` which is non-terminal.
+        self.open_count = self.open_count.saturating_add(1);
+        self.orders.insert(order.client_order_id.clone(), order);
+        Ok(())
+    }
+
+    /// Adopt an order whose truth source is the venue, usually during startup
+    /// reconciliation after querying resting orders. This intentionally
+    /// bypasses the Created -> Submitted -> Acked submit path because the
+    /// current process did not create the order.
+    pub fn adopt_order(&mut self, order: Order) -> Result<(), OmsError> {
+        if self.orders.contains_key(&order.client_order_id) {
+            return Err(OmsError::DuplicateOrder(order.client_order_id.clone()));
+        }
+        require_non_empty("client_order_id", &order.client_order_id)?;
+        require_non_empty("instrument_id", &order.instrument_id)?;
+        require_decimal_string("price", &order.price)?;
+        require_decimal_string("quantity", &order.quantity)?;
+        require_decimal_string("filled_quantity", &order.filled_quantity)?;
+        if !order.state.is_terminal() {
+            self.open_count = self.open_count.saturating_add(1);
         }
         self.orders.insert(order.client_order_id.clone(), order);
         Ok(())
@@ -189,6 +281,10 @@ impl InMemoryOms {
 
     pub fn get(&self, client_order_id: &str) -> Option<&Order> {
         self.orders.get(client_order_id)
+    }
+
+    pub fn orders(&self) -> impl Iterator<Item = &Order> {
+        self.orders.values()
     }
 
     pub fn transition(
@@ -208,10 +304,17 @@ impl InMemoryOms {
                 to,
             });
         }
+        let was_terminal = order.state.is_terminal();
+        let now_terminal = to.is_terminal();
         order.state = to;
         order.last_update_at = now.to_string();
         if let Some(reason) = reject_reason {
             order.last_reject_reason = Some(reason.to_string());
+        }
+        // Maintain O(1) open count: only the live→terminal edge decrements.
+        // Created→Submitted→Acked→PartiallyFilled stay non-terminal.
+        if !was_terminal && now_terminal {
+            self.open_count = self.open_count.saturating_sub(1);
         }
         Ok(order)
     }
@@ -236,27 +339,32 @@ impl InMemoryOms {
         if self.applied_fills.contains(&key) {
             return Ok(false);
         }
+        require_non_empty("fill_id", &fill.fill_id)?;
         require_decimal_string("price", &fill.price)?;
         require_decimal_string("quantity", &fill.quantity)?;
+        require_decimal_string("fee", &fill.fee)?;
+        let _fill_price = parse_decimal("price", &fill.price)?;
+        let fill_qty = parse_decimal("quantity", &fill.quantity)?;
+        let _fee = parse_decimal("fee", &fill.fee)?;
 
         let order = self
             .orders
             .get_mut(&fill.client_order_id)
             .ok_or_else(|| OmsError::UnknownOrder(fill.client_order_id.clone()))?;
-        let fill_qty = parse_decimal(&fill.quantity);
-        let remaining = parse_decimal(&order.quantity) - parse_decimal(&order.filled_quantity);
-        if fill_qty - remaining > 1e-9 {
+        let total = parse_decimal("order.quantity", &order.quantity)?;
+        let previously_filled = parse_decimal("filled_quantity", &order.filled_quantity)?;
+        let remaining = total - previously_filled;
+        if fill_qty > remaining {
             return Err(OmsError::Overfill {
                 order_id: order.client_order_id.clone(),
                 fill: fill.quantity.clone(),
                 remaining: format_decimal(remaining),
             });
         }
-        let new_filled = parse_decimal(&order.filled_quantity) + fill_qty;
+        let new_filled = previously_filled + fill_qty;
         order.filled_quantity = format_decimal(new_filled);
         order.last_update_at = fill.trade_ts.clone();
-        let total = parse_decimal(&order.quantity);
-        let next_state = if (new_filled - total).abs() < 1e-9 {
+        let next_state = if new_filled == total {
             OrderState::Filled
         } else {
             OrderState::PartiallyFilled
@@ -267,7 +375,12 @@ impl InMemoryOms {
                 to: next_state,
             });
         }
+        let was_terminal = order.state.is_terminal();
+        let now_terminal = next_state.is_terminal();
         order.state = next_state;
+        if !was_terminal && now_terminal {
+            self.open_count = self.open_count.saturating_sub(1);
+        }
         self.applied_fills.insert(key);
         Ok(true)
     }
@@ -278,16 +391,18 @@ impl InMemoryOms {
 }
 
 // ---------- numeric helpers ----------
-// Decimal-as-string is the cross-language contract; OMS uses f64 only for
-// internal arithmetic. Production grade decimal math would use `rust_decimal`;
-// this is intentional to keep the dependency set minimal until the parity gate.
+// Decimal-as-string is the cross-language contract. OMS parses those strings
+// into exact base-10 decimals and rejects malformed values on the hot path.
 
-fn parse_decimal(s: &str) -> f64 {
-    s.parse::<f64>().unwrap_or(0.0)
+fn parse_decimal(field: &'static str, s: &str) -> Result<Decimal, OmsError> {
+    Decimal::from_str(s).map_err(|_| OmsError::Decimal {
+        field,
+        value: s.to_string(),
+    })
 }
 
-fn format_decimal(v: f64) -> String {
-    format!("{v}")
+fn format_decimal(v: Decimal) -> String {
+    v.to_string()
 }
 
 #[cfg(test)]
@@ -309,7 +424,8 @@ mod tests {
     }
 
     fn t(oms: &mut InMemoryOms, id: &str, to: OrderState) {
-        oms.transition(id, to, "2026-05-26T12:00:01Z", None).unwrap();
+        oms.transition(id, to, "2026-05-26T12:00:01Z", None)
+            .unwrap();
     }
 
     #[test]
@@ -363,6 +479,24 @@ mod tests {
     }
 
     #[test]
+    fn decimal_format_preserves_trailing_zero_scale() {
+        let mut oms = InMemoryOms::new();
+        place(&mut oms, "c-scale", "10.00");
+        t(&mut oms, "c-scale", OrderState::Submitted);
+        t(&mut oms, "c-scale", OrderState::Acked);
+        oms.apply_fill(Fill {
+            fill_id: "f-scale".into(),
+            client_order_id: "c-scale".into(),
+            price: "0.50".into(),
+            quantity: "4.00".into(),
+            fee: "0.00".into(),
+            trade_ts: "2026-05-26T12:00:02Z".into(),
+        })
+        .unwrap();
+        assert_eq!(oms.get("c-scale").unwrap().filled_quantity, "4.00");
+    }
+
+    #[test]
     fn duplicate_fill_is_idempotent() {
         let mut oms = InMemoryOms::new();
         place(&mut oms, "c-3", "10");
@@ -398,6 +532,59 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, OmsError::Overfill { .. }));
+    }
+
+    #[test]
+    fn malformed_fill_quantity_is_rejected_not_zeroed() {
+        let mut oms = InMemoryOms::new();
+        place(&mut oms, "c-bad", "5");
+        t(&mut oms, "c-bad", OrderState::Submitted);
+        t(&mut oms, "c-bad", OrderState::Acked);
+        let err = oms
+            .apply_fill(Fill {
+                fill_id: "f-bad".into(),
+                client_order_id: "c-bad".into(),
+                price: "0.50".into(),
+                quantity: "abc".into(),
+                fee: "0".into(),
+                trade_ts: "2026-05-26T12:00:02Z".into(),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OmsError::Contract(ContractError::InvalidDecimal("quantity"))
+        ));
+        let order = oms.get("c-bad").unwrap();
+        assert_eq!(order.filled_quantity, "0");
+        assert_eq!(order.state, OrderState::Acked);
+    }
+
+    #[test]
+    fn venue_can_reject_after_ack_or_partial_fill() {
+        let mut oms = InMemoryOms::new();
+        place(&mut oms, "c-rej", "10");
+        t(&mut oms, "c-rej", OrderState::Submitted);
+        t(&mut oms, "c-rej", OrderState::Acked);
+        t(&mut oms, "c-rej", OrderState::Rejected);
+        assert_eq!(oms.get("c-rej").unwrap().state, OrderState::Rejected);
+
+        place(&mut oms, "c-partial-rej", "10");
+        t(&mut oms, "c-partial-rej", OrderState::Submitted);
+        t(&mut oms, "c-partial-rej", OrderState::Acked);
+        oms.apply_fill(Fill {
+            fill_id: "f-p".into(),
+            client_order_id: "c-partial-rej".into(),
+            price: "0.50".into(),
+            quantity: "2".into(),
+            fee: "0".into(),
+            trade_ts: "2026-05-26T12:00:02Z".into(),
+        })
+        .unwrap();
+        t(&mut oms, "c-partial-rej", OrderState::Rejected);
+        assert_eq!(
+            oms.get("c-partial-rej").unwrap().state,
+            OrderState::Rejected
+        );
     }
 
     #[test]
@@ -457,8 +644,13 @@ mod tests {
         t(&mut oms, "live", OrderState::Submitted);
         t(&mut oms, "live", OrderState::Acked);
         t(&mut oms, "done", OrderState::Submitted);
-        oms.transition("done", OrderState::Rejected, "2026-05-26T12:00:01Z", Some("venue_busy"))
-            .unwrap();
+        oms.transition(
+            "done",
+            OrderState::Rejected,
+            "2026-05-26T12:00:01Z",
+            Some("venue_busy"),
+        )
+        .unwrap();
         let ids: Vec<&str> = oms
             .open_orders()
             .map(|o| o.client_order_id.as_str())

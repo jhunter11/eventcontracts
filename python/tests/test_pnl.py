@@ -10,6 +10,7 @@ from eventcontracts.domain.events import (
     QuoteEvent,
     SettlementResolvedEvent,
 )
+from eventcontracts.domain.fees import FeeEstimate, FeeModel, FillContext
 from eventcontracts.domain.fills import Fill
 from eventcontracts.domain.ids import (
     ClientOrderId,
@@ -108,6 +109,36 @@ def test_mark_to_market_updates_unrealized() -> None:
     assert pos.unrealized_pnl == Decimal("11.00")
 
 
+def test_liquidation_mark_uses_bid_for_long_inventory() -> None:
+    pnl = PnLTracker(mark_mode="liquidation")
+    pnl.on_fill(_fill(price="0.40", qty="100", side=OrderSide.BUY))
+    pnl.on_event(_quote_event("0.50", "0.60"))
+
+    pos = pnl.position(INSTR, OutcomeSide.YES, now=NOW)
+
+    assert pos is not None
+    assert pos.unrealized_pnl == Decimal("10.00")
+
+
+def test_unrealized_drawdown_reaches_daily_loss_ledger_without_close() -> None:
+    ledger = DailyLossLedger()
+    pnl = PnLTracker(daily_loss_ledger=ledger)
+    pnl.on_fill(_fill(price="0.60", qty="100", side=OrderSide.BUY))
+    pnl.on_event(_quote_event("0.40", "0.50"))
+
+    assert ledger.loss_for(NOW) == Decimal("0")
+    assert ledger.unrealized_drawdown_for(NOW) == Decimal("20.00")
+    assert ledger.total_loss_for(NOW) == Decimal("20.00")
+
+
+def test_quote_without_position_does_not_create_position_record() -> None:
+    pnl = PnLTracker()
+
+    pnl.on_event(_quote_event("0.50", "0.52"))
+
+    assert pnl.records == {}
+
+
 def test_fees_reduce_realized() -> None:
     pnl = PnLTracker()
     pnl.on_fill(_fill(price="0.40", qty="100", side=OrderSide.BUY, fee="2.80"))
@@ -189,6 +220,29 @@ def test_settlement_loss_reaches_daily_loss_ledger() -> None:
     pnl.on_event(_settlement_event(resolved_side=OutcomeSide.NO))
     # Loss = -60. Reported as +60 in the ledger.
     assert ledger.loss_for(NOW) == Decimal("60")
+
+
+class _FlatSettlementFeeModel(FeeModel):
+    name = "flat-settlement"
+
+    def estimate(self, fill: FillContext) -> FeeEstimate:
+        return FeeEstimate(
+            amount=Decimal("2.50"),
+            currency="USD",
+            model_name=self.name,
+        )
+
+
+def test_settlement_fee_model_reduces_realized_pnl_and_ledger_net() -> None:
+    ledger = DailyLossLedger()
+    pnl = PnLTracker(daily_loss_ledger=ledger, settlement_fee_model=_FlatSettlementFeeModel())
+    pnl.on_fill(_fill(price="0.90", qty="10", side=OrderSide.BUY))
+
+    pnl.on_event(_settlement_event(resolved_side=OutcomeSide.YES, payout="1.00"))
+
+    assert pnl.total_fees_paid == Decimal("2.50")
+    assert pnl.cumulative_realized == Decimal("-1.50")
+    assert ledger.loss_for(NOW) == Decimal("1.50")
 
 
 def test_unresolved_settlement_does_not_realize() -> None:

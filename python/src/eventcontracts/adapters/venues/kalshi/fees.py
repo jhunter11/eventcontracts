@@ -1,19 +1,9 @@
 """Kalshi fee model.
 
-Kalshi charges a per-fill trading fee on most markets. The published
-formula is::
-
-    fee_cents = ceil(100 * 0.07 * price * (1 - price) * contracts)
-
-with ``price`` in dollars (i.e. between 0 and 1). The fee is paid in
-USD and rounded up to the nearest cent. Some market families
-(e.g. some FX or rate markets) use a reduced rate; pass ``rate`` to
-override.
-
-References:
-
-- https://kalshi.com/docs/fees
-- https://kalshi.com/docs/api (commissions section)
+Kalshi charges per-fill trading fees on expected earnings. The standard taker
+curve is 7% of ``price * (1 - price) * contracts`` rounded up to the nearest
+cent. Some series also charge maker fees; the default maker curve here is the
+published 1.75% formula so passive strategy tests do not assume free fills.
 """
 
 from __future__ import annotations
@@ -27,27 +17,18 @@ from eventcontracts.domain.fees import FeeEstimate, FeeModel, FillContext
 @dataclass(frozen=True)
 class KalshiFeeModel(FeeModel):
     rate: Decimal = Decimal("0.07")
+    maker_rate: Decimal = Decimal("0.0175")
     currency: str = "USD"
     name: str = "kalshi-fill-level"
 
     def estimate(self, fill: FillContext) -> FeeEstimate:
-        # Always paid by the taker side of the trade. For maker fills,
-        # Kalshi rebates nothing (fee remains zero) but the executor
-        # may still call us with liquidity="maker" — return zero.
-        if fill.liquidity == "maker":
-            return FeeEstimate(
-                amount=Decimal("0"),
-                currency=self.currency,
-                model_name=self.name,
-                notes=("maker-rebate-implicit",),
-            )
-
+        rate = self.maker_rate if fill.liquidity == "maker" else self.rate
         notional_per_contract = fill.price * (Decimal("1") - fill.price)
-        raw = self.rate * notional_per_contract * fill.quantity
-        # Round up to the cent.
+        raw = rate * notional_per_contract * fill.quantity
         amount = raw.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
         return FeeEstimate(
             amount=amount,
             currency=self.currency,
             model_name=self.name,
+            notes=(("maker-fee",) if fill.liquidity == "maker" else ()),
         )

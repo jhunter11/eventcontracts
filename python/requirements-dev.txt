@@ -1,7 +1,15 @@
 # Development and test tooling.
-# Install with: python3 -m pip install -r requirements-dev.txt
 -r requirements.txt
 
-pytest>=8.0
-mypy>=1.10
-ruff>=0.5
+pytest==9.0.2
+mypy==1.19.1
+ruff==0.14.14
+pip-audit==2.9.0
+
+# Research-only model training/export.
+xgboost==3.1.2
+onnx==1.20.0
+onnxmltools==1.14.0
+onnxruntime==1.23.2
+scikit-learn==1.8.0
+matplotlib==3.10.8

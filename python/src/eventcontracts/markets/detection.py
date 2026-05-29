@@ -9,7 +9,7 @@ plug-and-play while preserving the runner/gateway boundaries.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from fnmatch import fnmatchcase
 
@@ -68,6 +68,12 @@ class MarketCatalog:
     def get(self, instrument_id: InstrumentId) -> Market | None:
         raise NotImplementedError
 
+    def refresh(self, markets: Iterable[Market]) -> None:
+        raise NotImplementedError
+
+    def on_ticker_rename(self, old: InstrumentId, new: InstrumentId) -> None:
+        raise NotImplementedError
+
 
 class InMemoryMarketCatalog(MarketCatalog):
     """Deterministic catalog for tests, replay, and paper market discovery."""
@@ -82,6 +88,16 @@ class InMemoryMarketCatalog(MarketCatalog):
     def extend(self, markets: Iterable[Market]) -> None:
         for market in markets:
             self.upsert(market)
+
+    def refresh(self, markets: Iterable[Market]) -> None:
+        self._markets = {}
+        self.extend(markets)
+
+    def on_ticker_rename(self, old: InstrumentId, new: InstrumentId) -> None:
+        market = self._markets.pop(old, None)
+        if market is None:
+            return
+        self._markets[new] = replace(market, instrument_id=new)
 
     def list_markets(self, venue: Venue | None = None) -> Sequence[Market]:
         markets = (

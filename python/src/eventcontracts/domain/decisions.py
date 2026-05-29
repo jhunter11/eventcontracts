@@ -27,9 +27,10 @@ from eventcontracts.domain.ids import (
 )
 from eventcontracts.domain.latency import DEFAULT_EXECUTION_PRIORITY, ExecutionPriority
 from eventcontracts.domain.metadata import FrozenMap, freeze_mapping
-from eventcontracts.domain.models import InstrumentId, OutcomeSide
+from eventcontracts.domain.models import InstrumentId, MarketSnapshot, OutcomeSide
 from eventcontracts.domain.orders import OrderSide, OrderType, TimeInForce
 from eventcontracts.domain.validation import (
+    require_aware_datetime,
     require_non_empty,
     require_optional_aware_datetime,
     require_positive_decimal,
@@ -54,6 +55,7 @@ class PlaceOrder:
     quantity: Decimal
     price: Decimal | None = None
     expires_at: datetime | None = None
+    market_snapshot: MarketSnapshot | None = None
     reason: str = ""
     expected_edge_bps: Decimal | None = None
     priority: ExecutionPriority | None = None
@@ -85,6 +87,7 @@ class ReplaceOrder:
     client_order_id: ClientOrderId
     new_price: Decimal | None = None
     new_quantity: Decimal | None = None
+    market_snapshot: MarketSnapshot | None = None
     reason: str = ""
     priority: ExecutionPriority | None = None
 
@@ -134,7 +137,7 @@ class IntentEnvelope:
         require_non_empty(str(self.strategy_id), "strategy_id")
         require_non_empty(str(self.sleeve_id), "sleeve_id")
         require_non_empty(str(self.correlation_id), "correlation_id")
-        require_optional_aware_datetime(self.emitted_at, "emitted_at")
+        require_aware_datetime(self.emitted_at, "emitted_at")
         object.__setattr__(self, "metadata", freeze_mapping(self.metadata))
 
 
@@ -151,6 +154,8 @@ def decision_kind(decision: StrategyDecision) -> str:
             return "alert"
         case NoAction():
             return "no_action"
+        case _:
+            raise TypeError(f"unsupported decision variant: {type(decision).__name__}")
 
 
 def decision_priority(

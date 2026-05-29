@@ -11,7 +11,11 @@ import httpx
 import pytest
 
 from eventcontracts.cli import main as cli_main
-from eventcontracts.cli.weather import candlesticks_to_book_events, parse_kalshi_temperature_contract
+from eventcontracts.cli.weather import (
+    candlesticks_to_book_events,
+    candlesticks_to_quote_events,
+    parse_kalshi_temperature_contract,
+)
 from eventcontracts.domain.models import InstrumentId, Venue
 from eventcontracts.weather import (
     OpenMeteoClient,
@@ -145,16 +149,29 @@ def test_weather_historical_cli_runs_fixture_backtest(
     assert payload["signal_events"] == 4
     assert payload["decisions_emitted"] > 0
     report = json.loads(Path(payload["report"]).read_text(encoding="utf-8"))
-    assert report["fills"] > 0
+    assert report["intents_dispatched"] > 0
+    assert report["fills_are_hypothetical"] is True
+    assert report["liquidity_assumption"] == "historical_candle_synthetic_top_of_book"
 
 
 def test_kalshi_candle_volume_sets_synthetic_book_depth() -> None:
     instrument = InstrumentId(venue=Venue.KALSHI, market_id="KXHIGHNY-26MAY24-B75")
 
-    book = next(iter(candlesticks_to_book_events(_candles_payload(), instrument=instrument))).book
+    event = next(iter(candlesticks_to_book_events(_candles_payload(), instrument=instrument)))
+    book = event.book
 
     assert book.yes_bids[0].quantity == 10
     assert book.yes_asks[0].quantity == 10
+    assert event.provenance.metadata["synthetic_liquidity"] is True
+
+
+def test_kalshi_candle_quotes_mark_synthetic_liquidity() -> None:
+    instrument = InstrumentId(venue=Venue.KALSHI, market_id="KXHIGHNY-26MAY24-B75")
+
+    event = next(iter(candlesticks_to_quote_events(_candles_payload(), instrument=instrument)))
+
+    assert event.provenance.source_sequence == "KXHIGHNY-26MAY24-B75:0"
+    assert event.provenance.metadata["synthetic_liquidity"] is True
 
 
 def _weather_payload() -> dict[str, object]:

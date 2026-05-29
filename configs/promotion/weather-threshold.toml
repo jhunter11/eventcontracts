@@ -1,0 +1,5 @@
+strategy_spec = "../../contracts/examples/weather_threshold/strategy_spec.toml"
+parity_cases = "../../contracts/parity/weather_threshold"
+stage = "paper"
+promoted = true
+

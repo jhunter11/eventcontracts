@@ -7,13 +7,24 @@ publish.workspace = true
 
 [dependencies]
 eventcontracts-contracts = { path = "../contracts" }
+eventcontracts-feature-builder = { path = "../feature-builder" }
 eventcontracts-gateway = { path = "../gateway" }
 eventcontracts-oms = { path = "../oms" }
 eventcontracts-risk = { path = "../risk" }
+eventcontracts-runtime-hot = { path = "../runtime-hot" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 toml = "0.8"
+
+[dev-dependencies]
+criterion = { workspace = true }
+eventcontracts-kalshi = { path = "../kalshi" }
+time = { version = "0.3", default-features = false, features = ["std", "macros"] }
+
+[[bench]]
+name = "external_replay"
+harness = false
 
 [lib]
 path = "src/lib.rs"

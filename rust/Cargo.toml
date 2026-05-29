@@ -8,17 +8,17 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/allocator",
-    "crates/bus",
     "crates/contracts",
     "crates/feature-builder",
     "crates/gateway",
     "crates/kalshi",
     "crates/live-runner",
+    "crates/model-runtime",
     "crates/oms",
     "crates/parity",
     "crates/risk",
     "crates/runner",
+    "crates/runtime-hot",
 ]
 
 [workspace.package]
@@ -28,5 +28,11 @@ publish = false
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 thiserror = "1"
+smol_str = { version = "0.2", features = ["serde"] }
+arrayvec = { version = "0.7", features = ["serde"] }
+rust_decimal = { version = "1", features = ["serde"] }
+sha2 = "0.10"
+criterion = "0.5"
+async-trait = "0.1"
