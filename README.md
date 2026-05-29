@@ -235,8 +235,13 @@ rate-limit allocation, but never to bypass risk checks.
 
 ## Live Trading Boundary
 
-This project intentionally has no live-ordering implementation yet. The minimum
-safe path is:
+A gated live-ordering path now exists: the Rust `rust/crates/live-runner` with
+`--live-submit` routes intents through risk + the Kalshi gateway/venue client to
+place real orders. It is **off by default** and guarded (explicit `KALSHI_ENV`,
+mandatory `--max-live-orders`, startup reconciliation, a confirmation prompt, a
+file kill switch, and a toxicity breaker). Everything else runs paper/backtest.
+
+The safe path each strategy must clear before real capital:
 
 1. Real venue capture.
 2. Raw event persistence.
@@ -244,5 +249,8 @@ safe path is:
 4. Strategy/runner parity in backtest and paper.
 5. Paper execution with fees, slippage, latency, queue, pauses, and settlement.
 6. Risk, compliance, reconciliation, credentials, and gateway isolation.
+7. Cross-language parity: any model/feature/risk change must agree Python↔Rust.
 
-Only after those are in place should a live executor be added.
+Read `docs/runbooks/kalshi-live-runner.md` before enabling real orders. Note the
+two risk gates are **not** fully identical (e.g. `max_daily_loss` latches in
+Python but not in Rust) — the Rust gate is authoritative for live.
