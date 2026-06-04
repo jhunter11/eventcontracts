@@ -24,8 +24,13 @@ alpha = "0.60"
 min_shift_bps = "50"
 size = "5"
 order_ttl_ms = 5000
+# v7 contract: treat the bracket set as one implied distribution and only trade
+# pre-release. `ladder_no_arb` (monotone CDF + sum-to-one) enforcement is the
+# deferred Rust-ladder-archetype promotion step; the per-bracket path runs today.
+pre_release_only = true
+ladder_no_arb = true
 
 [tags]
 family = "macro"
 mode = "paper"
-research_doc = "docs/strategy-specs.md#11"
+research_doc = "docs/v7-live-test-ready-strategy-specs.md"

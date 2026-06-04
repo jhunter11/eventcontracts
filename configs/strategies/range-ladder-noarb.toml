@@ -1,0 +1,35 @@
+strategy_id = "range-ladder-noarb-v1"
+name = "kalshi_noarb_scanner"
+version = "1.0.0"
+description = "Cumulative threshold-ladder no-arbitrage scanner: flags P(>=t) monotonicity violations on CPI/equity/Brent ladders."
+feature_schema_id = "range_ladder_noarb_features"
+
+[subscription]
+venues = ["kalshi"]
+# Point at the cumulative ladder family you are scanning (CPI / equity / Brent).
+instrument_patterns = ["KXCPI*"]
+event_kinds = ["quote"]
+
+[default_execution_priority]
+tier = "standard"
+max_delay_ms = 1000
+expires_after_ms = 2000
+reason = "logical monotonicity check, not a sub-100ms race"
+
+[parameters]
+# Cumulative (">= threshold") ladder: P(>=t) must be non-increasing in t.
+# `ask(low) < bid(high)` is flagged as a two-leg lock (execution deferred for
+# leg risk). PLACEHOLDERS: replace with live cumulative-ladder tickers.
+brackets = "KXCPI-EXAMPLE-T02:0.002:1;KXCPI-EXAMPLE-T03:0.003:1;KXCPI-EXAMPLE-T04:0.004:1"
+ladder_kind = "cumulative"
+min_edge_bps = "100"
+size = "5"
+max_quote_age_seconds = "30"
+venue = "kalshi"
+
+[tags]
+family = "arbitrage"
+mode = "paper"
+archetype = "arb"
+research_doc = "docs/v7-live-test-ready-strategy-specs.md#6-intra-kalshi-no-arb-scanner"
+note = "cumulative-mode config of kalshi_noarb_scanner; brackets are placeholders"

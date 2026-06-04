@@ -1,0 +1,52 @@
+{
+  "case_id": "entertainment_box_office_02_signal",
+  "event": {
+    "event_id": "box:signal:1",
+    "event_kind": "external",
+    "payload_json": "{\"market_id\":\"KXBOXOFFICE-WEEKEND\",\"seat_occupancy_pct\":\"0.8\",\"ticket_velocity_per_hour\":\"1000000\",\"confidence\":\"0.9\"}",
+    "provenance": {
+      "source": "apify-fandango",
+      "channel": "external",
+      "schema_version": "apify-fandango-v1",
+      "venue": "kalshi",
+      "source_sequence": "2",
+      "normalization_version": "normalizer-v1",
+      "metadata": {}
+    },
+    "audit": {
+      "object_id": "box:signal:1",
+      "object_kind": "normalized_event",
+      "schema_version": "normalized-event-v1",
+      "produced_at": "2026-05-26T12:00:01Z",
+      "producer": "external-fixture",
+      "canonical_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "parent_ids": [],
+      "trace_id": null,
+      "metadata": {}
+    }
+  },
+  "feature_vector": null,
+  "expected_decisions": [
+    {
+      "strategy_id": "entertainment-box_office-v2",
+      "sleeve_id": "entertainment-box_office-v2-sleeve",
+      "correlation_id": "expected-1",
+      "emitted_at": "2026-05-26T12:00:01Z",
+      "decision_kind": "place_order",
+      "decision_json": "{\"kind\":\"place_order\",\"client_order_id\":\"c-box-00000001\",\"instrument_id\":\"kalshi:KXBOXOFFICE-WEEKEND\",\"outcome_side\":\"Yes\",\"side\":\"Buy\",\"price\":\"0.56\",\"quantity\":\"10\",\"fair_price\":\"0.68\",\"min_executable_edge_ticks\":500,\"time_in_force\":\"Gtc\"}",
+      "priority_tier": "relaxed",
+      "audit": {
+        "object_id": "expected-1",
+        "object_kind": "intent",
+        "schema_version": "intent-envelope-v1",
+        "produced_at": "2026-05-26T12:00:01Z",
+        "producer": "external-fixture",
+        "canonical_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "parent_ids": [],
+        "trace_id": null,
+        "metadata": {}
+      }
+    }
+  ],
+  "tolerance_bps": "0"
+}

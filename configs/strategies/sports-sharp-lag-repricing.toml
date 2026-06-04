@@ -1,0 +1,35 @@
+strategy_id = "sports-sharp-lag-repricing-v1"
+name = "external_edge"
+version = "1.0.0"
+description = "Generic sports moneyline repricing: de-vigged sharp-book consensus vs Kalshi mid (market-anchored residual)."
+feature_schema_id = "sports_sharp_lag_features"
+
+[subscription]
+venues = ["kalshi"]
+# Major-league moneylines. Confirm exact series tickers via REST discovery.
+instrument_patterns = ["KXMLB*", "KXNBA*", "KXNFL*", "KXNHL*"]
+event_kinds = ["quote", "external"]
+external_sources = ["sharp-consensus"]
+
+[default_execution_priority]
+tier = "standard"
+max_delay_ms = 500
+expires_after_ms = 60000
+reason = "pregame sharp-lag edge has seconds-to-minutes half-life; news shocks help but source quality dominates"
+
+[parameters]
+# Producer publishes a de-vigged sharp-consensus YES probability per market.
+# Edge type: market-anchoring residual (Kalshi lags the sharp book). Trade only
+# when Kalshi lags by enough; the standalone classifier is dominated by the line.
+signal_source = "sharp-consensus"
+min_edge_bps = "200"
+size = "5"
+confidence_floor = "0"
+venue = "kalshi"
+
+[tags]
+family = "sports"
+mode = "paper"
+archetype = "external_edge"
+research_doc = "docs/v7-live-test-ready-strategy-specs.md"
+note = "de-vig + rule-align + measure lag before trusting; wide books only as measured maker"

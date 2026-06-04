@@ -2,15 +2,15 @@ sleeve_id = "weather-kalshi-paper-a"
 strategy_id = "weather-temperature_arbitrage-v1"
 strategy_version = "1.0.0"
 venue = "kalshi"
-capital_allocation = "10000"
+capital_allocation = "10"
 currency = "USD"
 
 [risk]
-max_order_notional = "1000"
-max_position_notional = "10000"
-max_daily_loss = "5000"
+max_order_notional = "2"
+max_position_notional = "10"
+max_daily_loss = "10"
 max_open_orders = 100
-max_gross_exposure = "10000"
+max_gross_exposure = "10"
 currency = "USD"
 
 [tags]

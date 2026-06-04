@@ -1,0 +1,42 @@
+{
+  "NY": {
+    "station": "NY",
+    "bias_f": -0.4809,
+    "sigma_f": 1.6486,
+    "n": 731,
+    "monthly_bias_f": {},
+    "min_sigma_f": 0.75
+  },
+  "CHI": {
+    "station": "CHI",
+    "bias_f": 0.4259,
+    "sigma_f": 0.9788,
+    "n": 731,
+    "monthly_bias_f": {},
+    "min_sigma_f": 0.75
+  },
+  "MIA": {
+    "station": "MIA",
+    "bias_f": 1.3485,
+    "sigma_f": 1.1002,
+    "n": 731,
+    "monthly_bias_f": {},
+    "min_sigma_f": 0.75
+  },
+  "_meta": {
+    "generated_at": null,
+    "generated_by": "python/scripts/weather_calibration_report.py",
+    "fit_method": "recency_weighted",
+    "half_life_days": 21.0,
+    "warmup_days": 120,
+    "lead_semantics": "sigma fit on the Open-Meteo historical-forecast archive at ~nowcast lead; lead>=1 brackets are over-confident (see docs/weather-kxhigh-validation-and-edge-spec.md Phase 2). The live producer and offline recorder both emit only lead==0 signals.",
+    "source_dataset": "data/weather-calib/{NY,CHI,MIA}.csv",
+    "source_api": "historical-forecast-api.open-meteo.com",
+    "stations": {
+      "NY": { "n": 731, "first_day": "2024-05-27", "last_day": "2026-05-27" },
+      "CHI": { "n": 731, "first_day": "2024-05-27", "last_day": "2026-05-27" },
+      "MIA": { "n": 731, "first_day": "2024-05-27", "last_day": "2026-05-27" }
+    },
+    "note": "Backfilled provenance for a pre-existing committed artifact; generated_at is unrecorded for this fit. Re-run weather_calibration_report.py to repopulate generated_at and refresh the trailing-window fit."
+  }
+}

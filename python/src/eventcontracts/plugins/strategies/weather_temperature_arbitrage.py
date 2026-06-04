@@ -20,8 +20,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from decimal import ROUND_FLOOR, Decimal
+from datetime import UTC, datetime, timedelta
+from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from uuid import uuid4
 
 from eventcontracts.domain.decisions import (
@@ -32,8 +32,10 @@ from eventcontracts.domain.decisions import (
 from eventcontracts.domain.events import (
     ExternalSignalEvent,
     NormalizedEvent,
+    OrderBookEvent,
     QuoteEvent,
     SettlementResolvedEvent,
+    market_snapshot_from_book_event,
     market_snapshot_from_quote_event,
 )
 from eventcontracts.domain.ids import ClientOrderId
@@ -44,6 +46,21 @@ from eventcontracts.strategy.base import StrategyBase, StrategyFeedback
 from eventcontracts.strategy.context import StrategyContext
 from eventcontracts.strategy.pricing import buy_limit_from_fair
 from eventcontracts.strategy.registry import register
+
+
+def _fair_price_4dp(value: Decimal) -> str:
+    """Cap a fair value at 4 decimal places (the 1e4 grid the risk gate, gateway
+    `parse_fixed_4` and Kalshi's whole-cent settlement all require). A raw model
+    probability like 0.967731 would otherwise stringify to >4 dp and be rejected
+    as InvalidNumeric. Mirrors the Rust `format_decimal_ticks` fix and the tennis
+    strategy's `_fair_price_4dp` for Python<->Rust parity.
+    """
+    quantized = value.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+    text = format(quantized, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
 
 
 class WeatherTemperatureArbitrageStrategy(StrategyBase):
@@ -75,10 +92,17 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
         self.max_ticker_orders = int(spec.parameters.get("max_ticker_orders", 1_000_000))
         self.min_retrade_price_delta = Decimal(str(spec.parameters.get("min_retrade_price_delta", "0.00")))
         self.min_retrade_probability_delta = Decimal(str(spec.parameters.get("min_retrade_probability_delta", "0.00")))
+        self.quote_triggered_trading = _truthy(spec.parameters.get("quote_triggered_trading", "false"))
+        self.max_signal_age_seconds = int(spec.parameters.get("max_signal_age_seconds", 900))
+        # Don't open new positions within this many seconds of market close (0 = off).
+        # The producer carries the absolute `close_time` in the payload; remaining
+        # time is recomputed against ctx.now on every decision, including re-fires.
+        self.min_seconds_to_close = int(spec.parameters.get("min_seconds_to_close", 0))
         # Last known market mid per instrument; updated on QuoteEvent.
         self._mid_by_instrument: dict[InstrumentId, Decimal] = {}
         self._quote_by_instrument: dict[InstrumentId, tuple[Decimal, Decimal]] = {}
         self._snapshot_by_instrument: dict[InstrumentId, MarketSnapshot] = {}
+        self._latest_signal_by_instrument: dict[InstrumentId, _LatestWeatherSignal] = {}
         self._submitted_notional_by_ladder: dict[str, Decimal] = {}
         self._submitted_notional_by_instrument: dict[InstrumentId, Decimal] = {}
         self._active_notional = Decimal("0")
@@ -94,11 +118,32 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
             return (NoAction(reason=f"settlement_released_notional_{released}"),)
         if isinstance(event, QuoteEvent):
             self._track_mid(event)
-            return (NoAction(reason="quote_mid_updated"),)
+            if not self.quote_triggered_trading:
+                return (NoAction(reason="quote_mid_updated"),)
+            return self._quote_tick_decision(event, ctx)
+        if isinstance(event, OrderBookEvent):
+            self._track_book(event)
+            if not self.quote_triggered_trading:
+                return (NoAction(reason="book_updated"),)
+            return self._book_tick_decision(event, ctx)
         if not isinstance(event, ExternalSignalEvent):
             return (NoAction(reason="ignored:not_external_signal"),)
         if event.source != self.signal_source:
             return (NoAction(reason=f"ignored:source!={self.signal_source}"),)
+
+        # Defense in depth: never trade a signal that prices a non-current day. The
+        # KXHIGH producer already suppresses lead!=0 (its calibration sigma is
+        # nowcast-lead and over-confident for future days), but other producers
+        # might not. When `lead_days` is absent the signal predates this contract
+        # and is allowed through unchanged.
+        lead_days = event.payload.get("lead_days")
+        if lead_days is not None:
+            try:
+                lead_int = int(lead_days)
+            except (TypeError, ValueError):
+                return (NoAction(reason="censored:lead_days_unparsable"),)
+            if lead_int != 0:
+                return (NoAction(reason=f"censored:lead_days_{lead_int}"),)
 
         implied_prob = event.payload.get("implied_prob")
         instrument_payload = event.payload.get("instrument_id")
@@ -116,6 +161,73 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
         if instrument_id is None:
             return (NoAction(reason="censored:instrument_unresolved"),)
 
+        self._latest_signal_by_instrument[instrument_id] = _LatestWeatherSignal(
+            forecast_prob=forecast_prob,
+            payload=event.payload,
+            received_at=event.received_at,
+        )
+
+        return self._forecast_decision(
+            instrument_id,
+            forecast_prob,
+            event.payload,
+            ctx,
+            no_action_suffix="",
+        )
+
+    def _quote_tick_decision(self, event: QuoteEvent, ctx: StrategyContext) -> Sequence[StrategyDecision]:
+        return self._latest_tick_decision(
+            event.quote.instrument_id,
+            ctx,
+            prefix="quote_mid_updated",
+            no_action_suffix=":quote_tick",
+        )
+
+    def _book_tick_decision(self, event: OrderBookEvent, ctx: StrategyContext) -> Sequence[StrategyDecision]:
+        return self._latest_tick_decision(
+            event.book.instrument_id,
+            ctx,
+            prefix="book_updated",
+            no_action_suffix=":book_tick",
+        )
+
+    def _latest_tick_decision(
+        self,
+        instrument_id: InstrumentId,
+        ctx: StrategyContext,
+        *,
+        prefix: str,
+        no_action_suffix: str,
+    ) -> Sequence[StrategyDecision]:
+        latest = self._latest_signal_by_instrument.get(instrument_id)
+        if latest is None:
+            return (NoAction(reason=f"{prefix}:no_signal"),)
+        age = max((ctx.now - latest.received_at).total_seconds(), 0.0)
+        if age > self.max_signal_age_seconds:
+            return (NoAction(reason=f"{prefix}:signal_stale_{int(age)}s"),)
+        return self._forecast_decision(
+            instrument_id,
+            latest.forecast_prob,
+            latest.payload,
+            ctx,
+            no_action_suffix=no_action_suffix,
+        )
+
+    def _forecast_decision(
+        self,
+        instrument_id: InstrumentId,
+        forecast_prob: Decimal,
+        payload: Mapping[str, object],
+        ctx: StrategyContext,
+        *,
+        no_action_suffix: str,
+    ) -> Sequence[StrategyDecision]:
+        if self.min_seconds_to_close > 0:
+            seconds_left = _seconds_until(payload.get("close_time"), ctx.now)
+            if seconds_left is not None and seconds_left < self.min_seconds_to_close:
+                return (
+                    NoAction(reason=f"censored:within_{self.min_seconds_to_close}s_of_close{no_action_suffix}"),
+                )
         mid = self._mid_by_instrument.get(instrument_id)
         if mid is None:
             return (NoAction(reason="warmup:no_mid_yet"),)
@@ -128,17 +240,17 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
             decision = self._taker_decision(
                 instrument_id,
                 forecast_prob,
-                event.payload,
+                payload,
                 capital_base,
                 now=ctx.now,
             )
             if decision is None:
-                return (NoAction(reason="edge_below_executable_threshold"),)
+                return (NoAction(reason=f"edge_below_executable_threshold{no_action_suffix}"),)
             return (decision,)
 
         edge_bps = (forecast_prob - mid) * Decimal("10000")
         if abs(edge_bps) < self.min_edge_bps:
-            return (NoAction(reason="edge_below_threshold"),)
+            return (NoAction(reason=f"edge_below_threshold{no_action_suffix}"),)
 
         side = OutcomeSide.YES if edge_bps > 0 else OutcomeSide.NO
         order_side = OrderSide.BUY
@@ -177,6 +289,15 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
         self._mid_by_instrument[quote.instrument_id] = mid
         self._quote_by_instrument[quote.instrument_id] = (quote.bid.price, quote.ask.price)
         self._snapshot_by_instrument[quote.instrument_id] = market_snapshot_from_quote_event(event)
+
+    def _track_book(self, event: OrderBookEvent) -> None:
+        snapshot = market_snapshot_from_book_event(event, side=OutcomeSide.YES)
+        if snapshot.bid is None or snapshot.ask is None:
+            return
+        mid = (snapshot.bid.price + snapshot.ask.price) / Decimal("2")
+        self._mid_by_instrument[event.book.instrument_id] = mid
+        self._quote_by_instrument[event.book.instrument_id] = (snapshot.bid.price, snapshot.ask.price)
+        self._snapshot_by_instrument[event.book.instrument_id] = snapshot
 
     def _taker_decision(
         self,
@@ -259,6 +380,10 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
             price=price,
             forecast_prob=forecast_prob,
         )
+        self._last_trade_signal_by_instrument[instrument_id] = (
+            price,
+            forecast_prob,
+        )
         return PlaceOrder(
             client_order_id=client_order_id,
             instrument_id=instrument_id,
@@ -277,7 +402,7 @@ class WeatherTemperatureArbitrageStrategy(StrategyBase):
             expected_edge_bps=edge_bps,
             metadata={
                 "ladder_key": ladder_key,
-                "fair_price": str(fair_price),
+                "fair_price": _fair_price_4dp(fair_price),
                 "min_executable_edge_ticks": str(int(self.min_edge_bps)),
                 "fee_rate_bps": "700",
             },
@@ -482,6 +607,19 @@ def _truthy(value: object) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _seconds_until(close_value: object, now: datetime) -> float | None:
+    """Seconds from `now` until an ISO-8601 close time, or None if unparsable/absent."""
+    if not isinstance(close_value, str) or not close_value:
+        return None
+    try:
+        close_dt = datetime.fromisoformat(close_value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if close_dt.tzinfo is None:
+        close_dt = close_dt.replace(tzinfo=UTC)
+    return (close_dt - now).total_seconds()
+
+
 def _snapshot_for_side(
     snapshot: MarketSnapshot | None,
     side: OutcomeSide,
@@ -517,3 +655,10 @@ class _PendingWeatherOrder:
     notional: Decimal
     price: Decimal
     forecast_prob: Decimal
+
+
+@dataclass(frozen=True)
+class _LatestWeatherSignal:
+    forecast_prob: Decimal
+    payload: Mapping[str, object]
+    received_at: datetime

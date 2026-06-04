@@ -18,6 +18,7 @@ from eventcontracts.domain import (
     InstrumentId,
     IntentEnvelope,
     LatencyTier,
+    NoAction,
     OrderBook,
     OrderBookEvent,
     OrderBookLevel,
@@ -127,8 +128,14 @@ def _quote(bid: str, ask: str, instrument: InstrumentId) -> QuoteEvent:
     )
 
 
-def _book_event(bid: str, ask: str, bid_qty: str, ask_qty: str) -> OrderBookEvent:
-    instrument = InstrumentId(venue=Venue.KALSHI, market_id="DEMO-OBI")
+def _book_event(
+    bid: str,
+    ask: str,
+    bid_qty: str,
+    ask_qty: str,
+    instrument: InstrumentId | None = None,
+) -> OrderBookEvent:
+    instrument = instrument or InstrumentId(venue=Venue.KALSHI, market_id="DEMO-OBI")
     return OrderBookEvent(
         event_id=EventId(f"book-{bid}-{ask}-{bid_qty}-{ask_qty}"),
         book=OrderBook(
@@ -351,6 +358,261 @@ def test_weather_arb_releases_notional_on_risk_reject() -> None:
 
     assert strategy._active_notional == Decimal("0")
     assert strategy._pending_notional_by_client_order_id == {}
+
+
+def test_weather_arb_censors_non_zero_lead_signal() -> None:
+    """Defense in depth: a signal tagged with a non-zero lead must be refused
+    outright and must not be cached for later quote/book re-fires. Signals without
+    a `lead_days` tag (older producers) are unaffected."""
+    spec = replace(
+        _spec(),
+        strategy_id=StrategyId("weather-arb-v1"),
+        name="weather_temperature_arbitrage",
+        parameters={
+            "signal_source": "fixture-weather",
+            "execution_mode": "taker_if_edge",
+            "min_edge_bps": "10",
+        },
+    )
+    sleeve = _sleeve()
+    strategy = WeatherTemperatureArbitrageStrategy(spec)
+    instrument = InstrumentId(venue=Venue.KALSHI, market_id="DEMO-1")
+    clock = InMemoryClock()
+    ctx = InMemoryContext(
+        strategy_id_value=spec.strategy_id,
+        sleeve_id_value=sleeve.sleeve_id,
+        clock_now=clock.now(),
+        cash_by_ccy={
+            "USD": CashBalance(
+                currency="USD",
+                total=Decimal("1000"),
+                available=Decimal("1000"),
+                held_for_orders=Decimal("0"),
+                settling=Decimal("0"),
+                updated_at=clock.now(),
+            )
+        },
+    )
+    signal = ExternalSignalEvent(
+        event_id=EventId("weather-signal-lead1"),
+        source="fixture-weather",
+        exchange_ts=clock.now(),
+        received_at=clock.now(),
+        schema_version="weather-prob-v1",
+        payload={
+            "implied_prob": "0.75",
+            "lead_days": 1,
+            "instrument_id": {
+                "venue": "kalshi",
+                "market_id": instrument.market_id,
+            },
+        },
+        provenance=EventProvenance(source="fixture", channel="external"),
+    )
+
+    decisions = strategy.on_event(signal, ctx)
+
+    assert len(decisions) == 1
+    assert decisions[0].reason.startswith("censored:lead_days")
+    assert strategy._latest_signal_by_instrument == {}
+
+
+def test_weather_arb_censors_signal_within_close_buffer() -> None:
+    """With min_seconds_to_close set, a signal whose market closes inside the buffer
+    is refused (recomputed against ctx.now), while a far-from-close signal is not."""
+    spec = replace(
+        _spec(),
+        strategy_id=StrategyId("weather-arb-v1"),
+        name="weather_temperature_arbitrage",
+        parameters={
+            "signal_source": "fixture-weather",
+            "execution_mode": "taker_if_edge",
+            "min_edge_bps": "10",
+            "min_seconds_to_close": "300",
+        },
+    )
+    sleeve = _sleeve()
+    strategy = WeatherTemperatureArbitrageStrategy(spec)
+    instrument = InstrumentId(venue=Venue.KALSHI, market_id="DEMO-1")
+    clock = InMemoryClock()
+    ctx = InMemoryContext(
+        strategy_id_value=spec.strategy_id,
+        sleeve_id_value=sleeve.sleeve_id,
+        clock_now=clock.now(),
+        cash_by_ccy={
+            "USD": CashBalance(
+                currency="USD",
+                total=Decimal("1000"),
+                available=Decimal("1000"),
+                held_for_orders=Decimal("0"),
+                settling=Decimal("0"),
+                updated_at=clock.now(),
+            )
+        },
+    )
+
+    def _signal(close_dt: datetime) -> ExternalSignalEvent:
+        return ExternalSignalEvent(
+            event_id=EventId(f"weather-signal-{close_dt.isoformat()}"),
+            source="fixture-weather",
+            exchange_ts=clock.now(),
+            received_at=clock.now(),
+            schema_version="weather-prob-v1",
+            payload={
+                "implied_prob": "0.75",
+                "close_time": close_dt.isoformat(),
+                "instrument_id": {"venue": "kalshi", "market_id": instrument.market_id},
+            },
+            provenance=EventProvenance(source="fixture", channel="external"),
+        )
+
+    near = strategy.on_event(_signal(clock.now() + timedelta(seconds=100)), ctx)
+    assert len(near) == 1
+    assert near[0].reason.startswith("censored:within_300s_of_close")
+
+    # Far from close: the near-close gate must not fire (warmup:no_mid_yet means it
+    # passed the gate and reached normal pricing without a quote yet).
+    far = strategy.on_event(_signal(clock.now() + timedelta(seconds=10_000)), ctx)
+    assert len(far) == 1
+    assert not far[0].reason.startswith("censored:within_")
+
+
+def test_weather_arb_can_trigger_from_quote_tick_after_signal() -> None:
+    spec = replace(
+        _spec(),
+        strategy_id=StrategyId("weather-arb-v1"),
+        name="weather_temperature_arbitrage",
+        parameters={
+            "signal_source": "fixture-weather",
+            "execution_mode": "taker_if_edge",
+            "quote_triggered_trading": "true",
+            "max_signal_age_seconds": "60",
+            "min_edge_bps": "10",
+            "max_size": "10",
+            "capital_source": "context_cash",
+            "max_trade_capital_fraction": "1",
+            "min_retrade_price_delta": "0.03",
+            "min_retrade_probability_delta": "0.04",
+        },
+    )
+    strategy = WeatherTemperatureArbitrageStrategy(spec)
+    instrument = InstrumentId(venue=Venue.KALSHI, market_id="DEMO-1")
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    ctx = InMemoryContext(
+        strategy_id_value=spec.strategy_id,
+        sleeve_id_value=SleeveId("sleeve-a"),
+        clock_now=now,
+        cash_by_ccy={
+            "USD": CashBalance(
+                currency="USD",
+                total=Decimal("1000"),
+                available=Decimal("1000"),
+                held_for_orders=Decimal("0"),
+                settling=Decimal("0"),
+                updated_at=now,
+            )
+        },
+    )
+    signal = ExternalSignalEvent(
+        event_id=EventId("weather-signal"),
+        source="fixture-weather",
+        exchange_ts=now,
+        received_at=now,
+        schema_version="weather-prob-v1",
+        payload={
+            "implied_prob": "0.75",
+            "target_time": now.isoformat(),
+            "instrument_id": {
+                "venue": "kalshi",
+                "market_id": instrument.market_id,
+            },
+        },
+        provenance=EventProvenance(source="fixture", channel="external"),
+    )
+
+    assert list(strategy.on_event(_quote("0.70", "0.75", instrument), ctx)) == [
+        NoAction(reason="quote_mid_updated:no_signal")
+    ]
+    assert list(strategy.on_event(signal, ctx)) == [
+        NoAction(reason="edge_below_executable_threshold")
+    ]
+
+    tick_decisions = list(strategy.on_event(_quote("0.50", "0.52", instrument), ctx))
+    orders = [decision for decision in tick_decisions if isinstance(decision, PlaceOrder)]
+    assert len(orders) == 1
+    assert orders[0].outcome_side is OutcomeSide.YES
+    assert orders[0].price == Decimal("0.52")
+
+    duplicate = list(strategy.on_event(_quote("0.50", "0.52", instrument), ctx))
+    assert duplicate == [NoAction(reason="edge_below_executable_threshold:quote_tick")]
+
+
+def test_weather_arb_can_trigger_from_book_tick_after_signal() -> None:
+    spec = replace(
+        _spec(),
+        strategy_id=StrategyId("weather-arb-v1"),
+        name="weather_temperature_arbitrage",
+        parameters={
+            "signal_source": "fixture-weather",
+            "execution_mode": "taker_if_edge",
+            "quote_triggered_trading": "true",
+            "max_signal_age_seconds": "60",
+            "min_edge_bps": "10",
+            "max_size": "10",
+            "capital_source": "context_cash",
+            "max_trade_capital_fraction": "1",
+            "min_retrade_price_delta": "0.03",
+            "min_retrade_probability_delta": "0.04",
+        },
+    )
+    strategy = WeatherTemperatureArbitrageStrategy(spec)
+    instrument = InstrumentId(venue=Venue.KALSHI, market_id="DEMO-1")
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    ctx = InMemoryContext(
+        strategy_id_value=spec.strategy_id,
+        sleeve_id_value=SleeveId("sleeve-a"),
+        clock_now=now,
+        cash_by_ccy={
+            "USD": CashBalance(
+                currency="USD",
+                total=Decimal("10"),
+                available=Decimal("10"),
+                held_for_orders=Decimal("0"),
+                settling=Decimal("0"),
+                updated_at=now,
+            )
+        },
+    )
+    signal = ExternalSignalEvent(
+        event_id=EventId("weather-signal"),
+        source="fixture-weather",
+        exchange_ts=now,
+        received_at=now,
+        schema_version="weather-prob-v1",
+        payload={
+            "implied_prob": "0.75",
+            "target_time": now.isoformat(),
+            "instrument_id": {
+                "venue": "kalshi",
+                "market_id": instrument.market_id,
+            },
+        },
+        provenance=EventProvenance(source="fixture", channel="external"),
+    )
+
+    assert list(strategy.on_event(_book_event("0.70", "0.75", "100", "100", instrument), ctx)) == [
+        NoAction(reason="book_updated:no_signal")
+    ]
+    assert list(strategy.on_event(signal, ctx)) == [
+        NoAction(reason="edge_below_executable_threshold")
+    ]
+
+    tick_decisions = list(strategy.on_event(_book_event("0.50", "0.52", "100", "100", instrument), ctx))
+    orders = [decision for decision in tick_decisions if isinstance(decision, PlaceOrder)]
+    assert len(orders) == 1
+    assert orders[0].outcome_side is OutcomeSide.YES
+    assert orders[0].price == Decimal("0.52")
+    assert orders[0].quantity <= Decimal("10")
 
 
 def test_obi_scalper_handles_concurrent_cancel_decisions() -> None:

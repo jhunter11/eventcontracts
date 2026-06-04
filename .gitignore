@@ -13,9 +13,13 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.tmp-runpod/
+.tmp-target/
+logs/
 dist/
 build/
 *.egg-info/
+eventcontracts-runpod-*.tar.gz
 data/raw/
 data/normalized/
 data/replay/
@@ -41,3 +45,16 @@ rust/target/
 # canonical store is documented in docs/artifact-contract.md.
 artifacts/*
 !artifacts/.gitkeep
+
+# Local scratch / feasibility experiments and their caches — never committed.
+.tmp-feasibility/
+# Harness/agent runtime scratch (random temp files, mypy/ruff caches).
+.tmp-runtime/
+# Stray parity-scratch output from local `make parity-check` runs.
+.PARITY*.txt
+# Live-test watchers, prep scripts, and per-run ledgers (operator-local).
+live-test/
+# Editor / agent tooling and local slash-command definitions.
+.claude/
+.codex/
+.gemini/

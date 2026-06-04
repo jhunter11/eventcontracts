@@ -15,13 +15,16 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-import polars as pl
 import pytest
 
 from eventcontracts.contracts import load_json_contract, validate_contract
 from eventcontracts.research import tennis_odds as odds
 from eventcontracts.research import tennis_v2 as v2
 from tests.conftest import REPO_ROOT
+
+# polars is a research dependency; skip the whole module (rather than abort
+# collection of the entire suite) when it is not installed.
+pl = pytest.importorskip("polars")
 
 
 # --------------------------------------------------------------------------
@@ -102,6 +105,19 @@ def test_present_odds_normalize_and_flag() -> None:
     assert row["p1_implied_prob"] > 0.5  # favorite after overround-normalization
     assert row["implied_prob_diff"] > 0.0
     assert row["odds_overround"] > 1.0  # bookmaker margin present
+
+
+def test_write_v2_feature_schema_and_confidence_gate_metrics(tmp_path: Path) -> None:
+    schema_path = v2.write_feature_schema(tmp_path / "feature_schema.json")
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    gates = v2.confidence_gate_metrics([1, 0, 1, 0], [0.8, 0.6, 0.55, 0.49], cutoffs=(0.55, 0.7))
+
+    assert schema["schema_version"] == "2"
+    assert [f["name"] for f in schema["features"]] == list(v2.TENNIS_V2_FEATURE_NAMES)
+    assert gates[0]["cutoff"] == 0.55
+    assert gates[0]["samples"] == 3
+    assert gates[0]["accuracy"] == pytest.approx(2 / 3)
+    assert gates[1]["samples"] == 1
 
 
 # --------------------------------------------------------------------------
@@ -257,6 +273,59 @@ def test_frame_builder_emits_features_and_no_self_leakage() -> None:
 def test_frame_builder_requires_core_columns() -> None:
     with pytest.raises(ValueError, match="missing required"):
         v2.build_v2_training_frame(pl.DataFrame({"winner_id": ["A"]}))
+
+
+# --------------------------------------------------------------------------
+# dynamic-K Elo: experience decay + layoff boost
+# --------------------------------------------------------------------------
+def test_dynamic_k_shrinks_with_experience_and_grows_after_layoff() -> None:
+    base_k = 250.0
+    rookie = v2._dynamic_k(0, None, base_k=base_k, layoff_boost=0.5)
+    veteran = v2._dynamic_k(200, None, base_k=base_k, layoff_boost=0.5)
+    assert rookie == pytest.approx(base_k / (5**0.4))
+    assert veteran < rookie  # experience stabilises the rating
+
+    fresh = v2._dynamic_k(50, 10, base_k=base_k, layoff_boost=0.5)
+    at_grace = v2._dynamic_k(50, v2._ELO_LAYOFF_GRACE_DAYS, base_k=base_k, layoff_boost=0.5)
+    full = v2._dynamic_k(50, v2._ELO_LAYOFF_CAP_DAYS, base_k=base_k, layoff_boost=0.5)
+    assert fresh == at_grace  # inside the grace window → no boost
+    assert full == pytest.approx(fresh * 1.5)  # at the cap → (1 + boost)x
+    # clamped past the cap, and disabled by layoff_boost=0 or an unknown last match.
+    assert v2._dynamic_k(50, 10_000, base_k=base_k, layoff_boost=0.5) == full
+    assert v2._dynamic_k(50, v2._ELO_LAYOFF_CAP_DAYS, base_k=base_k, layoff_boost=0.0) == fresh
+    assert v2._dynamic_k(50, None, base_k=base_k, layoff_boost=0.5) == fresh
+
+
+def _repeated_pairing(dates: list[int]) -> pl.DataFrame:
+    n = len(dates)
+    return pl.DataFrame(
+        {
+            "winner_id": ["A"] * n,
+            "loser_id": ["B"] * n,
+            "tourney_date": dates,
+            "surface": ["Hard"] * n,
+            "best_of": [3] * n,
+            "score": ["6-4 6-4"] * n,
+        }
+    )
+
+
+def test_layoff_boost_is_inert_at_normal_cadence_but_engages_after_a_gap() -> None:
+    # Normal 14-day cadence: every gap is inside the grace window, so the layoff
+    # term changes nothing — a model trained without it stays consistent.
+    normal = _repeated_pairing([20230101, 20230115, 20230129])
+    assert (
+        v2.build_v2_training_frame(normal, include_mirrored=False, elo_layoff_boost=0.0)["elo_diff"].to_list()
+        == v2.build_v2_training_frame(normal, include_mirrored=False, elo_layoff_boost=0.5)["elo_diff"].to_list()
+    )
+    # A ~200-day gap before match 2 means match 2's update is layoff-boosted, so by
+    # match 3 (which sees that update) the winner A is rated further above B.
+    gapped = _repeated_pairing([20230101, 20230720, 20230725])
+    e0 = v2.build_v2_training_frame(gapped, include_mirrored=False, elo_layoff_boost=0.0).sort("match_date")["elo_diff"]
+    e5 = v2.build_v2_training_frame(gapped, include_mirrored=False, elo_layoff_boost=0.5).sort("match_date")["elo_diff"]
+    assert e0[0] == e5[0] == 0.0  # first meeting: shared 1500 prior
+    assert e0[1] == pytest.approx(e5[1])  # match 2 update was the players' first → no layoff yet
+    assert e5[2] > e0[2]  # boosted match-2 update widens the gap seen at match 3
 
 
 # --------------------------------------------------------------------------

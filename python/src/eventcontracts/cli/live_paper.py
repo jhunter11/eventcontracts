@@ -35,9 +35,9 @@ import os
 import signal
 import subprocess
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -57,8 +57,8 @@ from eventcontracts.domain.decisions import (
     PlaceOrder,
     decision_kind,
 )
-from eventcontracts.domain.events import NormalizedEvent
-from eventcontracts.domain.ids import SleeveId, StrategyId
+from eventcontracts.domain.events import EventProvenance, ExternalSignalEvent, NormalizedEvent
+from eventcontracts.domain.ids import EventId, SleeveId, StrategyId
 from eventcontracts.domain.positions import CashBalance
 from eventcontracts.normalization.kalshi import KalshiNormalizer
 from eventcontracts.risk.policy import SleeveRiskGate
@@ -66,7 +66,22 @@ from eventcontracts.runner import StrategyRunner
 from eventcontracts.runner.ports import RiskDecision
 from eventcontracts.strategy.registry import create_from_spec
 from eventcontracts.testing.doubles import InMemoryContext
+from eventcontracts.weather.calibration import (
+    StationCalibration,
+    load_calibration_meta,
+    load_calibrations,
+)
 from eventcontracts.weather.clients import OpenMeteoClient
+from eventcontracts.weather.distribution import (
+    StationObservationSnapshot,
+    build_daily_high_distribution,
+    probability_for_contract,
+)
+from eventcontracts.weather.kxhigh import (
+    KalshiHighContract,
+    daily_high_from_snapshot,
+    parse_kxhigh_market,
+)
 from eventcontracts.weather.temperature import (
     TemperatureThresholdMarket,
     TemperatureThresholdModel,
@@ -80,6 +95,8 @@ DEFAULT_KALSHI_CHANNELS: tuple[str, ...] = (
     "orderbook_delta",
     "market_lifecycle_v2",
 )
+
+LiveWeatherContract = KalshiTemperatureContract | KalshiHighContract
 
 
 def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -170,6 +187,12 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         default=0,
         help="Kalshi subaccount number for /portfolio/balance. Default 0 = primary.",
     )
+    parser.add_argument(
+        "--kxhigh-calibrations",
+        type=Path,
+        default=Path("configs/weather/station_calibrations.json"),
+        help="Station calibration JSON for KXHIGH daily-high contracts.",
+    )
     parser.set_defaults(handler=_handle)
 
 
@@ -184,6 +207,7 @@ class LiveStats:
     normalize_skipped: int = 0
     forecast_snapshots: int = 0
     external_signals_emitted: int = 0
+    kxhigh_signals_suppressed: int = 0
     decisions: int = 0
     decisions_by_kind: dict[str, int] = field(default_factory=dict)
     intents_dispatched: int = 0
@@ -263,6 +287,7 @@ def _handle(args: argparse.Namespace) -> int:
     strategy = create_from_spec(strategy_spec)
     risk_gate = SleeveRiskGate(sleeve_spec)
     threshold_model = TemperatureThresholdModel()
+    kxhigh_calibrations = _load_kxhigh_calibrations(args.kxhigh_calibrations)
 
     exit_code = 0
     try:
@@ -273,6 +298,7 @@ def _handle(args: argparse.Namespace) -> int:
                 sleeve_spec=sleeve_spec,
                 risk_gate=risk_gate,
                 threshold_model=threshold_model,
+                kxhigh_calibrations=kxhigh_calibrations,
                 patterns=patterns,
                 series_tickers=series_tickers,
                 channels=channels,
@@ -308,6 +334,7 @@ async def _run(
     sleeve_spec: Any,
     risk_gate: SleeveRiskGate,
     threshold_model: TemperatureThresholdModel,
+    kxhigh_calibrations: Mapping[str, StationCalibration],
     patterns: Sequence[str],
     series_tickers: Sequence[str],
     channels: Sequence[str],
@@ -378,6 +405,7 @@ async def _run(
                 open_meteo=open_meteo,
                 catalog=catalog,
                 threshold_model=threshold_model,
+                kxhigh_calibrations=kxhigh_calibrations,
                 event_queue=event_queue,
                 files=files,
                 stats=stats,
@@ -458,7 +486,7 @@ async def _ws_loop(
     discover_max_pages: int,
 ) -> None:
     last_tickers: tuple[str, ...] = ()
-    last_contracts: tuple[KalshiTemperatureContract, ...] = ()
+    last_contracts: tuple[LiveWeatherContract, ...] = ()
     while not shutdown.is_set() and datetime.now(UTC) < deadline:
         try:
             tickers, contracts = await asyncio.wait_for(
@@ -571,11 +599,11 @@ async def _discover_weather_markets(
     max_pages: int,
     *,
     series_tickers: Sequence[str] = (),
-) -> tuple[tuple[str, ...], tuple[KalshiTemperatureContract, ...]]:
+) -> tuple[tuple[str, ...], tuple[LiveWeatherContract, ...]]:
     globs = [p for p in patterns if any(c in p for c in "*?[]")]
     exact = {p for p in patterns if not any(c in p for c in "*?[]")}
     matched_tickers: set[str] = set(exact)
-    contracts: list[KalshiTemperatureContract] = []
+    contracts: list[LiveWeatherContract] = []
 
     if series_tickers:
         for series_ticker in series_tickers:
@@ -594,7 +622,7 @@ async def _discover_weather_markets(
                         continue
                     if ticker in exact or any(fnmatch.fnmatchcase(ticker, g) for g in globs):
                         matched_tickers.add(ticker)
-                        contract = parse_kalshi_temperature_contract(market)
+                        contract = _parse_live_weather_contract(market)
                         if contract is not None:
                             contracts.append(contract)
                 cursor_value = payload.get("cursor")
@@ -615,7 +643,7 @@ async def _discover_weather_markets(
                 continue
             if any(fnmatch.fnmatchcase(ticker, g) for g in globs):
                 matched_tickers.add(ticker)
-                contract = parse_kalshi_temperature_contract(market)
+                contract = _parse_live_weather_contract(market)
                 if contract is not None:
                     contracts.append(contract)
         cursor_value = payload.get("cursor")
@@ -638,6 +666,7 @@ async def _forecast_loop(
     open_meteo: OpenMeteoClient,
     catalog: WeatherMarketCatalog,
     threshold_model: TemperatureThresholdModel,
+    kxhigh_calibrations: Mapping[str, StationCalibration],
     event_queue: asyncio.Queue[NormalizedEvent],
     files: RunFiles,
     stats: LiveStats,
@@ -667,6 +696,12 @@ async def _forecast_loop(
                 )
                 continue
             as_of = datetime.now(UTC)
+            # Open-Meteo returns LOCAL wall-clock hourly times when `timezone=` is
+            # set (parsed naive->UTC), so the daily-high "day" is the local calendar
+            # day. Derive the local current day from the response's own
+            # utc_offset_seconds so the KXHIGH lead filter matches points_for_day's
+            # bucketing exactly, with no tz-database dependency.
+            local_today = _payload_local_today(payload, as_of)
             try:
                 snapshot = snapshot_from_open_meteo_payload(
                     payload, location=location, as_of=as_of
@@ -692,15 +727,40 @@ async def _forecast_loop(
             )
 
             for contract in catalog.contracts_for_location(location):
-                market = TemperatureThresholdMarket(
-                    instrument_id=_kalshi_instrument(contract.ticker),
-                    threshold_f=contract.threshold_f,
-                    target_day=contract.target_time.date(),
-                    direction=contract.direction,
-                    target_time=contract.target_time,
-                )
                 try:
-                    prediction = threshold_model.predict(snapshot, market)
+                    if isinstance(contract, KalshiHighContract):
+                        emitted = _kxhigh_external_signal(
+                            contract,
+                            snapshot=snapshot,
+                            as_of=as_of,
+                            calibrations=kxhigh_calibrations,
+                            local_today=local_today,
+                            high_so_far_f=_payload_high_so_far_f(payload, contract.target_day, as_of),
+                        )
+                        if emitted is None:
+                            # Suppressed: lead!=0 (nowcast-lead sigma is over-confident
+                            # for future days / past days have settled) or the market
+                            # has already closed. Don't emit a false/dead signal.
+                            stats.kxhigh_signals_suppressed += 1
+                            continue
+                        signal_event, signal_row = emitted
+                    else:
+                        market = TemperatureThresholdMarket(
+                            instrument_id=_kalshi_instrument(contract.ticker),
+                            threshold_f=contract.threshold_f,
+                            target_day=contract.target_time.date(),
+                            direction=contract.direction,
+                            target_time=contract.target_time,
+                        )
+                        prediction = threshold_model.predict(snapshot, market)
+                        signal_event = prediction.to_external_signal()
+                        signal_row = {
+                            "as_of": as_of.isoformat(),
+                            "instrument": contract.ticker,
+                            "implied_prob": prediction.implied_probability,
+                            "expected_temperature_f": prediction.expected_high_f,
+                            "uncertainty_f": prediction.uncertainty_f,
+                        }
                 except Exception as exc:  # noqa: BLE001
                     print(
                         f"[live-paper] predict error for {contract.ticker}: {exc}",
@@ -708,18 +768,8 @@ async def _forecast_loop(
                         flush=True,
                     )
                     continue
-                signal_event = prediction.to_external_signal()
                 stats.external_signals_emitted += 1
-                files.append(
-                    files.signals,
-                    {
-                        "as_of": as_of.isoformat(),
-                        "instrument": contract.ticker,
-                        "implied_prob": prediction.implied_probability,
-                        "expected_temperature_f": prediction.expected_high_f,
-                        "uncertainty_f": prediction.uncertainty_f,
-                    },
-                )
+                files.append(files.signals, signal_row)
                 await event_queue.put(signal_event)
         await _wait_or_shutdown(shutdown, interval)
 
@@ -813,9 +863,9 @@ class _LivePaperIntentSink:
 class WeatherMarketCatalog:
     """Tracks open weather contracts and the unique locations to poll."""
 
-    _by_ticker: dict[str, KalshiTemperatureContract] = field(default_factory=dict)
+    _by_ticker: dict[str, LiveWeatherContract] = field(default_factory=dict)
 
-    def update(self, contracts: Sequence[KalshiTemperatureContract]) -> None:
+    def update(self, contracts: Sequence[LiveWeatherContract]) -> None:
         self._by_ticker = {c.ticker: c for c in contracts}
 
     def locations(self) -> tuple[WeatherLocation, ...]:
@@ -830,13 +880,269 @@ class WeatherMarketCatalog:
 
     def contracts_for_location(
         self, location: WeatherLocation
-    ) -> tuple[KalshiTemperatureContract, ...]:
+    ) -> tuple[LiveWeatherContract, ...]:
         return tuple(
             contract
             for contract in self._by_ticker.values()
             if contract.location.latitude == location.latitude
             and contract.location.longitude == location.longitude
         )
+
+
+def _calibration_staleness_warning(
+    meta: Mapping[str, Any], *, now: datetime, max_age_days: float = 7.0
+) -> str | None:
+    """Warn if the persisted calibration lacks provenance or is older than
+    ``max_age_days``. The KXHIGH fit is a recency-weighted trailing-window snapshot
+    meant to be regenerated as new GHCND actuals land; a stale fit silently
+    misprices the live brackets, so the live runner surfaces this at startup."""
+    generated_at = meta.get("generated_at")
+    if not generated_at:
+        return (
+            "KXHIGH calibration has no generated_at provenance; cannot verify "
+            "freshness — regenerate via scripts/weather_calibration_report.py"
+        )
+    try:
+        ts = datetime.fromisoformat(str(generated_at).replace("Z", "+00:00"))
+    except ValueError:
+        return f"KXHIGH calibration generated_at is unparsable: {generated_at!r}"
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+    age_days = (now - ts).total_seconds() / 86_400.0
+    if age_days > max_age_days:
+        return (
+            f"KXHIGH calibration is {age_days:.1f} days old (> {max_age_days:.0f}d); "
+            "regenerate the trailing-window fit before relying on it"
+        )
+    return None
+
+
+def _load_kxhigh_calibrations(path: Path) -> dict[str, StationCalibration]:
+    if not path.exists():
+        print(
+            f"[live-paper] KXHIGH calibration file missing: {path}; "
+            "KXHIGH forecast signals will be skipped",
+            file=sys.stderr,
+            flush=True,
+        )
+        return {}
+    calibs = load_calibrations(path)
+    warning = _calibration_staleness_warning(load_calibration_meta(path), now=datetime.now(UTC))
+    if warning is not None:
+        print(f"[live-paper] WARNING: {warning}", file=sys.stderr, flush=True)
+    return calibs
+
+
+def _parse_live_weather_contract(market: dict[str, Any]) -> LiveWeatherContract | None:
+    return parse_kalshi_temperature_contract(market) or parse_kxhigh_market(market)
+
+
+def _payload_local_today(payload: Mapping[str, Any], as_of: datetime) -> date:
+    """Local calendar 'today' for an Open-Meteo response.
+
+    Uses the API's own ``utc_offset_seconds`` so the result is in the same local
+    wall-clock frame that :func:`snapshot_from_open_meteo_payload` buckets hourly
+    points into. Falls back to the UTC date if the offset is absent/unparsable.
+    """
+    offset = payload.get("utc_offset_seconds")
+    if offset is None:
+        return as_of.date()
+    try:
+        local_dt: datetime = as_of + timedelta(seconds=int(offset))
+    except (TypeError, ValueError):
+        return as_of.date()
+    return local_dt.date()
+
+
+def _payload_high_so_far_f(payload: Mapping[str, Any], target_day: date, as_of: datetime) -> float | None:
+    """Best-effort Open-Meteo hourly proxy for today's high so far.
+
+    This is not the official NWS settlement print. It is a same-provider,
+    same-location lower-bound proxy used to condition the KXHIGH distribution
+    during the lead-0 window.
+    """
+
+    hourly = payload.get("hourly")
+    if not isinstance(hourly, Mapping):
+        return None
+    times = hourly.get("time")
+    temperatures = hourly.get("temperature_2m")
+    if not isinstance(times, list) or not isinstance(temperatures, list):
+        return None
+    offset = payload.get("utc_offset_seconds")
+    if offset is None:
+        return None
+    try:
+        offset_seconds = int(offset)
+    except (TypeError, ValueError):
+        return None
+    local_now = (as_of + timedelta(seconds=offset_seconds)).replace(tzinfo=None)
+    if local_now.date() != target_day:
+        return None
+    high_so_far: float | None = None
+    for raw_time, raw_temperature in zip(times, temperatures, strict=False):
+        if raw_temperature is None:
+            continue
+        try:
+            point_time = datetime.fromisoformat(str(raw_time).replace("Z", "+00:00"))
+            temperature = float(raw_temperature)
+        except (TypeError, ValueError):
+            continue
+        if point_time.tzinfo is None:
+            point_day = point_time.date()
+            is_observed_or_now = point_time <= local_now
+        else:
+            point_utc = point_time.astimezone(UTC)
+            point_day = (point_utc + timedelta(seconds=offset_seconds)).date()
+            is_observed_or_now = point_utc <= as_of
+        if point_day == target_day and is_observed_or_now:
+            high_so_far = temperature if high_so_far is None else max(high_so_far, temperature)
+    return high_so_far
+
+
+def _snapshot_local_today(snapshot: Any) -> date:
+    """Fallback local 'today' when no payload offset is available: the earliest
+    forecast day present. The live producer fetches with past_days=0, so the first
+    local day in the snapshot is the current local day."""
+    earliest: date = min(point.timestamp.date() for point in snapshot.hourly)
+    return earliest
+
+
+def _kxhigh_external_signal(
+    contract: KalshiHighContract,
+    *,
+    snapshot: Any,
+    as_of: datetime,
+    calibrations: Mapping[str, StationCalibration],
+    local_today: date | None = None,
+    high_so_far_f: float | None = None,
+) -> tuple[ExternalSignalEvent, dict[str, Any]] | None:
+    """Price a KXHIGH bracket into an ``ExternalSignalEvent``, or ``None`` when the
+    signal must be suppressed.
+
+    The station calibration sigma is fit at ~nowcast lead (the historical-forecast
+    archive), so brackets settling on a future local day (lead>=1) are
+    systematically over-confident and manufacture wing "edges"
+    (see ``docs/weather-kxhigh-validation-and-edge-spec.md`` Phase 2). Until a
+    lead-aware sigma exists, only same-day (lead==0) signals are trustworthy;
+    lead<0 brackets have already settled. This mirrors the lead==0 gate the offline
+    recorder (``scripts/weather_kxhigh_paper.py``) already enforces, so the live
+    trading path and the paper recorder agree.
+    """
+    calibration = calibrations.get(contract.station_code)
+    if calibration is None:
+        raise ValueError(f"missing KXHIGH calibration for station {contract.station_code}")
+    if local_today is None:
+        local_today = _snapshot_local_today(snapshot)
+    lead_days = (contract.target_day - local_today).days
+    if lead_days != 0:
+        return None
+    # Suppress markets that have already closed (a race between discovery and this
+    # forecast tick). The absolute close_time is carried in the payload so the
+    # strategy can apply a fresh "no new trades within N seconds of close" gate.
+    seconds_to_close: float | None = None
+    if contract.close_time is not None:
+        seconds_to_close = (contract.close_time - as_of).total_seconds()
+        if seconds_to_close <= 0:
+            return None
+    raw_high = daily_high_from_snapshot(snapshot, contract.target_day)
+    observation = (
+        StationObservationSnapshot(
+            station_code=contract.station_code,
+            target_day=contract.target_day,
+            observed_high_f=high_so_far_f,
+            as_of=as_of,
+            source="open_meteo_hourly_proxy",
+        )
+        if high_so_far_f is not None
+        else None
+    )
+    distribution = build_daily_high_distribution(
+        snapshot,
+        contract.target_day,
+        calibration,
+        observation=observation,
+    )
+    expected_high = distribution.mean_f
+    implied_prob = probability_for_contract(contract, distribution)
+    signal_event = ExternalSignalEvent(
+        event_id=EventId(
+            "weather-temperature-"
+            f"{contract.ticker}-{contract.target_day.isoformat()}-{_event_ts(as_of)}"
+        ),
+        source=snapshot.source,
+        exchange_ts=as_of,
+        received_at=as_of,
+        schema_version="weather-temperature-probability-v1",
+        payload={
+            "market_id": contract.ticker,
+            "implied_prob": implied_prob,
+            "lead_days": lead_days,
+            "close_time": contract.close_time.isoformat() if contract.close_time is not None else None,
+            "seconds_to_close": seconds_to_close,
+            "instrument_id": {
+                "venue": "kalshi",
+                "market_id": contract.ticker,
+                "outcome_id": None,
+            },
+            "location": {
+                "name": contract.location.name,
+                "latitude": contract.location.latitude,
+                "longitude": contract.location.longitude,
+                "timezone": contract.location.timezone,
+                "station_id": contract.location.station_id,
+            },
+            "target_day": contract.target_day.isoformat(),
+            "target_time": None,
+            "threshold_f": contract.floor_strike,
+            "cap_threshold_f": contract.cap_strike,
+            "direction": contract.strike_type,
+            "temperature_basis": "daily_high",
+            "expected_temperature_f": expected_high,
+            "raw_forecast_temperature_f": raw_high,
+            "expected_high_f": expected_high,
+            "raw_forecast_high_f": raw_high,
+            "uncertainty_f": calibration.effective_sigma(),
+            "model_family": f"kxhigh_distribution:{distribution.method}:{calibration.station}",
+            "distribution_method": distribution.method,
+            "distribution_feature_hash": distribution.feature_hash,
+            "high_so_far_f": high_so_far_f,
+            "high_so_far_source": "open_meteo_hourly_proxy" if high_so_far_f is not None else None,
+            "latent_expected_high_f": distribution.latent_mean_f,
+            "features": {
+                "floor_strike": contract.floor_strike,
+                "cap_strike": contract.cap_strike,
+                "distribution_mean_f": distribution.mean_f,
+                "high_so_far_f": high_so_far_f,
+            },
+        },
+        provenance=EventProvenance(
+            source=snapshot.source,
+            channel="kxhigh_station_calibration",
+            schema_version="weather-temperature-probability-v1",
+            venue=_kalshi_instrument(contract.ticker).venue,
+            metadata={"model_family": f"kxhigh_distribution:{distribution.method}:{calibration.station}"},
+        ),
+    )
+    signal_row = {
+        "as_of": as_of.isoformat(),
+        "instrument": contract.ticker,
+        "implied_prob": implied_prob,
+        "lead_days": lead_days,
+        "target_day": contract.target_day.isoformat(),
+        "close_time": contract.close_time.isoformat() if contract.close_time is not None else None,
+        "seconds_to_close": seconds_to_close,
+        "expected_temperature_f": expected_high,
+        "raw_forecast_temperature_f": raw_high,
+        "uncertainty_f": calibration.effective_sigma(),
+        "model_family": f"kxhigh_distribution:{distribution.method}:{calibration.station}",
+        "distribution_method": distribution.method,
+        "distribution_feature_hash": distribution.feature_hash,
+        "high_so_far_f": high_so_far_f,
+        "high_so_far_source": "open_meteo_hourly_proxy" if high_so_far_f is not None else None,
+        "latent_expected_high_f": distribution.latent_mean_f,
+    }
+    return signal_event, signal_row
 
 
 async def _initial_cash_balance(
@@ -954,6 +1260,10 @@ def _kalshi_instrument(ticker: str) -> Any:
     return InstrumentId(venue=Venue.KALSHI, market_id=ticker)
 
 
+def _event_ts(value: datetime) -> str:
+    return value.isoformat().replace("+", "p").replace(":", "").replace("-", "").replace(".", "")
+
+
 def _instrument_str(decision: Any) -> str | None:
     if isinstance(decision, PlaceOrder):
         return f"{decision.instrument_id.venue.value}:{decision.instrument_id.market_id}"
@@ -1065,6 +1375,7 @@ def _write_manifest(
             "normalize_skipped": stats.normalize_skipped,
             "by_channel": dict(stats.by_channel),
             "external_signals_emitted": stats.external_signals_emitted,
+            "kxhigh_signals_suppressed": stats.kxhigh_signals_suppressed,
             "forecast_snapshots": stats.forecast_snapshots,
             "decisions": stats.decisions,
             "decisions_by_kind": dict(stats.decisions_by_kind),

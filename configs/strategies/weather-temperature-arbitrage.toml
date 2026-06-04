@@ -30,6 +30,10 @@ max_ladder_capital_fraction = "1.00"
 max_active_capital_fraction = "1.00"
 signal_source = "open-meteo"
 execution_mode = "taker_if_edge"
+quote_triggered_trading = true
+max_signal_age_seconds = 180
+# 0 = off (paper logs every bracket incl. final minutes); the live sleeve sets a buffer.
+min_seconds_to_close = "0"
 max_spread = "0.80"
 spread_edge_multiplier = "0.10"
 near_binary_price = "0.95"
@@ -43,4 +47,4 @@ min_retrade_probability_delta = "0.04"
 [tags]
 family = "weather"
 mode = "paper"
-research_doc = "docs/strategy-specs.md#1"
+research_doc = "docs/v7-live-test-ready-strategy-specs.md"

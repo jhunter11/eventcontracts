@@ -1,0 +1,51 @@
+strategy_id = "weather-temperature_arbitrage-live-v1"
+name = "weather_temperature_arbitrage"
+version = "1.0.0"
+description = "Live Kalshi weather taker using externally generated Open-Meteo probabilities."
+feature_schema_id = "weather_temperature_arbitrage_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXHIGH*"]
+event_kinds = ["quote", "book", "external"]
+external_sources = ["open-meteo"]
+
+[default_execution_priority]
+tier = "fast"
+max_delay_ms = 250
+expires_after_ms = 5000
+reason = "IOC taker orders should use the current live touch only."
+
+[parameters]
+min_edge_bps = "150"
+size = "1"
+max_size = "1"
+order_ttl_ms = 5000
+kelly_fraction = "1.00"
+currency = "USD"
+capital_source = "context_cash"
+capital_base = "0"
+allow_static_capital_base = false
+max_trade_capital_fraction = "0.20"
+max_ladder_capital_fraction = "1.00"
+max_active_capital_fraction = "1.00"
+signal_source = "open-meteo"
+execution_mode = "taker_if_edge"
+quote_triggered_trading = true
+max_signal_age_seconds = 180
+min_seconds_to_close = "300"
+max_spread = "0.80"
+spread_edge_multiplier = "0.10"
+near_binary_price = "0.95"
+near_binary_min_edge_bps = "600"
+max_ladder_notional = "5"
+max_ladder_orders = 5
+max_ticker_orders = 1
+min_retrade_price_delta = "0.03"
+min_retrade_probability_delta = "0.04"
+
+[tags]
+family = "weather"
+mode = "live"
+research_doc = "docs/strategy-specs.md#1"
+sleeve_id = "weather-kalshi-live-a"

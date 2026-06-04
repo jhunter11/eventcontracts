@@ -5,17 +5,31 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 
+from eventcontracts.domain.decisions import PlaceOrder
+from eventcontracts.domain.events import QuoteEvent
 from eventcontracts.domain.ids import EventId
-from eventcontracts.domain.models import InstrumentId, Venue
+from eventcontracts.domain.models import (
+    InstrumentId,
+    OrderBookLevel,
+    OutcomeSide,
+    Quote,
+    Venue,
+)
+from eventcontracts.domain.orders import OrderSide
+from eventcontracts.domain.spec import EventSubscription, StrategySpec
 from eventcontracts.sports import (
     CutLineBracket,
     GolfCutLineMonteCarloModel,
+    GolfFirstRoundMonteCarloModel,
     GolfPlayerSnapshot,
     GolfTournamentState,
     GolfWinnerMonteCarloModel,
     MarketPriceBar,
+    TeeTimeWaveForecast,
+    WaveAssignment,
     bracket_map_from_mapping,
 )
+from eventcontracts.strategy.registry import create_from_spec, load_entry_points
 
 NOW = datetime(2026, 5, 25, 15, 0, tzinfo=UTC)
 
@@ -163,3 +177,180 @@ def _state() -> GolfTournamentState:
             ),
         ),
     )
+
+
+# --- first-round (pre-round) model ------------------------------------------
+
+
+class _Ctx:
+    @property
+    def now(self) -> datetime:
+        return NOW
+
+
+def _player(
+    player_id: str,
+    *,
+    sg_approach: float = 0.0,
+    sg_putting: float = 0.0,
+    market_id: str | None = None,
+) -> GolfPlayerSnapshot:
+    return GolfPlayerSnapshot(
+        player_id=player_id,
+        score_to_par=0.0,
+        holes_completed=0,
+        sg_approach=sg_approach,
+        sg_putting=sg_putting,
+        baseline_score_to_par_per_hole=0.0,
+        market_id=market_id,
+    )
+
+
+def _frl_state(players: list[GolfPlayerSnapshot]) -> GolfTournamentState:
+    return GolfTournamentState(
+        tournament_id="pga-frl-demo",
+        as_of=NOW,
+        players=tuple(players),
+        wind_forecast_mph=0.0,
+    )
+
+
+def _quote(market_id: str, bid: str, ask: str) -> QuoteEvent:
+    instrument = InstrumentId(venue=Venue.KALSHI, market_id=market_id)
+    return QuoteEvent(
+        event_id=EventId(f"q-{market_id}"),
+        quote=Quote(
+            instrument_id=instrument,
+            side=OutcomeSide.YES,
+            bid=OrderBookLevel(price=Decimal(bid), quantity=Decimal("100")),
+            ask=OrderBookLevel(price=Decimal(ask), quantity=Decimal("100")),
+            exchange_ts=None,
+            received_at=NOW,
+        ),
+    )
+
+
+def test_first_round_frl_probabilities_are_deterministic_and_sum_to_one() -> None:
+    state = _frl_state([_player("a", sg_approach=1.5), _player("b"), _player("c", sg_approach=-1.0)])
+    model = GolfFirstRoundMonteCarloModel(simulations=4000, seed=7)
+
+    prediction = model.predict(state)
+    repeat = model.predict(state)
+
+    assert prediction == repeat
+    assert abs(sum(p.frl_probability for p in prediction.player_probabilities) - 1.0) < 1e-9
+    by_player = {p.player_id: p.frl_probability for p in prediction.player_probabilities}
+    assert by_player["a"] > by_player["b"] > by_player["c"]
+
+
+def test_first_round_top_n_probability_is_one_when_field_fits_in_top_n() -> None:
+    state = _frl_state([_player("a"), _player("b"), _player("c")])
+    prediction = GolfFirstRoundMonteCarloModel(simulations=1000, seed=1, top_n=5).predict(state)
+
+    for p in prediction.player_probabilities:
+        assert p.top_n_probability == 1.0  # 3-player field is entirely inside top-5
+
+
+def test_first_round_wave_asymmetry_favors_the_calm_wave() -> None:
+    state = _frl_state([_player("am_player", market_id="FRL-AM"), _player("pm_player", market_id="FRL-PM")])
+    assignments = (
+        WaveAssignment("am_player", "am", market_id="FRL-AM"),
+        WaveAssignment("pm_player", "pm", market_id="FRL-PM"),
+    )
+    calm = TeeTimeWaveForecast(am_wave_wind_mph=10.0, pm_wave_wind_mph=10.0, assignments=assignments)
+    blown_pm = TeeTimeWaveForecast(am_wave_wind_mph=8.0, pm_wave_wind_mph=28.0, assignments=assignments)
+    model = GolfFirstRoundMonteCarloModel(simulations=6000, seed=5)
+
+    calm_am = model.predict(state, forecast=calm).frl_probability_for("am_player")
+    blown = model.predict(state, forecast=blown_pm)
+    blown_am = blown.frl_probability_for("am_player")
+
+    assert abs(calm_am - 0.5) < 0.06  # equal winds -> ~symmetric
+    assert blown_am > 0.58  # AM wave gains a structural edge when PM is blown out
+    assert blown_am > blown.frl_probability_for("pm_player")
+
+
+def test_first_round_round_score_cdf_is_monotone_and_centered() -> None:
+    state = _frl_state([_player("a", sg_approach=2.0), _player("b")])
+    prediction = GolfFirstRoundMonteCarloModel(simulations=500, seed=4).predict(state)
+    mean_a = next(p.projected_round_score_to_par for p in prediction.player_probabilities if p.player_id == "a")
+
+    lo = prediction.round_score_probability_at_most("a", mean_a - 3)
+    mid = prediction.round_score_probability_at_most("a", mean_a)
+    hi = prediction.round_score_probability_at_most("a", mean_a + 3)
+
+    assert lo < mid < hi
+    assert abs(mid - 0.5) < 1e-9
+
+
+def test_first_round_signal_matches_frl_strategy_schema() -> None:
+    state = _frl_state([_player("am_player", market_id="FRL-AM"), _player("pm_player", market_id="FRL-PM")])
+    forecast = TeeTimeWaveForecast(
+        am_wave_wind_mph=8.0,
+        pm_wave_wind_mph=28.0,
+        assignments=(
+            WaveAssignment("am_player", "am", wind_sg_baseline=0.3, market_id="FRL-AM"),
+            WaveAssignment("pm_player", "pm", market_id="FRL-PM"),
+        ),
+    )
+    prediction = GolfFirstRoundMonteCarloModel(simulations=2000, seed=2).predict(state, forecast=forecast)
+
+    signal = prediction.to_frl_signal(forecast)
+
+    assert signal.source == "weather_tee_combined"
+    assert signal.payload["am_wave_wind_mph"] == 8.0
+    assert signal.payload["pm_wave_wind_mph"] == 28.0
+    entries = {entry["player_id"]: entry for entry in signal.payload["players"]}
+    assert entries["am_player"]["wave"] == "am"
+    assert entries["am_player"]["wind_sg_baseline"] == 0.3
+    assert "model_frl_probability" in entries["am_player"]
+
+
+def test_first_round_signal_drives_frl_weather_arb_strategy() -> None:
+    load_entry_points()
+    state = _frl_state([_player("am_player", market_id="FRL-AM"), _player("pm_player", market_id="FRL-PM")])
+    forecast = TeeTimeWaveForecast(
+        am_wave_wind_mph=8.0,
+        pm_wave_wind_mph=28.0,
+        assignments=(
+            WaveAssignment("am_player", "am", market_id="FRL-AM"),
+            WaveAssignment("pm_player", "pm", market_id="FRL-PM"),
+        ),
+    )
+    signal = GolfFirstRoundMonteCarloModel(simulations=2000, seed=2).predict(state, forecast=forecast).to_frl_signal(
+        forecast
+    )
+    spec = StrategySpec(
+        strategy_id="frl-e2e",
+        name="sports_frl_weather_arb",
+        version="1",
+        description="producer->strategy e2e",
+        feature_schema_id="sports_frl_weather_features",
+        subscription=EventSubscription(
+            venues=("kalshi",),
+            instrument_patterns=("FRL-*",),
+            event_kinds=("external", "quote"),
+            external_sources=("weather_tee_combined",),
+        ),
+        parameters={
+            "player_market_map": "am_player:FRL-AM;pm_player:FRL-PM",
+            "signal_source": "weather_tee_combined",
+            "field_size": "156",
+            "min_edge_bps": "100",
+            "size": "5",
+            "venue": "kalshi",
+        },
+    )
+    strat = create_from_spec(spec)
+    ctx = _Ctx()
+
+    strat.on_event(_quote("FRL-AM", "0.010", "0.014"), ctx)  # mid 0.012, cheap AM player
+    strat.on_event(_quote("FRL-PM", "0.040", "0.060"), ctx)  # mid 0.050
+    decisions = strat.on_event(signal, ctx)
+
+    orders = [d for d in decisions if isinstance(d, PlaceOrder)]
+    assert orders, "producer signal should drive at least one FRL order"
+    am_orders = [o for o in orders if o.instrument_id.market_id == "FRL-AM"]
+    assert am_orders, "the favored AM-wave player should be a tradable edge"
+    assert am_orders[0].outcome_side is OutcomeSide.YES
+    assert am_orders[0].order_side is OrderSide.BUY

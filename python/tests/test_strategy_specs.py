@@ -60,6 +60,7 @@ STRATEGY_CONFIGS: tuple[str, ...] = tuple(
 
 SLEEVE_CONFIGS: tuple[str, ...] = (
     "weather-kalshi-paper-a.toml",
+    "weather-kalshi-live-a.toml",
     "microstructure-obi-paper-a.toml",
     "macro-nfp-kalshi-paper-a.toml",
     "arbitrage-cross-venue-kalshi-paper-a.toml",
@@ -328,7 +329,9 @@ def _box_office(strategy: Strategy, ctx: InMemoryContext) -> Sequence[StrategyDe
         _quote_event(_instrument("KXBOXOFFICE-WEEKEND"), bid="0.20", ask="0.22", event_id="box-quote"),
         ctx,
     )
-    _dispatch(
+    # Promoted box_office is signal-triggered (the live Rust runtime has no
+    # timer); the order fires on the external signal, which must carry market_id.
+    return _dispatch(
         strategy,
         ExternalSignalEvent(
             event_id=EventId("box-signal"),
@@ -337,16 +340,12 @@ def _box_office(strategy: Strategy, ctx: InMemoryContext) -> Sequence[StrategyDe
             received_at=NOW,
             schema_version="box-office-v1",
             payload={
+                "market_id": "KXBOXOFFICE-WEEKEND",
                 "seat_occupancy_pct": "1.0",
                 "ticket_velocity_per_hour": "1000000",
                 "confidence": "0.90",
             },
         ),
-        ctx,
-    )
-    return _dispatch(
-        strategy,
-        TimerEvent(event_id=EventId("box-timer"), timestamp=NOW, label="friday_8pm_et"),
         ctx,
     )
 

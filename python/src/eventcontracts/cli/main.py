@@ -26,6 +26,7 @@ from eventcontracts.cli import replay as replay_cmd
 from eventcontracts.cli import sports_golf as sports_golf_cmd
 from eventcontracts.cli import strategy_tools as strategy_tools_cmd
 from eventcontracts.cli import sweep as sweep_cmd
+from eventcontracts.cli import tennis_odds_feed as tennis_odds_feed_cmd
 from eventcontracts.cli import tennis_xgboost as tennis_xgboost_cmd
 from eventcontracts.cli import train as train_cmd
 from eventcontracts.cli import validate_bundle as validate_bundle_cmd
@@ -90,6 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_cmd.register(subparsers)
     model_train_cmd.register(subparsers)
     tennis_xgboost_cmd.register(subparsers)
+    tennis_odds_feed_cmd.register(subparsers)
     sports_golf_cmd.register(subparsers)
     strategy_tools_cmd.register(subparsers)
     weather_cmd.register(subparsers)

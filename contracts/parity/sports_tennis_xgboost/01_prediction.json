@@ -3,7 +3,7 @@
   "event": {
     "event_id": "tennis:prediction:1",
     "event_kind": "external",
-    "payload_json": "{\"market_id\":\"KX-ATP-DEMO\",\"player_1_win_probability\":\"0.70\"}",
+    "payload_json": "{\"market_id\":\"KX-ATP-DEMO\",\"model_confidence\":\"0.70\",\"odds_present\":true,\"player_1_win_probability\":\"0.70\"}",
     "provenance": {
       "source": "tennis_xgboost_onnx",
       "channel": "external",

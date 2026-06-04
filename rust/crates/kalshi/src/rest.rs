@@ -300,6 +300,12 @@ pub struct KalshiOrder {
     pub created_time: Option<String>,
     #[serde(default)]
     pub last_update_time: Option<String>,
+    /// Any venue fields we do not explicitly model above. Captured rather than
+    /// silently dropped so that a Kalshi field rename — e.g. the limit price
+    /// moving to a new key — surfaces in the reconcile-on-start failure dump
+    /// instead of masquerading as a priceless order.
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, Value>,
 }
 
 impl KalshiOrder {

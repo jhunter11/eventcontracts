@@ -1,0 +1,31 @@
+{
+  "case_id": "entertainment_box_office_03_signal_lowconf",
+  "event": {
+    "event_id": "box:signal:2",
+    "event_kind": "external",
+    "payload_json": "{\"market_id\":\"KXBOXOFFICE-WEEKEND\",\"seat_occupancy_pct\":\"0.8\",\"ticket_velocity_per_hour\":\"1000000\",\"confidence\":\"0.5\"}",
+    "provenance": {
+      "source": "apify-fandango",
+      "channel": "external",
+      "schema_version": "apify-fandango-v1",
+      "venue": "kalshi",
+      "source_sequence": "3",
+      "normalization_version": "normalizer-v1",
+      "metadata": {}
+    },
+    "audit": {
+      "object_id": "box:signal:2",
+      "object_kind": "normalized_event",
+      "schema_version": "normalized-event-v1",
+      "produced_at": "2026-05-26T12:00:02Z",
+      "producer": "external-fixture",
+      "canonical_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "parent_ids": [],
+      "trace_id": null,
+      "metadata": {}
+    }
+  },
+  "feature_vector": null,
+  "expected_decisions": [],
+  "tolerance_bps": "0"
+}

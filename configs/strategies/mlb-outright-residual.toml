@@ -1,0 +1,36 @@
+strategy_id = "mlb-outright-residual-v1"
+name = "external_edge"
+version = "1.0.0"
+description = "MLB outright (division/pennant/series) residual vs sportsbook futures + schedule simulation (long-duration, correlation-capped)."
+feature_schema_id = "mlb_outright_residual_features"
+
+[subscription]
+venues = ["kalshi"]
+# Confirm exact outright series tickers via REST discovery.
+instrument_patterns = ["KXMLBSERIES*", "KXMLBDIV*", "KXMLBPENNANT*"]
+event_kinds = ["quote", "external"]
+external_sources = ["mlb-outright-model"]
+
+[default_execution_priority]
+tier = "relaxed"
+max_delay_ms = 5000
+expires_after_ms = 3600000
+reason = "season-long outrights move slowly; latency is irrelevant, capital duration is the cost"
+
+[parameters]
+# Producer publishes a YES probability per outright from sportsbook futures +
+# team-strength + schedule simulation. Higher edge bar than moneylines because
+# capital is locked for months; cap correlated additions at the sleeve level.
+signal_source = "mlb-outright-model"
+min_edge_bps = "300"
+size = "3"
+confidence_floor = "0"
+venue = "kalshi"
+
+[tags]
+family = "sports"
+subfamily = "outright"
+mode = "paper"
+archetype = "external_edge"
+research_doc = "docs/v7-live-test-ready-strategy-specs.md"
+note = "long-duration: apply capital-duration + portfolio-correlation penalties"

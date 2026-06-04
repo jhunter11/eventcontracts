@@ -103,6 +103,16 @@ pub fn default_registry() -> StrategyRegistry {
     r.register("sports_tennis_xgboost", |spec| {
         Ok(Box::new(crate::TennisXgboostStrategy::from_spec(spec)?))
     });
+    r.register("weather_temperature_arbitrage", |spec| {
+        Ok(Box::new(
+            crate::WeatherTemperatureArbitrageStrategy::from_spec(spec)?,
+        ))
+    });
+    r.register("entertainment_box_office", |spec| {
+        Ok(Box::new(crate::EntertainmentBoxOfficeStrategy::from_spec(
+            spec,
+        )?))
+    });
     r
 }
 
@@ -133,6 +143,7 @@ size = "10"
         assert!(names.contains(&"weather_threshold"));
         assert!(names.contains(&"example_threshold"));
         assert!(names.contains(&"sports_tennis_xgboost"));
+        assert!(names.contains(&"weather_temperature_arbitrage"));
     }
 
     #[test]
@@ -159,6 +170,25 @@ size = "5"
         .unwrap();
         let strat = r.instantiate(&spec).unwrap();
         assert_eq!(strat.strategy_id(), "sports-tennis-xgboost-v1");
+    }
+
+    #[test]
+    fn instantiate_returns_runtime_for_weather_temperature_arbitrage() {
+        let r = default_registry();
+        let spec = StrategySpecArtifact::from_toml_str(
+            r#"
+strategy_id = "weather-temperature-arbitrage-live-v1"
+name = "weather_temperature_arbitrage"
+version = "1.0.0"
+[parameters]
+signal_source = "open-meteo"
+min_edge_bps = "150"
+size = "1"
+"#,
+        )
+        .unwrap();
+        let strat = r.instantiate(&spec).unwrap();
+        assert_eq!(strat.strategy_id(), "weather-temperature-arbitrage-live-v1");
     }
 
     #[test]

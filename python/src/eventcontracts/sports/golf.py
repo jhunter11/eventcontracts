@@ -53,6 +53,9 @@ class GolfPlayerSnapshot:
     baseline_score_to_par_per_hole: float = 0.0
     wave_weather_delta_per_round: float = 0.0
     market_id: str | None = None
+    injury_strokes_per_round: float = 0.0
+    rest_fatigue_strokes_per_round: float = 0.0
+    caddie_absence_strokes_per_round: float = 0.0
 
     def __post_init__(self) -> None:
         require_non_empty(self.player_id, "player_id")
@@ -60,6 +63,13 @@ class GolfPlayerSnapshot:
             raise ValueError("holes_completed must be >= 0")
         if self.market_id is not None:
             require_non_empty(self.market_id, "market_id")
+        for name, value in (
+            ("injury_strokes_per_round", self.injury_strokes_per_round),
+            ("rest_fatigue_strokes_per_round", self.rest_fatigue_strokes_per_round),
+            ("caddie_absence_strokes_per_round", self.caddie_absence_strokes_per_round),
+        ):
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
 
 
 @dataclass(frozen=True)
@@ -500,7 +510,10 @@ class GolfCutLineMonteCarloModel:
         weather_per_hole = (player.wave_weather_delta_per_round * self.weather_weight_per_round) / 18.0
         skill_per_hole = -(player.sg_approach * self.approach_weight_per_sg)
         skill_per_hole -= player.sg_putting * self.putting_weight_per_sg
-        return remaining_holes * (player.baseline_score_to_par_per_hole + weather_per_hole + skill_per_hole)
+        context_per_hole = _availability_context_strokes_per_round(player) / 18.0
+        return remaining_holes * (
+            player.baseline_score_to_par_per_hole + weather_per_hole + skill_per_hole + context_per_hole
+        )
 
 
 class GolfWinnerMonteCarloModel:
@@ -576,7 +589,10 @@ class GolfWinnerMonteCarloModel:
         weather_per_hole = (player.wave_weather_delta_per_round * self.weather_weight_per_round) / 18.0
         skill_per_hole = -(player.sg_approach * self.approach_weight_per_sg)
         skill_per_hole -= player.sg_putting * self.putting_weight_per_sg
-        return remaining_holes * (player.baseline_score_to_par_per_hole + weather_per_hole + skill_per_hole)
+        context_per_hole = _availability_context_strokes_per_round(player) / 18.0
+        return remaining_holes * (
+            player.baseline_score_to_par_per_hole + weather_per_hole + skill_per_hole + context_per_hole
+        )
 
 
 def bracket_map_from_mapping(mapping: Mapping[int, str]) -> tuple[CutLineBracket, ...]:
@@ -594,6 +610,14 @@ def _sports_model_provenance(*, source: str, schema_version: str) -> EventProven
         channel="predictive_model",
         schema_version=schema_version,
         metadata={"model_family": "sports_golf_monte_carlo"},
+    )
+
+
+def _availability_context_strokes_per_round(player: GolfPlayerSnapshot) -> float:
+    return (
+        player.injury_strokes_per_round
+        + player.rest_fatigue_strokes_per_round
+        + player.caddie_absence_strokes_per_round
     )
 
 

@@ -63,6 +63,21 @@ impl ParamValue {
             ParamValue::Bool(_) => Err("bool not coercible to f64".into()),
         }
     }
+
+    /// Parse as bool from TOML boolean, numeric 0/1, or common string forms.
+    pub fn as_bool(&self) -> Result<bool, String> {
+        match self {
+            ParamValue::Bool(b) => Ok(*b),
+            ParamValue::Int(0) => Ok(false),
+            ParamValue::Int(1) => Ok(true),
+            ParamValue::Int(_) | ParamValue::Float(_) => Err("number not coercible to bool".into()),
+            ParamValue::Str(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "y" | "on" => Ok(true),
+                "false" | "0" | "no" | "n" | "off" => Ok(false),
+                _ => Err("string not coercible to bool".into()),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -162,6 +177,16 @@ impl StrategySpecArtifact {
         }
     }
 
+    /// Optional parameter as bool with a default.
+    pub fn param_bool_or(&self, key: &str, default: bool) -> Result<bool, SpecError> {
+        match self.parameters.get(key) {
+            None => Ok(default),
+            Some(v) => v
+                .as_bool()
+                .map_err(|e| SpecError::InvalidParameter(key.to_string(), e)),
+        }
+    }
+
     /// Optional parameter as decimal-string (canonical form, no rounding).
     pub fn param_str_or(&self, key: &str, default: &str) -> String {
         self.parameters
@@ -240,5 +265,6 @@ d = true
         assert_eq!(spec.param_f64("b").unwrap(), 0.5);
         assert_eq!(spec.param_f64("c").unwrap(), 5.0);
         assert!(spec.param_f64("d").is_err());
+        assert!(spec.param_bool_or("d", false).unwrap());
     }
 }

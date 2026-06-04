@@ -84,6 +84,12 @@ pub struct SleeveState {
     /// UTC day for which `daily_realized_loss` accumulates. Caller writes
     /// `today_utc_day` before each evaluate; on day rollover the loss is reset.
     pub daily_loss_day_utc: i32,
+    /// Available settled cash in dollars * 10_000. `None` means "unknown" and
+    /// the cash gate is skipped (paper, or a failed balance fetch). `Some(v)`
+    /// is enforced: a BUY whose notional exceeds it is rejected. Seeded from the
+    /// venue balance at startup reconciliation and maintained on every fill
+    /// (buys debit, sells credit, fees debit) by the gateway.
+    pub available_cash_ticks: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -139,6 +145,10 @@ pub enum RiskRejection {
     DailyLossExceeded {
         realized: String,
         limit: String,
+    },
+    InsufficientCash {
+        required: String,
+        available: String,
     },
     KillSwitchEngaged,
     StaleMarketData {
@@ -319,6 +329,22 @@ impl RiskGate {
             });
         }
 
+        // Available-cash gate (BUYs only). A SELL closes inventory and returns
+        // cash on a binary venue, so it never needs buying power. When cash is
+        // unknown (`None`, e.g. paper or a failed balance fetch) the gate is
+        // skipped and the notional/gross caps remain the only bound. Mirrors the
+        // Python `check_available_cash`.
+        if matches!(intent.side, Side::Buy) {
+            if let Some(available) = state.available_cash_ticks {
+                if order_notional > i128::from(available) {
+                    return RiskDecision::Rejected(RiskRejection::InsufficientCash {
+                        required: format_money(order_notional),
+                        available: format_money(i128::from(available)),
+                    });
+                }
+            }
+        }
+
         if let Some(fair_raw) = intent.fair_price.as_deref() {
             let fair = match parse_fixed(fair_raw) {
                 Ok(v) => v,
@@ -490,6 +516,40 @@ pub fn invalidate_quote_bbo(state: &mut SleeveState, instrument_id: &str, now_ep
         state.best_bid_qty_ticks.remove(&key);
         state.best_ask_qty_ticks.remove(&key);
         state.mark_price_ticks.remove(&key);
+    }
+}
+
+/// Net liquidation-mark unrealized drawdown across all open positions, in
+/// dollars * 10_000 (>= 0; gains net against losses and a net gain returns 0).
+///
+/// Each position is marked to the price it would *exit* into: a long (qty > 0)
+/// to its side-specific best bid, a short (qty < 0) to its best ask. A position
+/// with no recorded executable quote keeps its entry price (no mark move), so a
+/// stale book never manufactures phantom drawdown. The result is written into
+/// `SleeveState::unrealized_drawdown_loss`, which the daily-loss gate folds in
+/// alongside realized loss — so a held position bleeding intraday counts toward
+/// `max_daily_loss` before it is realized at settlement.
+pub fn liquidation_unrealized_drawdown_ticks(state: &SleeveState) -> i64 {
+    let mut net: i128 = 0;
+    for (key, pos) in &state.positions {
+        if pos.quantity == 0 {
+            continue;
+        }
+        let exit_ticks = if pos.quantity > 0 {
+            state.best_bid_ticks.get(key)
+        } else {
+            state.best_ask_ticks.get(key)
+        }
+        .copied()
+        .unwrap_or(pos.avg_price_ticks);
+        let pnl = i128::from(exit_ticks.saturating_sub(pos.avg_price_ticks))
+            .saturating_mul(i128::from(pos.quantity));
+        net = net.saturating_add(pnl);
+    }
+    if net < 0 {
+        clamp_i128_to_i64(-net)
+    } else {
+        0
     }
 }
 
@@ -801,6 +861,35 @@ mod tests {
         ));
     }
 
+    /// F4 no-latch invariant: unlike the Python soft-halt (which latches a
+    /// one-way kill switch on a realized breach until an operator resets it),
+    /// the Rust live gate re-evaluates the daily-loss cap on every event and
+    /// holds no breach memory. So if realized loss recovers below the cap, a new
+    /// risk-increasing BUY is allowed again on the very next evaluation. This is
+    /// the documented, intended live behaviour ("keep de-risking, block new buys
+    /// only while over the cap"); the hard process-level stops are the
+    /// kill-switch file, --max-live-orders, and the toxicity breaker.
+    #[test]
+    fn daily_loss_gate_does_not_latch_and_reopens_when_loss_recovers() {
+        let gate = RiskGate::new(limits());
+        let mut state = fresh_state();
+
+        // Over the cap (250) -> a risk-increasing BUY is rejected.
+        state.daily_realized_loss = 300 * SCALE as i64;
+        assert!(matches!(
+            gate.evaluate(&state, &intent(Side::Buy, "0.5", "10"), NOW),
+            RiskDecision::Rejected(RiskRejection::DailyLossExceeded { .. })
+        ));
+
+        // Same gate, loss now recovered below the cap -> the identical BUY is
+        // approved. A latching gate would still reject here.
+        state.daily_realized_loss = 10 * SCALE as i64;
+        assert_eq!(
+            gate.evaluate(&state, &intent(Side::Buy, "0.5", "10"), NOW),
+            RiskDecision::Approved
+        );
+    }
+
     #[test]
     fn rejects_projected_position_notional_breach() {
         let mut lim = limits();
@@ -936,5 +1025,89 @@ mod tests {
         let dec = gate.evaluate(&state, &intent, NOW);
 
         assert_eq!(dec, RiskDecision::Approved);
+    }
+
+    #[test]
+    fn rejects_buy_exceeding_available_cash_but_allows_sell() {
+        // F6: BUY consumes cash and is gated; SELL returns cash and is never
+        // blocked by the cash gate. $5 cash, BUY 100 @ 0.90 = $90 notional.
+        let gate = RiskGate::new(limits());
+        let mut state = fresh_state();
+        state.available_cash_ticks = Some(5 * SCALE as i64);
+        let buy = gate.evaluate(&state, &intent(Side::Buy, "0.90", "100"), NOW);
+        assert!(matches!(
+            buy,
+            RiskDecision::Rejected(RiskRejection::InsufficientCash { .. })
+        ));
+        // A SELL of a held long is an exit; the cash gate must not block it.
+        state.positions.insert(
+            outcome_position_key("kalshi:M-1", OutcomeSide::Yes),
+            Position {
+                quantity: 100,
+                avg_price_ticks: 5000,
+            },
+        );
+        let sell = gate.evaluate(&state, &intent(Side::Sell, "0.90", "100"), NOW);
+        assert_eq!(sell, RiskDecision::Approved);
+    }
+
+    #[test]
+    fn cash_gate_skipped_when_balance_unknown() {
+        // None == unknown: the gate is inert (paper / failed balance fetch).
+        let gate = RiskGate::new(limits());
+        let mut state = fresh_state();
+        state.available_cash_ticks = None;
+        let dec = gate.evaluate(&state, &intent(Side::Buy, "0.90", "100"), NOW);
+        assert_eq!(dec, RiskDecision::Approved);
+    }
+
+    #[test]
+    fn liquidation_drawdown_marks_long_to_bid() {
+        // F3: a long 10 @ $0.50 with the bid at $0.49 is $0.10/contract * 10 =
+        // $1.00 underwater → 1.00 * SCALE drawdown ticks.
+        let mut state = fresh_state(); // records bid 4900 / ask 5100 for M-1
+        state.positions.insert(
+            outcome_position_key("kalshi:M-1", OutcomeSide::Yes),
+            Position {
+                quantity: 10,
+                avg_price_ticks: 5000,
+            },
+        );
+        assert_eq!(liquidation_unrealized_drawdown_ticks(&state), 1000);
+        // A position in the green (entry below the bid) contributes no drawdown.
+        state.positions.insert(
+            outcome_position_key("kalshi:M-1", OutcomeSide::Yes),
+            Position {
+                quantity: 10,
+                avg_price_ticks: 4800,
+            },
+        );
+        assert_eq!(liquidation_unrealized_drawdown_ticks(&state), 0);
+    }
+
+    #[test]
+    fn unrealized_drawdown_feeds_daily_loss_gate() {
+        // The drawdown the helper computes, written into the sleeve state, trips
+        // the daily-loss gate exactly like realized loss does.
+        let gate = RiskGate::new(limits()); // max_daily_loss = 250
+        let mut state = fresh_state();
+        state.positions.insert(
+            outcome_position_key("kalshi:OTHER", OutcomeSide::Yes),
+            Position {
+                quantity: 1000,
+                avg_price_ticks: 5000,
+            },
+        );
+        // Mark OTHER's bid far below entry: (200 - 5000) * 1000 = -$480 drawdown.
+        state
+            .best_bid_ticks
+            .insert(outcome_position_key("kalshi:OTHER", OutcomeSide::Yes), 200);
+        state.unrealized_drawdown_loss = liquidation_unrealized_drawdown_ticks(&state);
+        assert!(state.unrealized_drawdown_loss >= 250 * SCALE as i64);
+        let dec = gate.evaluate(&state, &intent(Side::Buy, "0.50", "1"), NOW);
+        assert!(matches!(
+            dec,
+            RiskDecision::Rejected(RiskRejection::DailyLossExceeded { .. })
+        ));
     }
 }

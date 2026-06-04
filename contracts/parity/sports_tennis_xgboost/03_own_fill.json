@@ -1,0 +1,31 @@
+{
+  "case_id": "sports_tennis_xgboost_03_own_fill",
+  "event": {
+    "event_id": "tennis:own_fill:1",
+    "event_kind": "own_fill",
+    "payload_json": "{\"fill_id\":\"f-tennis-1\",\"instrument\":\"kalshi:KX-ATP-DEMO\",\"client_order_id\":\"c-tennis-buy-00000001\",\"price\":\"0.57\",\"quantity\":\"5\",\"remaining_quantity\":\"0\",\"fee\":\"0\"}",
+    "provenance": {
+      "source": "kalshi-ws",
+      "channel": "fills",
+      "schema_version": "kalshi-ws-v1",
+      "venue": "kalshi",
+      "source_sequence": "3",
+      "normalization_version": "kalshi-ws-v1",
+      "metadata": {}
+    },
+    "audit": {
+      "object_id": "tennis:own_fill:1",
+      "object_kind": "normalized_event",
+      "schema_version": "normalized-event-v1",
+      "produced_at": "2026-05-26T12:00:02Z",
+      "producer": "external-fixture",
+      "canonical_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "parent_ids": [],
+      "trace_id": null,
+      "metadata": {}
+    }
+  },
+  "feature_vector": null,
+  "expected_decisions": [],
+  "tolerance_bps": "0"
+}

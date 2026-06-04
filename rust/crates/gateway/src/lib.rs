@@ -85,6 +85,19 @@ fn default_outcome_side() -> OutcomeSide {
     OutcomeSide::Yes
 }
 
+/// Decision payloads the gateway accepts from a strategy. `PlaceOrder` carries
+/// the full intent; `CancelOrder` only needs the client order id.
+///
+/// There is deliberately no `ReplaceOrder` variant (audit F5). The only live
+/// sleeve — the single-taker tennis-XGBoost strategy — prices at the opposite
+/// touch with `TimeInForce::Ioc`, so every order either fills immediately or is
+/// killed by the venue; it never rests and therefore can never need an in-place
+/// reprice. A partial-fill tail is handled by `CancelOrder`, not amendment.
+/// `ReplaceOrder` would only be required by a future resting/maker quoting
+/// sleeve, and adding it before such a sleeve exists would put untested
+/// order-mutation code on the real-money path. The IOC-only invariant of the
+/// live taker is enforced by `tennis_taker_emits_ioc_orders_only` in the runner
+/// crate.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum DecisionPayload {
@@ -1608,6 +1621,15 @@ impl<C: VenueClient> DryRunGateway<C> {
             .saturating_add(loss_contribution)
             .saturating_add(fee_ticks.max(0));
 
+        // F6: keep available cash in sync when it is tracked (live, seeded from
+        // the venue balance at reconcile). A buy debits cash, a sell credits it
+        // (`cash_delta_ticks` already carries the sign), and fees always debit.
+        if let Some(cash) = self.sleeve_state.available_cash_ticks.as_mut() {
+            *cash = cash
+                .saturating_add(cash_delta_ticks)
+                .saturating_sub(fee_ticks.max(0));
+        }
+
         self.ledger.push(LedgerEntry {
             ts: trade_ts,
             client_order_id,
@@ -2753,6 +2775,83 @@ mod tests {
                 quantity: 10,
                 avg_price_ticks: 5000
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn live_path_async_submit_then_fills_track_cash_and_daily_loss() {
+        // F7 + F6 end-to-end: the async submit path (submit_async → ack → OMS
+        // Submitted), then venue fills through apply_fill the way the live runner
+        // feeds the WS `fill` channel — asserting the available-cash gauge and
+        // daily realized loss both track venue truth.
+        let mut gw = fresh_gateway();
+        gw.sleeve_state.available_cash_ticks = Some(100 * 10_000); // $100 funded
+
+        // Open: BUY 10 YES @ $0.50 via the async path.
+        gw.enqueue(place_intent(
+            "p1",
+            "c-1",
+            "standard",
+            "0.50",
+            "10",
+            "2026-05-26T12:00:00Z",
+        ))
+        .unwrap();
+        let acks = gw.process_batch_async("2026-05-26T12:00:00Z", 4).await;
+        assert!(acks[0].1.is_ok());
+        assert_eq!(gw.oms.get("c-1").unwrap().state, OrderState::Submitted);
+        // A submit is not a spend: cash is unchanged until the fill lands.
+        assert_eq!(gw.sleeve_state.available_cash_ticks, Some(100 * 10_000));
+
+        // Fill the buy fully at $0.50 with a $0.01 fee: cash debits $5.00 + fee.
+        gw.apply_fill(Fill {
+            fill_id: "f-1".into(),
+            client_order_id: "c-1".into(),
+            price: "0.50".into(),
+            quantity: "10".into(),
+            fee: "0.01".into(),
+            trade_ts: "2026-05-26T12:00:00Z".into(),
+        })
+        .unwrap();
+        assert_eq!(gw.sleeve_state.available_cash_ticks, Some(949_900));
+        assert_eq!(gw.sleeve_state.daily_realized_loss, 100); // opening fill: fee only
+        let yes_key = outcome_position_key("kalshi:M-1", OutcomeSide::Yes);
+        assert_eq!(gw.sleeve_state.positions[&yes_key].quantity, 10);
+
+        // Close at a loss: SELL 10 YES @ $0.49 (inside the last-look collar).
+        gw.enqueue(place_intent_with_side(
+            "p2",
+            "c-2",
+            "standard",
+            OutcomeSide::Yes,
+            Side::Sell,
+            "0.49",
+            "10",
+            "2026-05-26T12:00:00Z",
+        ))
+        .unwrap();
+        assert!(gw.process_batch_async("2026-05-26T12:00:00Z", 4).await[0]
+            .1
+            .is_ok());
+        gw.apply_fill(Fill {
+            fill_id: "f-2".into(),
+            client_order_id: "c-2".into(),
+            price: "0.49".into(),
+            quantity: "10".into(),
+            fee: "0.01".into(),
+            trade_ts: "2026-05-26T12:00:00Z".into(),
+        })
+        .unwrap();
+        // Sell credits $4.90, debits the $0.01 fee: 949_900 + 49_000 − 100.
+        assert_eq!(gw.sleeve_state.available_cash_ticks, Some(998_800));
+        // Realized loss = $0.10 on the close + $0.02 total fees = 0.12 → 1200.
+        assert_eq!(gw.sleeve_state.daily_realized_loss, 1200);
+        assert_eq!(
+            gw.sleeve_state
+                .positions
+                .get(&yes_key)
+                .map_or(0, |p| p.quantity),
+            0
         );
     }
 

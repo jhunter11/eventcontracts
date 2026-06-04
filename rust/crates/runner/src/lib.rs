@@ -162,6 +162,8 @@ pub enum StrategyEvent {
         source: String,
         market_id: String,
         probability: FixedPrice,
+        confidence: Option<FixedPrice>,
+        odds_present: Option<bool>,
     },
     ExternalProbability {
         source: String,
@@ -171,6 +173,23 @@ pub enum StrategyEvent {
         /// Strategies with a configured `min_confidence` suppress signals below
         /// it; absent confidence is treated as zero.
         confidence: Option<FixedPrice>,
+        /// Producer forecast lead in days (0 = settles today). Strategies whose
+        /// model is only valid at lead 0 (e.g. weather KXHIGH, whose calibration
+        /// sigma is nowcast-lead) refuse `lead_days != 0`. Absent = unconstrained.
+        lead_days: Option<i64>,
+        /// Market close time (RFC3339), used for a "no new trades within N seconds
+        /// of close" gate recomputed against `ctx.now`. Absent = no close gate.
+        close_time: Option<String>,
+    },
+    /// Generic external signal carrying the raw payload, for bespoke custom
+    /// strategies that compute their own model probability in-runtime (e.g.
+    /// box-office seat-occupancy/ticket-velocity -> implied gross). Emitted for
+    /// `external` events that carry a `market_id` but no recognized probability
+    /// key, so the existing probability/tennis paths are unaffected.
+    ExternalSignal {
+        source: String,
+        market_id: String,
+        payload_json: String,
     },
     Other {
         event_kind: String,
@@ -307,6 +326,10 @@ fn parse_external(event: &NormalizedEventRecord) -> Option<StrategyEvent> {
             source,
             market_id: market_id.to_string(),
             probability,
+            confidence: FixedPrice::parse(&payload, "model_confidence")
+                .ok()
+                .or_else(|| FixedPrice::parse(&payload, "confidence").ok()),
+            odds_present: parse_optional_bool(payload.get("odds_present")),
         });
     }
     for key in [
@@ -321,10 +344,47 @@ fn parse_external(event: &NormalizedEventRecord) -> Option<StrategyEvent> {
                 market_id: market_id.to_string(),
                 probability,
                 confidence: FixedPrice::parse(&payload, "confidence").ok(),
+                lead_days: payload.get("lead_days").and_then(parse_optional_i64),
+                close_time: payload
+                    .get("close_time")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
             });
         }
     }
-    None
+    // No recognized probability key: surface the raw payload so a bespoke
+    // custom strategy (e.g. box-office) can parse its own model inputs and
+    // compute the probability in-runtime. Requires `market_id` (checked above).
+    Some(StrategyEvent::ExternalSignal {
+        source,
+        market_id: market_id.to_string(),
+        payload_json: event.payload_json.clone(),
+    })
+}
+
+fn parse_optional_i64(value: &serde_json::Value) -> Option<i64> {
+    match value {
+        serde_json::Value::Number(n) => n.as_i64(),
+        serde_json::Value::String(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn parse_optional_bool(value: Option<&serde_json::Value>) -> Option<bool> {
+    match value? {
+        serde_json::Value::Bool(value) => Some(*value),
+        serde_json::Value::Number(value) => value.as_u64().and_then(|n| match n {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }),
+        serde_json::Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "y" | "on" => Some(true),
+            "false" | "0" | "no" | "n" | "off" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 // ---------- traits ----------
@@ -702,6 +762,7 @@ impl StrategyRuntime for ExternalEdgeStrategy {
                 market_id,
                 probability,
                 confidence,
+                ..
             } => {
                 if !self.signal_source.is_empty() && source != &self.signal_source {
                     return Ok(vec![]);
@@ -769,16 +830,577 @@ impl StrategyRuntime for ExternalEdgeStrategy {
     }
 }
 
+// ---------- weather temperature arbitrage taker ----------
+
+#[derive(Clone, Debug)]
+struct WeatherSignalState {
+    probability: FixedPrice,
+    received_epoch_secs: i64,
+    /// Market close as epoch seconds (parsed from the signal's RFC3339 close_time),
+    /// for the near-close gate recomputed against `now`. None = no close gate.
+    close_epoch_secs: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct WeatherMarketState {
+    instrument: Option<String>,
+    yes_bid: Option<FixedPrice>,
+    yes_ask: Option<FixedPrice>,
+    latest_signal: Option<WeatherSignalState>,
+    last_order_price_ticks: Option<i64>,
+    last_order_probability_ticks: Option<i64>,
+}
+
+/// Rust live implementation of `weather_temperature_arbitrage`.
+///
+/// It consumes quote/book ticks plus external probability events. Orders are
+/// IOC taker buys on the side with the larger executable edge. This is the
+/// promoted live path for the Python weather research loop: Python can keep
+/// producing calibrated Open-Meteo probabilities, while Rust owns submission,
+/// last-look, reconciliation, and kill-switch behavior.
+pub struct WeatherTemperatureArbitrageStrategy {
+    pub strategy_id: String,
+    pub sleeve_id: String,
+    signal_source: String,
+    min_edge_ticks: i64,
+    max_spread_ticks: i64,
+    spread_edge_multiplier: f64,
+    near_binary_price_ticks: i64,
+    near_binary_edge_ticks: i64,
+    max_signal_age_secs: i64,
+    min_seconds_to_close_secs: i64,
+    min_retrade_price_delta_ticks: i64,
+    min_retrade_probability_delta_ticks: i64,
+    quote_triggered_trading: bool,
+    size: String,
+    next_client_order: u64,
+    markets: HashMap<String, WeatherMarketState>,
+    priority_tier: String,
+    expires_after_ms: Option<u64>,
+}
+
+impl WeatherTemperatureArbitrageStrategy {
+    fn market_state_mut(
+        &mut self,
+        market_id: &str,
+        instrument: Option<&str>,
+    ) -> &mut WeatherMarketState {
+        let state = self.markets.entry(market_id.to_string()).or_default();
+        if let Some(instrument) = instrument {
+            state.instrument = Some(instrument.to_string());
+        }
+        state
+    }
+
+    fn update_book_bbo(
+        &mut self,
+        market_id: &str,
+        instrument: &str,
+        bids: &[(FixedPrice, u32)],
+        asks: &[(FixedPrice, u32)],
+    ) {
+        let (Some((yes_bid, _)), Some((no_bid, _))) = (bids.first(), asks.first()) else {
+            return;
+        };
+        let yes_ask_ticks = PRICE_SCALE.saturating_sub(no_bid.ticks());
+        if yes_bid.ticks() <= 0 || yes_ask_ticks <= 0 {
+            return;
+        }
+        let state = self.market_state_mut(market_id, Some(instrument));
+        state.yes_bid = Some(*yes_bid);
+        state.yes_ask = Some(FixedPrice(yes_ask_ticks));
+    }
+
+    fn evaluate_market(
+        &mut self,
+        market_id: &str,
+        now_epoch_secs: i64,
+    ) -> Result<Vec<DecisionPayload>, RunnerError> {
+        let Some(state) = self.markets.get(market_id) else {
+            return Ok(vec![]);
+        };
+        let Some(signal) = state.latest_signal.clone() else {
+            return Ok(vec![]);
+        };
+        if self.max_signal_age_secs > 0 {
+            let age = now_epoch_secs.saturating_sub(signal.received_epoch_secs);
+            if age < 0 || age > self.max_signal_age_secs {
+                return Ok(vec![]);
+            }
+        }
+        // Near-close gate (Python parity): don't open new positions within
+        // `min_seconds_to_close` of market close. Recomputed against `now` so it
+        // fires identically on signal arrival and on quote/book re-fires.
+        if self.min_seconds_to_close_secs > 0 {
+            if let Some(close_epoch) = signal.close_epoch_secs {
+                if close_epoch.saturating_sub(now_epoch_secs) < self.min_seconds_to_close_secs {
+                    return Ok(vec![]);
+                }
+            }
+        }
+        let (Some(instrument), Some(yes_bid), Some(yes_ask)) =
+            (state.instrument.clone(), state.yes_bid, state.yes_ask)
+        else {
+            return Ok(vec![]);
+        };
+        if !(yes_bid.ticks() > 0 && yes_ask.ticks() > 0 && yes_ask.ticks() < PRICE_SCALE) {
+            return Ok(vec![]);
+        }
+        let spread_ticks = yes_ask.ticks().saturating_sub(yes_bid.ticks());
+        if yes_ask.ticks() <= yes_bid.ticks() || spread_ticks > self.max_spread_ticks {
+            return Ok(vec![]);
+        }
+
+        let dynamic_edge_ticks = (spread_ticks as f64 * self.spread_edge_multiplier).round() as i64;
+        let required_edge_ticks = self.min_edge_ticks.saturating_add(dynamic_edge_ticks);
+        let mut yes_edge_ticks = signal.probability.ticks() - yes_ask.ticks();
+        let no_ask_ticks = PRICE_SCALE.saturating_sub(yes_bid.ticks());
+        let no_probability_ticks = PRICE_SCALE.saturating_sub(signal.probability.ticks());
+        let mut no_edge_ticks = no_probability_ticks - no_ask_ticks;
+        if yes_ask.ticks() >= self.near_binary_price_ticks {
+            yes_edge_ticks = yes_edge_ticks.saturating_sub(self.near_binary_edge_ticks);
+        }
+        if no_ask_ticks >= self.near_binary_price_ticks {
+            no_edge_ticks = no_edge_ticks.saturating_sub(self.near_binary_edge_ticks);
+        }
+        if yes_edge_ticks < required_edge_ticks && no_edge_ticks < required_edge_ticks {
+            return Ok(vec![]);
+        }
+
+        let (outcome_side, price_ticks, fair_ticks) = if yes_edge_ticks >= no_edge_ticks {
+            (
+                OutcomeSide::Yes,
+                yes_ask.ticks(),
+                signal.probability.ticks(),
+            )
+        } else {
+            (OutcomeSide::No, no_ask_ticks, no_probability_ticks)
+        };
+        if !self.can_retrade(market_id, price_ticks, signal.probability.ticks()) {
+            return Ok(vec![]);
+        }
+
+        self.next_client_order += 1;
+        let client_order_id = format!("c-weather-{:08}", self.next_client_order);
+        let state = self.market_state_mut(market_id, Some(&instrument));
+        state.last_order_price_ticks = Some(price_ticks);
+        state.last_order_probability_ticks = Some(signal.probability.ticks());
+
+        Ok(vec![DecisionPayload::PlaceOrder {
+            client_order_id,
+            instrument_id: instrument,
+            outcome_side,
+            side: Side::Buy,
+            price: format_decimal_ticks(price_ticks),
+            quantity: self.size.clone(),
+            fair_price: Some(format_decimal_ticks(fair_ticks)),
+            min_executable_edge_ticks: Some(self.min_edge_ticks / 100),
+            fee_rate_bps: Some(700),
+            time_in_force: TimeInForce::Ioc,
+        }])
+    }
+
+    fn can_retrade(&self, market_id: &str, price_ticks: i64, probability_ticks: i64) -> bool {
+        let Some(state) = self.markets.get(market_id) else {
+            return true;
+        };
+        let price_moved = state
+            .last_order_price_ticks
+            .map(|last| (price_ticks - last).abs() >= self.min_retrade_price_delta_ticks)
+            .unwrap_or(true);
+        let probability_moved = state
+            .last_order_probability_ticks
+            .map(|last| {
+                (probability_ticks - last).abs() >= self.min_retrade_probability_delta_ticks
+            })
+            .unwrap_or(true);
+        price_moved || probability_moved
+    }
+}
+
+impl FromSpec for WeatherTemperatureArbitrageStrategy {
+    fn from_spec(spec: &StrategySpecArtifact) -> Result<Self, SpecError> {
+        let signal_source = spec.param_str_or("signal_source", "open-meteo");
+        let min_edge_bps = spec.param_f64_or("min_edge_bps", 150.0)?;
+        let max_spread = spec.param_f64_or("max_spread", 0.80)?;
+        let spread_edge_multiplier = spec.param_f64_or("spread_edge_multiplier", 0.0)?;
+        let near_binary_price = spec.param_f64_or("near_binary_price", 0.95)?;
+        let near_binary_min_edge_bps = spec.param_f64_or("near_binary_min_edge_bps", 600.0)?;
+        let max_signal_age_seconds = spec.param_f64_or("max_signal_age_seconds", 180.0)?;
+        let min_seconds_to_close = spec.param_f64_or("min_seconds_to_close", 0.0)?;
+        let min_retrade_price_delta = spec.param_f64_or("min_retrade_price_delta", 0.03)?;
+        let min_retrade_probability_delta =
+            spec.param_f64_or("min_retrade_probability_delta", 0.04)?;
+        let quote_triggered_trading = spec.param_bool_or("quote_triggered_trading", true)?;
+        let max_size = spec.param_str_or("max_size", "1");
+        let size = spec.param_str_or("size", &max_size);
+        let sleeve_id = spec
+            .tags
+            .get("sleeve_id")
+            .cloned()
+            .unwrap_or_else(|| format!("{}-sleeve", spec.strategy_id));
+        let (tier, expires_after_ms) = priority_from_spec(spec);
+        Ok(Self {
+            strategy_id: spec.strategy_id.clone(),
+            sleeve_id,
+            signal_source,
+            min_edge_ticks: ((min_edge_bps / 10_000.0) * PRICE_SCALE as f64).round() as i64,
+            max_spread_ticks: (max_spread * PRICE_SCALE as f64).round() as i64,
+            spread_edge_multiplier,
+            near_binary_price_ticks: (near_binary_price * PRICE_SCALE as f64).round() as i64,
+            near_binary_edge_ticks: ((near_binary_min_edge_bps / 10_000.0) * PRICE_SCALE as f64)
+                .round() as i64,
+            max_signal_age_secs: max_signal_age_seconds.round().max(0.0) as i64,
+            min_seconds_to_close_secs: min_seconds_to_close.round().max(0.0) as i64,
+            min_retrade_price_delta_ticks: (min_retrade_price_delta * PRICE_SCALE as f64).round()
+                as i64,
+            min_retrade_probability_delta_ticks: (min_retrade_probability_delta
+                * PRICE_SCALE as f64)
+                .round() as i64,
+            quote_triggered_trading,
+            size,
+            next_client_order: 0,
+            markets: HashMap::new(),
+            priority_tier: tier,
+            expires_after_ms,
+        })
+    }
+}
+
+impl StrategyRuntime for WeatherTemperatureArbitrageStrategy {
+    fn strategy_id(&self) -> &str {
+        &self.strategy_id
+    }
+
+    fn sleeve_id(&self) -> &str {
+        &self.sleeve_id
+    }
+
+    fn priority_tier(&self) -> &str {
+        &self.priority_tier
+    }
+
+    fn expires_after_ms(&self) -> Option<u64> {
+        self.expires_after_ms
+    }
+
+    fn on_event(
+        &mut self,
+        event: &StrategyEvent,
+        ctx: &StrategyContext,
+    ) -> Result<Vec<DecisionPayload>, RunnerError> {
+        let now_epoch = epoch_seconds_from_rfc3339(&ctx.now);
+        match event {
+            StrategyEvent::Quote {
+                market_id,
+                instrument,
+                bid,
+                ask,
+            } => {
+                if bid.ticks() > 0 && ask.ticks() > 0 {
+                    let state = self.market_state_mut(market_id, Some(instrument));
+                    state.yes_bid = Some(*bid);
+                    state.yes_ask = Some(*ask);
+                }
+                if self.quote_triggered_trading {
+                    return self.evaluate_market(market_id, now_epoch);
+                }
+                Ok(vec![])
+            }
+            StrategyEvent::Book {
+                market_id,
+                instrument,
+                bids,
+                asks,
+                ..
+            } => {
+                self.update_book_bbo(market_id, instrument, bids, asks);
+                if self.quote_triggered_trading {
+                    return self.evaluate_market(market_id, now_epoch);
+                }
+                Ok(vec![])
+            }
+            StrategyEvent::ExternalProbability {
+                source,
+                market_id,
+                probability,
+                lead_days,
+                close_time,
+                ..
+            } => {
+                if !self.signal_source.is_empty() && source != &self.signal_source {
+                    return Ok(vec![]);
+                }
+                if probability.ticks() < 0 || probability.ticks() > PRICE_SCALE {
+                    return Ok(vec![]);
+                }
+                // Lead gate (Python parity): the station calibration sigma is
+                // nowcast-lead, so only same-day (lead==0) signals are trustworthy.
+                // Refuse — and do NOT cache — lead!=0 so a later quote can't
+                // re-fire a stale future-day signal. Absent lead = unconstrained.
+                if matches!(lead_days, Some(lead) if *lead != 0) {
+                    return Ok(vec![]);
+                }
+                let close_epoch_secs = close_time.as_deref().map(epoch_seconds_from_rfc3339);
+                let state = self.market_state_mut(market_id, None);
+                state.latest_signal = Some(WeatherSignalState {
+                    probability: *probability,
+                    received_epoch_secs: now_epoch,
+                    close_epoch_secs,
+                });
+                self.evaluate_market(market_id, now_epoch)
+            }
+            _ => Ok(vec![]),
+        }
+    }
+}
+
+// ---------- entertainment box-office extrapolator ----------
+
+#[derive(Clone, Debug, Default)]
+struct BoxOfficeMarketState {
+    instrument: Option<String>,
+    mid: Option<FixedPrice>,
+}
+
+/// Read a JSON value as f64, tolerating both numbers and decimal strings.
+fn json_f64(value: &serde_json::Value) -> Option<f64> {
+    match value {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// Map an extrapolated weekend gross (whole dollars) to an implied YES
+/// probability in price ticks, via the same clamped-linear rule as the Python
+/// `EntertainmentBoxOfficeStrategy._gross_to_prob`:
+///   ratio = extrapolated / target_gross
+///   ratio <= 0.5 -> 0.05 ; ratio >= 1.5 -> 0.95 ; else 0.05 + (ratio-0.5)*0.9
+/// Integer-exact on the parity grid; finer ticks round away at the 4dp boundary
+/// shared with `format_decimal_ticks` (and with Python's 4dp quantize).
+fn gross_to_prob_ticks(extrapolated: i64, target_gross: i64) -> i64 {
+    if target_gross <= 0 {
+        return 50_000; // ratio 0 -> 0.05 floor
+    }
+    let ratio_ticks = (extrapolated as i128 * PRICE_SCALE as i128 / target_gross as i128) as i64;
+    if ratio_ticks <= 500_000 {
+        50_000
+    } else if ratio_ticks >= 1_500_000 {
+        950_000
+    } else {
+        50_000 + (ratio_ticks - 500_000) * 9 / 10
+    }
+}
+
+/// Rust live implementation of `entertainment_box_office`.
+///
+/// Consumes quote ticks (for the market mid) plus a bespoke external signal
+/// carrying `seat_occupancy_pct`, `ticket_velocity_per_hour`, and `confidence`.
+/// It reconstructs the weekend-gross extrapolation, maps it to an implied YES
+/// probability with the same clamped-linear rule as the Python strategy, and
+/// buys YES/NO when the absolute edge clears `min_edge_bps` (and confidence
+/// clears `confidence_floor`). The "Friday 8pm" gating that Python expressed as
+/// a TimerEvent is the producer's job here — Rust has no timer, so the decision
+/// fires on signal arrival (parity-replicable trigger).
+///
+/// Integer fixed-point throughout (price ticks are `PRICE_ONE` == $1.00, dollar
+/// amounts are whole-dollar i64) so the decision is bit-identical to Python on
+/// the parity fixtures.
+pub struct EntertainmentBoxOfficeStrategy {
+    pub strategy_id: String,
+    pub sleeve_id: String,
+    signal_source: String,
+    market_id: String,
+    target_gross: i64,
+    baseline_gross: i64,
+    extrapolation_hours: i64,
+    min_edge_ticks: i64,
+    confidence_floor_ticks: i64,
+    size: String,
+    next_client_order: u64,
+    markets: HashMap<String, BoxOfficeMarketState>,
+    priority_tier: String,
+    expires_after_ms: Option<u64>,
+}
+
+impl FromSpec for EntertainmentBoxOfficeStrategy {
+    fn from_spec(spec: &StrategySpecArtifact) -> Result<Self, SpecError> {
+        let min_edge_bps = spec.param_f64_or("min_edge_bps", 500.0)?;
+        let confidence_floor = spec.param_f64_or("confidence_floor", 0.8)?;
+        Ok(Self {
+            strategy_id: spec.strategy_id.clone(),
+            sleeve_id: format!("{}-sleeve", spec.strategy_id),
+            signal_source: spec.param_str_or("signal_source", "apify-fandango"),
+            market_id: spec.param_str_or("market_id", ""),
+            target_gross: spec.param_f64_or("target_gross_usd", 0.0)?.round() as i64,
+            baseline_gross: spec
+                .param_f64_or("baseline_gross_usd", 1_000_000.0)?
+                .round() as i64,
+            extrapolation_hours: spec.param_f64_or("extrapolation_hours", 48.0)?.round() as i64,
+            min_edge_ticks: ((min_edge_bps / 10_000.0) * PRICE_SCALE as f64).round() as i64,
+            confidence_floor_ticks: (confidence_floor * PRICE_SCALE as f64).round() as i64,
+            size: spec.param_str_or("size", "10"),
+            next_client_order: 0,
+            markets: HashMap::new(),
+            priority_tier: priority_from_spec(spec).0,
+            expires_after_ms: priority_from_spec(spec).1,
+        })
+    }
+}
+
+impl StrategyRuntime for EntertainmentBoxOfficeStrategy {
+    fn strategy_id(&self) -> &str {
+        &self.strategy_id
+    }
+
+    fn sleeve_id(&self) -> &str {
+        &self.sleeve_id
+    }
+
+    fn priority_tier(&self) -> &str {
+        &self.priority_tier
+    }
+
+    fn expires_after_ms(&self) -> Option<u64> {
+        self.expires_after_ms
+    }
+
+    fn on_event(
+        &mut self,
+        event: &StrategyEvent,
+        _ctx: &StrategyContext,
+    ) -> Result<Vec<DecisionPayload>, RunnerError> {
+        match event {
+            StrategyEvent::Quote {
+                market_id,
+                instrument,
+                bid,
+                ask,
+            } => {
+                if bid.ticks() > 0 && ask.ticks() > 0 {
+                    let state = self.markets.entry(market_id.clone()).or_default();
+                    state.instrument = Some(instrument.clone());
+                    state.mid = Some(FixedPrice((bid.ticks() + ask.ticks()) / 2));
+                }
+                Ok(vec![])
+            }
+            StrategyEvent::ExternalSignal {
+                source,
+                market_id,
+                payload_json,
+            } => {
+                if !self.signal_source.is_empty() && source != &self.signal_source {
+                    return Ok(vec![]);
+                }
+                if !self.market_id.is_empty() && market_id != &self.market_id {
+                    return Ok(vec![]);
+                }
+                let Ok(payload) = serde_json::from_str::<serde_json::Value>(payload_json) else {
+                    return Ok(vec![]);
+                };
+                // Confidence gate (parity with Python `confidence_floor`): a
+                // missing confidence is treated as zero, so it is suppressed.
+                let confidence_ticks = FixedPrice::parse(&payload, "confidence")
+                    .map(|c| c.ticks())
+                    .unwrap_or(0);
+                if confidence_ticks < self.confidence_floor_ticks {
+                    return Ok(vec![]);
+                }
+                let Ok(occ) = FixedPrice::parse(&payload, "seat_occupancy_pct") else {
+                    return Ok(vec![]);
+                };
+                let Some(vel) = payload
+                    .get("ticket_velocity_per_hour")
+                    .and_then(json_f64)
+                    .map(|v| v.round() as i64)
+                else {
+                    return Ok(vec![]);
+                };
+                let Some(state) = self.markets.get(market_id) else {
+                    return Ok(vec![]);
+                };
+                let Some(mid) = state.mid else {
+                    return Ok(vec![]);
+                };
+
+                // Weekend-gross extrapolation in whole dollars (integer-exact):
+                //   extrapolated = occ * baseline + velocity * hours
+                // `occ` is a price-scaled fraction (PRICE_ONE == 1.0).
+                let occ_term = (occ.ticks() as i128 * self.baseline_gross as i128
+                    / PRICE_SCALE as i128) as i64;
+                let extrapolated = occ_term + vel * self.extrapolation_hours;
+                let implied_ticks = gross_to_prob_ticks(extrapolated, self.target_gross);
+
+                let edge = implied_ticks - mid.ticks();
+                if edge.abs() < self.min_edge_ticks {
+                    return Ok(vec![]);
+                }
+                self.next_client_order += 1;
+                let outcome_side = if edge > 0 {
+                    OutcomeSide::Yes
+                } else {
+                    OutcomeSide::No
+                };
+                // BUY of YES or of NO -> floor the per-side price to the venue
+                // cent (edge-preserving; matches Python `buy_limit_from_fair`).
+                let raw_price_ticks = if outcome_side == OutcomeSide::Yes {
+                    mid.ticks()
+                } else {
+                    PRICE_SCALE - mid.ticks()
+                };
+                let price_ticks = pricing::buy_limit_from_fair(raw_price_ticks, pricing::CENT_TICK);
+                let fair_ticks = if outcome_side == OutcomeSide::Yes {
+                    implied_ticks
+                } else {
+                    PRICE_SCALE - implied_ticks
+                };
+                Ok(vec![DecisionPayload::PlaceOrder {
+                    client_order_id: format!("c-box-{:08}", self.next_client_order),
+                    instrument_id: state
+                        .instrument
+                        .clone()
+                        .unwrap_or_else(|| format!("kalshi:{market_id}")),
+                    outcome_side,
+                    side: Side::Buy,
+                    price: format_decimal_ticks(price_ticks),
+                    quantity: self.size.clone(),
+                    fair_price: Some(format_decimal_ticks(fair_ticks)),
+                    min_executable_edge_ticks: Some(self.min_edge_ticks / 100),
+                    fee_rate_bps: None,
+                    time_in_force: TimeInForce::Gtc,
+                }])
+            }
+            _ => Ok(vec![]),
+        }
+    }
+}
+
 // ---------- tennis XGBoost value strategy ----------
 
 #[derive(Clone, Debug, Default)]
 struct TennisMarketState {
     probability: Option<FixedPrice>,
+    confidence: Option<FixedPrice>,
+    odds_present: Option<bool>,
     yes_bid: Option<FixedPrice>,
     yes_ask: Option<FixedPrice>,
     instrument: Option<String>,
     pending_client_order_id: Option<String>,
     filled: bool,
+    // entry intent (recorded at emit) so a fill establishes the held side/size
+    // deterministically — OwnFill carries no outcome_side, so we cannot read it
+    // off the fill. Mirrors the Python strategy for cross-language parity.
+    entry_client_order_id: Option<String>,
+    pending_side: Option<OutcomeSide>,
+    pending_qty: Option<String>,
+    // open-position / trailing-stop management
+    holding: bool,
+    held_side: Option<OutcomeSide>,
+    held_qty: Option<String>,
+    peak_ticks: Option<i64>,
+    exit_client_order_id: Option<String>,
+    closed: bool,
 }
 
 /// Rust implementation of `sports_tennis_xgboost`.
@@ -795,7 +1417,11 @@ pub struct TennisXgboostStrategy {
     pub sleeve_id: String,
     prediction_source: String,
     min_edge_ticks: i64,
+    min_model_confidence_ticks: i64,
+    require_odds_present: bool,
     size: String,
+    // Trailing stop-loss in price ticks (0 disables -> pure hold-to-completion).
+    stop_loss_ticks: i64,
     next_client_order: u64,
     markets: HashMap<String, TennisMarketState>,
     priority_tier: String,
@@ -815,7 +1441,10 @@ impl TennisXgboostStrategy {
             sleeve_id: sleeve_id.into(),
             prediction_source: prediction_source.into(),
             min_edge_ticks: ((min_edge_bps / 10_000.0) * PRICE_SCALE as f64).round() as i64,
+            min_model_confidence_ticks: 0,
+            require_odds_present: false,
             size: size.into(),
+            stop_loss_ticks: (0.12 * PRICE_SCALE as f64).round() as i64,
             next_client_order: 0,
             markets: HashMap::new(),
             priority_tier: "standard".to_string(),
@@ -829,11 +1458,29 @@ impl TennisXgboostStrategy {
         self
     }
 
+    /// Trailing stop-loss as a probability fraction (0.12 == 12c; 0 disables).
+    pub fn with_trailing_stop(mut self, drop: f64) -> Self {
+        self.stop_loss_ticks = (drop.max(0.0) * PRICE_SCALE as f64).round() as i64;
+        self
+    }
+
+    pub fn with_signal_gates(
+        mut self,
+        min_model_confidence: f64,
+        require_odds_present: bool,
+    ) -> Self {
+        self.min_model_confidence_ticks =
+            (min_model_confidence * PRICE_SCALE as f64).round() as i64;
+        self.require_odds_present = require_odds_present;
+        self
+    }
+
     fn maybe_decide(&mut self, market_id: &str) -> Result<Vec<DecisionPayload>, RunnerError> {
         let Some(state) = self.markets.get_mut(market_id) else {
             return Ok(vec![]);
         };
-        if state.filled || state.pending_client_order_id.is_some() {
+        if state.filled || state.holding || state.closed || state.pending_client_order_id.is_some()
+        {
             return Ok(vec![]);
         }
         let (Some(probability), Some(yes_bid), Some(yes_ask)) =
@@ -841,6 +1488,16 @@ impl TennisXgboostStrategy {
         else {
             return Ok(vec![]);
         };
+        if self.require_odds_present && state.odds_present != Some(true) {
+            return Ok(vec![]);
+        }
+        let confidence_ticks = state
+            .confidence
+            .map(|confidence| confidence.ticks())
+            .unwrap_or_else(|| probability.ticks().max(PRICE_SCALE - probability.ticks()));
+        if confidence_ticks < self.min_model_confidence_ticks {
+            return Ok(vec![]);
+        }
         let yes_edge = probability.ticks() - yes_ask.ticks();
         let no_ask = PRICE_SCALE - yes_bid.ticks();
         let no_edge = (PRICE_SCALE - probability.ticks()) - no_ask;
@@ -854,6 +1511,14 @@ impl TennisXgboostStrategy {
             format!("c-tennis-buy-no-{:08}", self.next_client_order)
         };
         state.pending_client_order_id = Some(client_order_id.clone());
+        // Record the entry intent so a fill establishes the held position+side.
+        state.entry_client_order_id = Some(client_order_id.clone());
+        state.pending_side = Some(if yes_edge >= no_edge {
+            OutcomeSide::Yes
+        } else {
+            OutcomeSide::No
+        });
+        state.pending_qty = Some(self.size.clone());
         let instrument = state
             .instrument
             .clone()
@@ -887,6 +1552,82 @@ impl TennisXgboostStrategy {
         }
     }
 
+    /// Trailing-stop liquidation of an open position. Tracks the peak of the HELD
+    /// side's best bid and sells (taker, at the bid) once it falls
+    /// `stop_loss_ticks` below that peak. Otherwise the position holds (no
+    /// take-profit). Mirrors the Python `_exit_decision` for parity.
+    fn maybe_exit(&mut self, market_id: &str) -> Result<Vec<DecisionPayload>, RunnerError> {
+        if self.stop_loss_ticks <= 0 {
+            return Ok(vec![]);
+        }
+        let Some(state) = self.markets.get_mut(market_id) else {
+            return Ok(vec![]);
+        };
+        if state.closed || !state.holding || state.exit_client_order_id.is_some() {
+            return Ok(vec![]);
+        }
+        let (Some(yes_bid), Some(yes_ask), Some(held_side)) =
+            (state.yes_bid, state.yes_ask, state.held_side)
+        else {
+            return Ok(vec![]);
+        };
+        let liquidation_ticks = match held_side {
+            OutcomeSide::Yes => yes_bid.ticks(),
+            OutcomeSide::No => PRICE_SCALE - yes_ask.ticks(),
+        };
+        let peak = state
+            .peak_ticks
+            .map_or(liquidation_ticks, |p| p.max(liquidation_ticks));
+        state.peak_ticks = Some(peak);
+        if peak - liquidation_ticks < self.stop_loss_ticks {
+            return Ok(vec![]);
+        }
+        let quantity = state.held_qty.clone().unwrap_or_else(|| self.size.clone());
+        let instrument = state
+            .instrument
+            .clone()
+            .unwrap_or_else(|| format!("kalshi:{market_id}"));
+        self.next_client_order += 1;
+        let client_order_id = format!("c-tennis-sell-{:08}", self.next_client_order);
+        state.exit_client_order_id = Some(client_order_id.clone());
+        let price = format_decimal_ticks(liquidation_ticks);
+        Ok(vec![DecisionPayload::PlaceOrder {
+            client_order_id,
+            instrument_id: instrument,
+            outcome_side: held_side,
+            side: Side::Sell,
+            price,
+            quantity,
+            fair_price: None,
+            min_executable_edge_ticks: None,
+            fee_rate_bps: None,
+            time_in_force: TimeInForce::Ioc,
+        }])
+    }
+
+    /// A fill matching the recorded entry order establishes the held position;
+    /// one matching the in-flight exit order closes it for good.
+    fn apply_own_fill(&mut self, client_order_id: &str) {
+        for market in self.markets.values_mut() {
+            if market.exit_client_order_id.as_deref() == Some(client_order_id) {
+                market.holding = false;
+                market.held_qty = None;
+                market.exit_client_order_id = None;
+                market.closed = true;
+                return;
+            }
+            if market.entry_client_order_id.as_deref() == Some(client_order_id) && !market.holding {
+                market.holding = true;
+                market.filled = true;
+                market.held_side = market.pending_side;
+                market.held_qty = market.pending_qty.clone();
+                market.peak_ticks = None;
+                market.pending_client_order_id = None;
+                return;
+            }
+        }
+    }
+
     fn apply_own_order_update(&mut self, client_order_id: &str, state: &str) {
         let terminal_retryable = matches!(
             state.trim().to_ascii_lowercase().as_str(),
@@ -901,6 +1642,11 @@ impl TennisXgboostStrategy {
                 } else if terminal_retryable {
                     market.pending_client_order_id = None;
                 }
+            }
+            // A failed liquidation must be retryable on the next adverse quote.
+            if market.exit_client_order_id.as_deref() == Some(client_order_id) && terminal_retryable
+            {
+                market.exit_client_order_id = None;
             }
         }
     }
@@ -918,7 +1664,10 @@ impl FromSpec for TennisXgboostStrategy {
     fn from_spec(spec: &StrategySpecArtifact) -> Result<Self, SpecError> {
         let prediction_source = spec.param_str_or("prediction_source", "tennis_xgboost_onnx");
         let min_edge_bps = spec.param_f64_or("min_edge_bps", 150.0)?;
+        let min_model_confidence = spec.param_f64_or("min_model_confidence", 0.0)?;
+        let require_odds_present = spec.param_bool_or("require_odds_present", false)?;
         let size = spec.param_str_or("size", "5");
+        let trailing_stop_loss = spec.param_f64_or("trailing_stop_loss", 0.12)?;
         let sleeve_id = format!("{}-sleeve", spec.strategy_id);
         let (tier, expires_after_ms) = priority_from_spec(spec);
         Ok(Self::new(
@@ -928,6 +1677,8 @@ impl FromSpec for TennisXgboostStrategy {
             min_edge_bps,
             size,
         )
+        .with_signal_gates(min_model_confidence, require_odds_present)
+        .with_trailing_stop(trailing_stop_loss)
         .with_priority(tier, expires_after_ms))
     }
 }
@@ -969,12 +1720,18 @@ impl StrategyRuntime for TennisXgboostStrategy {
             state.yes_bid = Some(*bid);
             state.yes_ask = Some(*ask);
             state.instrument = Some(instrument.clone());
+            let manage_position = state.holding && !state.closed;
+            if manage_position {
+                return self.maybe_exit(market_id);
+            }
             return self.maybe_decide(market_id);
         }
         if let StrategyEvent::TennisPrediction {
             source,
             market_id,
             probability,
+            confidence,
+            odds_present,
         } = event
         {
             if source != &self.prediction_source {
@@ -982,7 +1739,16 @@ impl StrategyRuntime for TennisXgboostStrategy {
             }
             let state = self.markets.entry(market_id.to_string()).or_default();
             state.probability = Some(*probability);
+            state.confidence = *confidence;
+            state.odds_present = *odds_present;
             return self.maybe_decide(market_id);
+        }
+        if let StrategyEvent::OwnFill {
+            client_order_id, ..
+        } = event
+        {
+            self.apply_own_fill(client_order_id);
+            return Ok(vec![]);
         }
         if let StrategyEvent::OwnOrderUpdate {
             client_order_id,
@@ -1438,15 +2204,28 @@ fn parse_decimal_ticks(raw: &str) -> Result<i64, RunnerError> {
     Ok(if negative { -ticks } else { ticks })
 }
 
+/// Format an internal 1e6-scale tick value as a decimal string with at most 4
+/// fractional digits.
+///
+/// The runner carries prices at 1e6 internally, but EVERY downstream consumer —
+/// the risk gate (`parse_fixed`), the gateway (`parse_fixed_4`), and the Kalshi
+/// venue itself (whole-cent grid) — works at 1e4 and REJECTS any string with
+/// more than 4 fractional digits. A model probability like 0.967731 would
+/// otherwise emit "0.967731" (6 dp) and be rejected as `InvalidNumeric`, which
+/// is exactly what blocked every live tennis intent. Rounding to the 1e4 grid is
+/// lossless with respect to anything that actually trades. Round-half-up on the
+/// magnitude keeps it symmetric for the NO side (`PRICE_SCALE - ticks`).
 fn format_decimal_ticks(ticks: i64) -> String {
     let sign = if ticks < 0 { "-" } else { "" };
-    let abs = ticks.abs();
-    let whole = abs / PRICE_SCALE;
-    let frac = abs % PRICE_SCALE;
+    let abs = ticks.unsigned_abs();
+    // 1e6 -> 1e4 ticks, rounding half up (1e6 / 1e4 = 100).
+    let abs_1e4 = (abs + 50) / 100;
+    let whole = abs_1e4 / 10_000;
+    let frac = abs_1e4 % 10_000;
     if frac == 0 {
         return format!("{sign}{whole}");
     }
-    let mut frac_text = format!("{frac:06}");
+    let mut frac_text = format!("{frac:04}");
     while frac_text.ends_with('0') {
         frac_text.pop();
     }
@@ -1632,6 +2411,20 @@ mod tests {
     use eventcontracts_gateway::RecordingVenueClient;
     use eventcontracts_risk::RiskLimits;
 
+    #[test]
+    fn box_office_gross_to_prob_clamps_and_interpolates() {
+        // ratio = extrapolated / target_gross, mapped to [0.05, 0.95]:
+        // <=0.5 -> 0.05 ; >=1.5 -> 0.95 ; else 0.05 + (ratio-0.5)*0.9.
+        let target = 100_000_000;
+        assert_eq!(gross_to_prob_ticks(40_000_000, target), 50_000); // ratio 0.4 -> clamp low
+        assert_eq!(gross_to_prob_ticks(50_000_000, target), 50_000); // ratio 0.5 boundary
+        assert_eq!(gross_to_prob_ticks(100_000_000, target), 500_000); // ratio 1.0 -> 0.50
+        assert_eq!(gross_to_prob_ticks(120_000_000, target), 680_000); // ratio 1.2 -> 0.68 (fixture)
+        assert_eq!(gross_to_prob_ticks(150_000_000, target), 950_000); // ratio 1.5 boundary
+        assert_eq!(gross_to_prob_ticks(200_000_000, target), 950_000); // ratio 2.0 -> clamp high
+        assert_eq!(gross_to_prob_ticks(100_000_000, 0), 50_000); // degenerate target -> floor
+    }
+
     fn audit() -> AuditStamp {
         AuditStamp {
             object_id: "event-1".into(),
@@ -1658,6 +2451,121 @@ mod tests {
         }
     }
 
+    fn entry_fill() -> StrategyEvent {
+        // The deterministic id the Rust strategy assigns to its first entry.
+        StrategyEvent::OwnFill {
+            client_order_id: "c-tennis-buy-00000001".into(),
+            instrument: "kalshi:M-1".into(),
+            price: FixedPrice::from_f64(0.57),
+            quantity: 5,
+            remaining_quantity: 0,
+        }
+    }
+
+    #[test]
+    fn tennis_trailing_stop_liquidates_when_bid_drops_from_peak() {
+        let mut strat = TennisXgboostStrategy::new(
+            "sports-tennis-xgboost-v1",
+            "sports-tennis-paper",
+            "tennis_xgboost_onnx",
+            150.0,
+            "5",
+        ); // default trailing stop = 0.12
+        strat
+            .on_event(&strategy_event(&tennis_signal("M-1", "0.70")), &ctx())
+            .unwrap();
+        let entry = strat
+            .on_event(&strategy_event(&quote("0.55", "0.57")), &ctx())
+            .unwrap();
+        assert!(matches!(
+            &entry[0],
+            DecisionPayload::PlaceOrder {
+                side: Side::Buy,
+                ..
+            }
+        ));
+        strat.on_event(&entry_fill(), &ctx()).unwrap();
+
+        // Bid climbs to a 0.66 peak — held to completion, no take-profit.
+        assert!(strat
+            .on_event(&strategy_event(&quote("0.60", "0.62")), &ctx())
+            .unwrap()
+            .is_empty());
+        assert!(strat
+            .on_event(&strategy_event(&quote("0.66", "0.68")), &ctx())
+            .unwrap()
+            .is_empty());
+        // Bid falls 0.13 from the peak (>= 0.12) -> liquidate at the bid.
+        let exit = strat
+            .on_event(&strategy_event(&quote("0.53", "0.55")), &ctx())
+            .unwrap();
+        assert_eq!(exit.len(), 1);
+        assert!(matches!(
+            &exit[0],
+            DecisionPayload::PlaceOrder {
+                side: Side::Sell,
+                outcome_side: OutcomeSide::Yes,
+                price,
+                quantity,
+                time_in_force: TimeInForce::Ioc,
+                ..
+            } if price == "0.53" && quantity == "5"
+        ));
+    }
+
+    #[test]
+    fn tennis_trailing_stop_holds_within_threshold() {
+        let mut strat = TennisXgboostStrategy::new(
+            "sports-tennis-xgboost-v1",
+            "sports-tennis-paper",
+            "tennis_xgboost_onnx",
+            150.0,
+            "5",
+        );
+        strat
+            .on_event(&strategy_event(&tennis_signal("M-1", "0.70")), &ctx())
+            .unwrap();
+        strat
+            .on_event(&strategy_event(&quote("0.55", "0.57")), &ctx())
+            .unwrap();
+        strat.on_event(&entry_fill(), &ctx()).unwrap();
+        strat
+            .on_event(&strategy_event(&quote("0.66", "0.68")), &ctx())
+            .unwrap(); // peak 0.66
+                       // 0.07 drop < 0.12 stop -> still holding.
+        assert!(strat
+            .on_event(&strategy_event(&quote("0.59", "0.61")), &ctx())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn tennis_disabled_trailing_stop_holds_to_completion() {
+        let mut strat = TennisXgboostStrategy::new(
+            "sports-tennis-xgboost-v1",
+            "sports-tennis-paper",
+            "tennis_xgboost_onnx",
+            150.0,
+            "5",
+        )
+        .with_trailing_stop(0.0); // disabled
+        strat
+            .on_event(&strategy_event(&tennis_signal("M-1", "0.70")), &ctx())
+            .unwrap();
+        strat
+            .on_event(&strategy_event(&quote("0.55", "0.57")), &ctx())
+            .unwrap();
+        strat.on_event(&entry_fill(), &ctx()).unwrap();
+        strat
+            .on_event(&strategy_event(&quote("0.66", "0.68")), &ctx())
+            .unwrap();
+        // Huge drop, but the stop is disabled -> position still held.
+        assert!(strat
+            .on_event(&strategy_event(&quote("0.20", "0.22")), &ctx())
+            .unwrap()
+            .is_empty());
+    }
+
     fn quote(bid: &str, ask: &str) -> NormalizedEventRecord {
         let payload = serde_json::json!({
             "instrument": "kalshi:M-1",
@@ -1678,6 +2586,36 @@ mod tests {
             "source": "tennis_xgboost_onnx",
             "market_id": market_id,
             "player_1_win_probability": probability,
+        });
+        NormalizedEventRecord {
+            event_id: format!("tennis-{market_id}-{probability}"),
+            event_kind: "external".into(),
+            payload_json: payload.to_string(),
+            provenance: EventProvenance {
+                source: "tennis_xgboost_onnx".into(),
+                channel: "external".into(),
+                schema_version: "normalized-event-v1".into(),
+                venue: Some("kalshi".into()),
+                source_sequence: None,
+                normalization_version: "1".into(),
+                metadata: Metadata::new(),
+            },
+            audit: audit(),
+        }
+    }
+
+    fn tennis_signal_with_context(
+        market_id: &str,
+        probability: &str,
+        confidence: &str,
+        odds_present: bool,
+    ) -> NormalizedEventRecord {
+        let payload = serde_json::json!({
+            "source": "tennis_xgboost_onnx",
+            "market_id": market_id,
+            "player_1_win_probability": probability,
+            "model_confidence": confidence,
+            "odds_present": odds_present,
         });
         NormalizedEventRecord {
             event_id: format!("tennis-{market_id}-{probability}"),
@@ -1822,6 +2760,155 @@ mod tests {
     }
 
     #[test]
+    fn format_decimal_ticks_caps_at_four_dp_and_rounds() {
+        // Internal scale is 1e6; downstream risk/gateway/Kalshi are 1e4 and
+        // reject >4 dp. Whole + <=4dp values must be exact; finer ticks round
+        // half-up onto the 1e4 grid. Regression for the live tennis
+        // InvalidNumeric{fair_price} reject (a 6-dp probability string).
+        assert_eq!(format_decimal_ticks(700_000), "0.7");
+        assert_eq!(format_decimal_ticks(570_000), "0.57");
+        assert_eq!(format_decimal_ticks(1_000_000), "1");
+        assert_eq!(format_decimal_ticks(0), "0");
+        // 0.967731 (a real model probability) -> 4 dp, rounded half-up.
+        assert_eq!(format_decimal_ticks(967_731), "0.9677");
+        assert_eq!(format_decimal_ticks(967_750), "0.9678");
+        // NO-side complement PRICE_SCALE - 967_731 = 32_269 -> "0.0323".
+        assert_eq!(format_decimal_ticks(PRICE_SCALE - 967_731), "0.0323");
+        // Every output has at most 4 fractional digits.
+        for ticks in [1_i64, 49, 50, 51, 123_456, 999_999, 967_731] {
+            let s = format_decimal_ticks(ticks);
+            if let Some((_, frac)) = s.split_once('.') {
+                assert!(frac.len() <= 4, "{s} has >4 dp");
+            }
+        }
+    }
+
+    /// Regression: a realistic 6-dp model probability must yield a `fair_price`
+    /// string the risk gate accepts (<=4 dp), on BOTH the YES and NO branch.
+    /// Before the fix this emitted "0.967731"/"0.032269" and every live tennis
+    /// intent was rejected InvalidNumeric{fair_price}. Mirrors risk/gateway's
+    /// `frac.len() > 4` rule.
+    #[test]
+    fn tennis_fair_price_is_risk_parseable_for_realistic_probability() {
+        fn max_4dp(s: &str) -> bool {
+            s.split_once('.').map(|(_, f)| f.len() <= 4).unwrap_or(true)
+        }
+        let new_strat = || {
+            TennisXgboostStrategy::new(
+                "sports-tennis-xgboost-v1",
+                "sports-tennis-paper",
+                "tennis_xgboost_onnx",
+                150.0,
+                "5",
+            )
+        };
+
+        // YES branch: prob 0.9677 (a real 4-dp model output that exposed the
+        // >4-dp bug live) well above the ask -> BUY YES.
+        let mut strat = new_strat();
+        let _ = strat
+            .on_event(&strategy_event(&tennis_signal("M-1", "0.9677")), &ctx())
+            .unwrap();
+        let decisions = strat
+            .on_event(&strategy_event(&quote("0.55", "0.57")), &ctx())
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        let DecisionPayload::PlaceOrder {
+            outcome_side,
+            price,
+            fair_price,
+            ..
+        } = &decisions[0]
+        else {
+            panic!("expected place order");
+        };
+        assert_eq!(*outcome_side, OutcomeSide::Yes);
+        let fp = fair_price.as_deref().expect("fair_price");
+        assert!(max_4dp(fp), "YES fair_price {fp} exceeds 4 dp");
+        assert!(max_4dp(price), "YES price {price} exceeds 4 dp");
+
+        // NO branch: prob 0.0323 below the bid -> BUY NO; the NO fair_price is
+        // the 1e6 complement, which is exactly where the 6-dp string came from.
+        let mut strat = new_strat();
+        let _ = strat
+            .on_event(&strategy_event(&tennis_signal("M-1", "0.0323")), &ctx())
+            .unwrap();
+        let decisions = strat
+            .on_event(&strategy_event(&quote("0.60", "0.62")), &ctx())
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        let DecisionPayload::PlaceOrder {
+            outcome_side,
+            price,
+            fair_price,
+            ..
+        } = &decisions[0]
+        else {
+            panic!("expected place order");
+        };
+        assert_eq!(*outcome_side, OutcomeSide::No);
+        let fp = fair_price.as_deref().expect("fair_price");
+        assert!(max_4dp(fp), "NO fair_price {fp} exceeds 4 dp");
+        assert!(max_4dp(price), "NO price {price} exceeds 4 dp");
+    }
+
+    /// F5 invariant: the live tennis taker only ever emits IOC `PlaceOrder`s,
+    /// across the model/quote input range and on BOTH the YES- and NO-favoured
+    /// branches. This is what makes the absence of a `ReplaceOrder` variant
+    /// safe: an IOC order cannot rest, so a partial-fill tail is canceled, never
+    /// repriced. A future maker/quoting sleeve that introduces resting orders
+    /// must add its own replace-path coverage; this guards the taker against
+    /// silently growing a non-IOC code path.
+    #[test]
+    fn tennis_taker_emits_ioc_orders_only() {
+        // (probability, yes_bid, yes_ask): strong-YES, strong-NO, and tighter
+        // books that still clear the edge gate on exactly one side.
+        let cases = [
+            ("0.90", "0.55", "0.57"),
+            ("0.80", "0.55", "0.57"),
+            ("0.10", "0.60", "0.62"),
+            ("0.20", "0.60", "0.62"),
+            ("0.70", "0.55", "0.57"),
+            ("0.30", "0.60", "0.62"),
+        ];
+        for (prob, bid, ask) in cases {
+            let mut strat = TennisXgboostStrategy::new(
+                "sports-tennis-xgboost-v1",
+                "sports-tennis-paper",
+                "tennis_xgboost_onnx",
+                150.0,
+                "5",
+            );
+            let _ = strat
+                .on_event(&strategy_event(&tennis_signal("M-1", prob)), &ctx())
+                .unwrap();
+            let decisions = strat
+                .on_event(&strategy_event(&quote(bid, ask)), &ctx())
+                .unwrap();
+            for decision in &decisions {
+                match decision {
+                    DecisionPayload::PlaceOrder {
+                        time_in_force,
+                        side,
+                        ..
+                    } => {
+                        assert_eq!(
+                            *time_in_force,
+                            TimeInForce::Ioc,
+                            "taker order for prob={prob} bid={bid} ask={ask} must be IOC"
+                        );
+                        // The taker only ever buys into the opposite touch.
+                        assert_eq!(*side, Side::Buy);
+                    }
+                    DecisionPayload::CancelOrder { .. } => {
+                        panic!("a fresh taker signal must never emit a cancel")
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn tennis_strategy_clears_pending_after_gateway_rejection() {
         let mut strat = TennisXgboostStrategy::new(
             "sports-tennis-xgboost-v1",
@@ -1850,6 +2937,59 @@ mod tests {
             .unwrap();
 
         assert_eq!(second.len(), 1);
+    }
+
+    #[test]
+    fn tennis_strategy_honors_confidence_and_odds_gates() {
+        let mut strat = TennisXgboostStrategy::new(
+            "sports-tennis-xgboost-v1",
+            "sports-tennis-paper",
+            "tennis_xgboost_onnx",
+            150.0,
+            "5",
+        )
+        .with_signal_gates(0.62, true);
+        let ctx = ctx();
+        assert!(strat
+            .on_event(&strategy_event(&quote("0.55", "0.57")), &ctx)
+            .unwrap()
+            .is_empty());
+
+        let signal = |confidence: i64, odds_present: bool| StrategyEvent::TennisPrediction {
+            source: "tennis_xgboost_onnx".into(),
+            market_id: "M-1".into(),
+            probability: FixedPrice(700_000),
+            confidence: Some(FixedPrice(confidence)),
+            odds_present: Some(odds_present),
+        };
+
+        assert!(strat
+            .on_event(&signal(610_000, true), &ctx)
+            .unwrap()
+            .is_empty());
+        assert!(strat
+            .on_event(&signal(700_000, false), &ctx)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            strat.on_event(&signal(700_000, true), &ctx).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn tennis_external_signal_parses_confidence_and_odds_context() {
+        let event = strategy_event(&tennis_signal_with_context("M-1", "0.70", "0.70", true));
+
+        assert!(matches!(
+            event,
+            StrategyEvent::TennisPrediction {
+                probability,
+                confidence: Some(confidence),
+                odds_present: Some(true),
+                ..
+            } if probability.ticks() == 700_000 && confidence.ticks() == 700_000
+        ));
     }
 
     /// Closure-backed `Scorer` used in tests so `OnnxQuoteStrategy` can be
@@ -2109,6 +3249,278 @@ mod tests {
         assert_eq!(sink.emitted.len(), 1);
     }
 
+    fn weather_strategy() -> WeatherTemperatureArbitrageStrategy {
+        let spec = StrategySpecArtifact::from_toml_str(
+            r#"
+strategy_id = "weather-temperature-arbitrage-live-v1"
+name = "weather_temperature_arbitrage"
+version = "1.0.0"
+[parameters]
+signal_source = "open-meteo"
+min_edge_bps = "150"
+size = "1"
+max_spread = "0.80"
+spread_edge_multiplier = "0.10"
+near_binary_price = "0.95"
+near_binary_min_edge_bps = "600"
+max_signal_age_seconds = 180
+min_seconds_to_close = "300"
+min_retrade_price_delta = "0.03"
+min_retrade_probability_delta = "0.04"
+[tags]
+sleeve_id = "weather-kalshi-live-a"
+"#,
+        )
+        .unwrap();
+        WeatherTemperatureArbitrageStrategy::from_spec(&spec).unwrap()
+    }
+
+    fn weather_signal(market_id: &str, probability_ticks: i64) -> StrategyEvent {
+        weather_signal_with_context(market_id, probability_ticks, None, None)
+    }
+
+    fn weather_signal_with_context(
+        market_id: &str,
+        probability_ticks: i64,
+        lead_days: Option<i64>,
+        close_time: Option<&str>,
+    ) -> StrategyEvent {
+        StrategyEvent::ExternalProbability {
+            source: "open-meteo".into(),
+            market_id: market_id.into(),
+            probability: FixedPrice(probability_ticks),
+            confidence: None,
+            lead_days,
+            close_time: close_time.map(str::to_string),
+        }
+    }
+
+    fn weather_external_record(
+        market_id: &str,
+        probability: &str,
+        lead_days: i64,
+        close_time: &str,
+    ) -> NormalizedEventRecord {
+        let payload = serde_json::json!({
+            "source": "open-meteo",
+            "market_id": market_id,
+            "implied_prob": probability,
+            "lead_days": lead_days,
+            "close_time": close_time,
+            "instrument_id": {
+                "venue": "kalshi",
+                "market_id": market_id,
+            },
+        });
+        NormalizedEventRecord {
+            event_id: format!("weather-{market_id}-{probability}"),
+            event_kind: "external".into(),
+            payload_json: payload.to_string(),
+            provenance: EventProvenance {
+                source: "open-meteo".into(),
+                channel: "external".into(),
+                schema_version: "weather-temperature-probability-v1".into(),
+                venue: Some("kalshi".into()),
+                source_sequence: None,
+                normalization_version: "normalizer-v1".into(),
+                metadata: Metadata::new(),
+            },
+            audit: audit(),
+        }
+    }
+
+    #[test]
+    fn weather_strategy_buys_yes_when_signal_beats_live_ask() {
+        let mut strat = weather_strategy();
+        let ctx = ctx();
+        assert!(strat
+            .on_event(&weather_signal("M-1", 700_000), &ctx)
+            .unwrap()
+            .is_empty());
+        let decisions = strat
+            .on_event(&strategy_event(&quote("0.55", "0.57")), &ctx)
+            .unwrap();
+
+        assert_eq!(decisions.len(), 1);
+        assert!(matches!(
+            &decisions[0],
+            DecisionPayload::PlaceOrder {
+                outcome_side: OutcomeSide::Yes,
+                side: Side::Buy,
+                price,
+                quantity,
+                fair_price: Some(fair_price),
+                time_in_force: TimeInForce::Ioc,
+                fee_rate_bps: Some(700),
+                ..
+            } if price == "0.57" && quantity == "1" && fair_price == "0.7"
+        ));
+    }
+
+    #[test]
+    fn weather_strategy_buys_no_at_complement_of_yes_bid() {
+        let mut strat = weather_strategy();
+        let ctx = ctx();
+        let _ = strat
+            .on_event(
+                &StrategyEvent::Quote {
+                    market_id: "M-1".into(),
+                    instrument: "kalshi:M-1".into(),
+                    bid: FixedPrice(600_000),
+                    ask: FixedPrice(620_000),
+                },
+                &ctx,
+            )
+            .unwrap();
+        let decisions = strat
+            .on_event(&weather_signal("M-1", 300_000), &ctx)
+            .unwrap();
+
+        assert_eq!(decisions.len(), 1);
+        assert!(matches!(
+            &decisions[0],
+            DecisionPayload::PlaceOrder {
+                outcome_side: OutcomeSide::No,
+                side: Side::Buy,
+                price,
+                fair_price: Some(fair_price),
+                ..
+            } if price == "0.4" && fair_price == "0.7"
+        ));
+    }
+
+    #[test]
+    fn weather_strategy_book_tick_inverts_kalshi_no_bid_to_yes_ask() {
+        let mut strat = weather_strategy();
+        let ctx = ctx();
+        let _ = strat
+            .on_event(&weather_signal("M-1", 700_000), &ctx)
+            .unwrap();
+        let decisions = strat
+            .on_event(
+                &StrategyEvent::Book {
+                    market_id: "M-1".into(),
+                    instrument: "kalshi:M-1".into(),
+                    bids: vec![(FixedPrice(400_000), 20)],
+                    // Kalshi book "no" levels are no bids. The weather taker
+                    // must invert 0.58 to a YES ask at 0.42 before trading.
+                    asks: vec![(FixedPrice(580_000), 10)],
+                    is_snapshot: true,
+                },
+                &ctx,
+            )
+            .unwrap();
+
+        assert_eq!(decisions.len(), 1);
+        assert!(matches!(
+            &decisions[0],
+            DecisionPayload::PlaceOrder {
+                outcome_side: OutcomeSide::Yes,
+                price,
+                ..
+            } if price == "0.42"
+        ));
+    }
+
+    #[test]
+    fn weather_strategy_retrade_gate_suppresses_duplicate_tick() {
+        let mut strat = weather_strategy();
+        let ctx = ctx();
+        let _ = strat
+            .on_event(&weather_signal("M-1", 700_000), &ctx)
+            .unwrap();
+        let first = strat
+            .on_event(&strategy_event(&quote("0.55", "0.57")), &ctx)
+            .unwrap();
+        let second = strat
+            .on_event(&strategy_event(&quote("0.55", "0.57")), &ctx)
+            .unwrap();
+
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn weather_strategy_suppresses_non_zero_lead_without_caching() {
+        let mut strat = weather_strategy();
+        let ctx = ctx();
+        strat
+            .on_event(
+                &weather_signal_with_context("M-1", 700_000, Some(1), None),
+                &ctx,
+            )
+            .unwrap();
+
+        assert!(strat
+            .on_event(&strategy_event(&quote("0.55", "0.57")), &ctx)
+            .unwrap()
+            .is_empty());
+
+        // Older producers without a lead tag are still accepted once a quote is
+        // cached; this proves the lead=1 signal was refused rather than cached.
+        assert_eq!(
+            strat
+                .on_event(&weather_signal("M-1", 700_000), &ctx)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn weather_strategy_suppresses_signal_within_close_buffer() {
+        let mut strat = weather_strategy();
+        let ctx = ctx();
+        strat
+            .on_event(&strategy_event(&quote("0.55", "0.57")), &ctx)
+            .unwrap();
+
+        let near = strat
+            .on_event(
+                &weather_signal_with_context("M-1", 700_000, Some(0), Some("2026-05-26T12:01:00Z")),
+                &ctx,
+            )
+            .unwrap();
+        assert!(near.is_empty());
+        assert!(strat
+            .on_event(&strategy_event(&quote("0.55", "0.57")), &ctx)
+            .unwrap()
+            .is_empty());
+
+        let far = strat
+            .on_event(
+                &weather_signal_with_context("M-1", 700_000, Some(0), Some("2026-05-26T13:00:00Z")),
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(far.len(), 1);
+    }
+
+    #[test]
+    fn weather_external_signal_parses_lead_and_close_context() {
+        let event = strategy_event(&weather_external_record(
+            "M-1",
+            "0.70",
+            0,
+            "2026-05-26T13:00:00Z",
+        ));
+
+        assert!(matches!(
+            event,
+            StrategyEvent::ExternalProbability {
+                source,
+                market_id,
+                probability,
+                lead_days: Some(0),
+                close_time: Some(close_time),
+                ..
+            } if source == "open-meteo"
+                && market_id == "M-1"
+                && probability.ticks() == 700_000
+                && close_time == "2026-05-26T13:00:00Z"
+        ));
+    }
+
     #[test]
     fn external_edge_confidence_gate_suppresses_low_confidence() {
         // Closes the Python↔Rust crop divergence: the generic external_edge
@@ -2148,6 +3560,8 @@ archetype = "external_edge"
             market_id: "KXM".into(),
             probability: FixedPrice(700_000),
             confidence: conf.map(FixedPrice),
+            lead_days: None,
+            close_time: None,
         };
         // Below the 0.55 gate -> suppressed.
         assert!(strat

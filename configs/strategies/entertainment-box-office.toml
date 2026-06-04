@@ -7,7 +7,7 @@ feature_schema_id = "entertainment_box_office_features"
 [subscription]
 venues = ["kalshi"]
 instrument_patterns = ["KXMOVIE*", "KXBOXOFFICE*"]
-event_kinds = ["external", "quote", "timer"]
+event_kinds = ["external", "quote"]
 external_sources = ["apify-fandango", "tmdb"]
 
 [default_execution_priority]
@@ -21,8 +21,8 @@ market_id = "KXBOXOFFICE-WEEKEND"
 venue = "kalshi"
 signal_source = "apify-fandango"
 target_gross_usd = "100000000"
-baseline_gross_usd = "120000000"
-extrapolation_hours = "48"
+baseline_gross_usd = "100000000"
+extrapolation_hours = "40"
 min_edge_bps = "500"
 size = "10"
 confidence_floor = "0.80"
@@ -30,4 +30,4 @@ confidence_floor = "0.80"
 [tags]
 family = "entertainment"
 mode = "paper"
-research_doc = "docs/strategy-specs.md#7"
+research_doc = "docs/v7-live-test-ready-strategy-specs.md"

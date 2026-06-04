@@ -25,4 +25,4 @@ reference_mid = "0.50"
 [tags]
 family = "macro"
 mode = "paper"
-research_doc = "docs/strategy-specs.md#3"
+research_doc = "docs/v7-live-test-ready-strategy-specs.md"

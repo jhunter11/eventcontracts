@@ -1,0 +1,37 @@
+strategy_id = "weather-ladder-cdf-v1"
+name = "ladder_cdf"
+version = "1.0.0"
+description = "KXHIGH daily-high brackets priced coherently off one station-day temperature distribution (full-ladder CDF)."
+feature_schema_id = "weather_ladder_cdf_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXHIGH*", "KXTEMP*"]
+event_kinds = ["quote", "external"]
+external_sources = ["weather-dist"]
+
+[default_execution_priority]
+tier = "standard"
+max_delay_ms = 1000
+expires_after_ms = 300000
+reason = "weather distribution half-life is minutes-to-hours"
+
+[parameters]
+# Producer publishes {mean, sigma} for the station-day high (high-so-far +
+# remaining-hours forecast). Brackets are mutually-exclusive temperature ranges.
+# PLACEHOLDERS: replace with the live KXHIGH<city>-<date> bracket tickers.
+signal_source = "weather-dist"
+brackets = "KXHIGHNY-EXAMPLE-B71:71:73;KXHIGHNY-EXAMPLE-B73:73:75;KXHIGHNY-EXAMPLE-B75:75:77;KXHIGHNY-EXAMPLE-B77:77:79"
+ladder_kind = "exclusive"
+dist = "normal"
+min_edge_bps = "150"
+size = "5"
+max_orders = "8"
+venue = "kalshi"
+
+[tags]
+family = "weather"
+mode = "paper"
+archetype = "ladder_cdf"
+research_doc = "docs/v7-live-test-ready-strategy-specs.md"
+note = "coherent-ladder variant of weather_temperature_arbitrage; brackets are placeholders"

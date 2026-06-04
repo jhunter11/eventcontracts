@@ -1,0 +1,36 @@
+strategy_id = "equity-index-range-ladder-v1"
+name = "external_edge"
+version = "1.0.0"
+description = "S&P/Nasdaq daily-close range ladder: per-bracket terminal-distribution probability vs Kalshi mid (external_edge)."
+feature_schema_id = "equity_index_range_features"
+
+[subscription]
+venues = ["kalshi"]
+# Confirm exact daily-range series tickers via REST discovery (e.g. S&P close,
+# Nasdaq-100 close) before relying on these.
+instrument_patterns = ["KXINX*", "KXINXD*", "KXNASDAQ100*", "KXSPX*"]
+event_kinds = ["quote", "external"]
+external_sources = ["equity-terminal-dist"]
+
+[default_execution_priority]
+tier = "standard"
+max_delay_ms = 2000
+expires_after_ms = 600000
+reason = "range pricing updates over seconds; the final minutes-to-close tighten but are not a sub-100ms race"
+
+[parameters]
+# Producer publishes a per-bracket YES probability from an ES/NQ + intraday-vol
+# terminal-distribution model (Brownian bridge near close). Joint-CDF / no-arb
+# ladder enforcement is the deferred Rust-archetype promotion step; per-bracket
+# external_edge runs today.
+signal_source = "equity-terminal-dist"
+min_edge_bps = "200"
+size = "5"
+confidence_floor = "0"
+venue = "kalshi"
+
+[tags]
+family = "equity"
+mode = "paper"
+archetype = "external_edge"
+research_doc = "docs/v7-live-test-ready-strategy-specs.md#5-equity-index-daily-range-ladders"

@@ -31,8 +31,9 @@ use eventcontracts_model_runtime::{
     TennisV2OnnxArtifact,
 };
 use eventcontracts_risk::{
-    epoch_seconds_from_rfc3339, invalidate_quote_bbo, record_book_bbo, record_quote_bbo,
-    utc_day_from_epoch_secs, IntentSnapshot, RiskDecision, RiskGate, RiskLimits,
+    epoch_seconds_from_rfc3339, invalidate_quote_bbo, liquidation_unrealized_drawdown_ticks,
+    record_book_bbo, record_quote_bbo, utc_day_from_epoch_secs, IntentSnapshot, RiskDecision,
+    RiskGate, RiskLimits,
 };
 use eventcontracts_runner::{
     build_intent_envelope, default_registry, priority_from_spec, OnnxQuoteStrategy, SpecError,
@@ -44,7 +45,7 @@ use serde::Deserialize;
 mod reconcile;
 use std::error::Error;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -64,10 +65,16 @@ enum WsLoopResult {
     Deadline,
     Shutdown(&'static str),
     Tick,
-    Envelope(KalshiWsEnvelope),
+    Input(LiveInput),
     /// The spawned WS reader task has exited — either gracefully on close
     /// or after exhausting its reconnect budget. Either way the runner can
     /// no longer receive ingest; treat this as a terminal shutdown.
+    WsTerminated,
+}
+
+enum LiveInput {
+    Ws(KalshiWsEnvelope),
+    External(NormalizedEventRecord),
     WsTerminated,
 }
 
@@ -118,6 +125,27 @@ struct Args {
     /// TennisMatchSnapshot fields from eventcontracts-feature-builder.
     #[arg(long)]
     tennis_snapshots_jsonl: Option<PathBuf>,
+    /// JSONL rows containing live external probabilities. This bridges the
+    /// Python weather signal generator into the Rust submit/reconcile path;
+    /// rows with stale `as_of` timestamps are ignored.
+    #[arg(long)]
+    external_signals_jsonl: Option<PathBuf>,
+    /// Source label attached to `--external-signals-jsonl` probability rows.
+    #[arg(long, default_value = "open-meteo")]
+    external_signal_source: String,
+    /// Poll interval for tailing `--external-signals-jsonl`.
+    #[arg(long, default_value_t = 250)]
+    external_signals_poll_ms: u64,
+    /// Maximum accepted age for an external signal row.
+    #[arg(long, default_value_t = 180)]
+    external_signal_max_age_secs: u64,
+    /// Fail-closed schema guard (F9): when set, the live runner refuses to
+    /// start unless the promoted bundle's `feature_schema_version` (from its
+    /// manifest) equals this value. Stops a v1 bundle from being scored with
+    /// the v2 feature vector — or vice versa — which would silently mis-shape
+    /// the model input on the real-money path. Set to "2" for the v2 sleeve.
+    #[arg(long)]
+    expect_tennis_schema_version: Option<String>,
     /// Submit real orders to Kalshi. Off by default; paper mode otherwise.
     /// Requires --max-live-orders, an explicit KALSHI_ENV, and (unless --yes)
     /// an interactive confirmation prompt.
@@ -147,6 +175,12 @@ struct Args {
     /// --cancel-orphans-on-start.
     #[arg(long, default_value_t = false)]
     reconcile_on_start: bool,
+    /// Seed subscribed markets as tradable at startup. Use when the operator
+    /// selected explicit open tickers and the lifecycle stream does not replay
+    /// their current state on subscribe; later lifecycle events still override
+    /// this seed and can suspend/cancel.
+    #[arg(long, default_value_t = false)]
+    seed_open_market_state_on_start: bool,
     /// Optional JSON metrics export written at process exit.
     #[arg(long)]
     metrics_json: Option<PathBuf>,
@@ -258,14 +292,49 @@ buy_no_below = 0.7
         )
         .unwrap();
 
-        let event = tennis_prediction_event(&row.market_id, &row.source, 0.612345, 7).unwrap();
+        let event =
+            tennis_prediction_event(&row.market_id, &row.source, 0.612345, false, 7).unwrap();
         assert_eq!(event.event_kind, "external");
         assert_eq!(event.provenance.source, "tennis_xgboost_onnx");
         assert!(event.payload_json.contains("\"market_id\":\"KXTENNIS-M1\""));
         assert!(event
             .payload_json
             .contains("\"player_1_win_probability\":\"0.612345\""));
+        assert!(event
+            .payload_json
+            .contains("\"model_confidence\":\"0.612345\""));
+        assert!(event.payload_json.contains("\"odds_present\":false"));
         event.validate().unwrap();
+    }
+
+    #[test]
+    fn weather_external_signal_row_flattens_into_probability_event() {
+        let now = rfc3339_now();
+        let line = format!(
+            r#"{{"as_of":"{now}","instrument":"KXHIGHMIA-26MAY31-B94.5","implied_prob":0.612345}}"#
+        );
+        let event = external_signal_row_event(&line, "open-meteo", 3, 180)
+            .unwrap()
+            .expect("fresh event");
+
+        assert_eq!(event.event_kind, "external");
+        assert_eq!(event.provenance.source, "open-meteo");
+        assert!(event
+            .payload_json
+            .contains("\"market_id\":\"KXHIGHMIA-26MAY31-B94.5\""));
+        assert!(event.payload_json.contains("\"implied_prob\":\"0.612345\""));
+        let parsed = StrategyEvent::from_record(&event).unwrap();
+        assert!(matches!(
+            parsed,
+            StrategyEvent::ExternalProbability {
+                source,
+                market_id,
+                probability,
+                ..
+            } if source == "open-meteo"
+                && market_id == "KXHIGHMIA-26MAY31-B94.5"
+                && probability.ticks() == 612_345
+        ));
     }
 
     #[test]
@@ -291,6 +360,29 @@ buy_no_below = 0.7
         assert_eq!(row.snapshot.round, "QF");
         // unspecified fields fall back to the v2 priors.
         assert!((row.snapshot.p1_serve_won - 0.63).abs() < 1e-9);
+    }
+
+    #[test]
+    fn schema_version_gate_passes_on_match_and_when_unset() {
+        // No operator expectation → guard is a no-op for any bundle version.
+        assert!(check_tennis_schema_version("2", None).is_ok());
+        assert!(check_tennis_schema_version("1", None).is_ok());
+        assert!(check_tennis_schema_version("", None).is_ok());
+        // Expectation met → ok.
+        assert!(check_tennis_schema_version("2", Some("2")).is_ok());
+    }
+
+    #[test]
+    fn schema_version_gate_fails_closed_on_mismatch_or_missing() {
+        // v1 bundle promoted under a v2 expectation must hard-fail — exactly the
+        // "feature width mismatch" the live-capital audit flagged (F9).
+        let err = check_tennis_schema_version("1", Some("2")).unwrap_err();
+        assert!(err.contains("expected `2`"), "{err}");
+        assert!(err.contains('1'), "{err}");
+        // A bundle whose manifest carries no version, under an expectation, also
+        // fails closed rather than silently defaulting to the v1 builder.
+        let err = check_tennis_schema_version("", Some("2")).unwrap_err();
+        assert!(err.contains("missing manifest"), "{err}");
     }
 
     #[test]
@@ -342,6 +434,176 @@ max_position_notional = "34"
         assert_eq!(limits.max_open_orders, 10);
     }
 
+    fn f7_limits() -> RiskLimits {
+        RiskLimits {
+            max_order_notional: "100".into(),
+            max_position_notional: "1000".into(),
+            max_daily_loss: "150".into(),
+            max_open_orders: 10,
+            max_gross_exposure: "1000".into(),
+            currency: "USD".into(),
+            max_market_data_age_secs: 60,
+        }
+    }
+
+    /// Build a validated `NormalizedEventRecord` for a private-channel event,
+    /// modeled on the live WS normalization so `apply_private_venue_event` sees
+    /// exactly the record shape it gets in production.
+    fn private_event_record(
+        event_kind: &str,
+        seq: u64,
+        payload: serde_json::Value,
+    ) -> NormalizedEventRecord {
+        let event_id = format!("{event_kind}:{seq}");
+        let payload_json = payload.to_string();
+        let provenance = EventProvenance {
+            source: "kalshi".into(),
+            channel: event_kind.into(),
+            schema_version: "normalized-event-v1".into(),
+            venue: Some("kalshi".into()),
+            source_sequence: Some(seq.to_string()),
+            normalization_version: "kalshi-ws-v1".into(),
+            metadata: Metadata::new(),
+        };
+        let digest = canonical_sha256(&serde_json::json!({
+            "event_id": event_id.clone(),
+            "event_kind": event_kind,
+            "payload_json": payload_json.clone(),
+            "provenance": provenance.clone(),
+        }))
+        .unwrap();
+        let event = NormalizedEventRecord {
+            event_id: event_id.clone(),
+            event_kind: event_kind.into(),
+            payload_json,
+            provenance,
+            audit: AuditStamp {
+                object_id: event_id,
+                object_kind: "normalized_event".into(),
+                schema_version: "normalized-event-v1".into(),
+                produced_at: "2026-05-26T12:00:00Z".into(),
+                producer: "test".into(),
+                canonical_sha256: digest,
+                parent_ids: vec![],
+                trace_id: None,
+                metadata: Metadata::new(),
+            },
+        };
+        event.validate().unwrap();
+        event
+    }
+
+    fn seed_resting_buy_yes(gateway: &mut DryRunGateway<BoxedVenue>, client_order_id: &str) {
+        use eventcontracts_gateway::RestingOrderSnapshot;
+        use eventcontracts_oms::{OrderState, OutcomeSide, Side, TimeInForce};
+        gateway
+            .adopt_resting_order(RestingOrderSnapshot {
+                client_order_id: client_order_id.into(),
+                venue_order_id: Some(format!("v-{client_order_id}")),
+                instrument_id: "kalshi:M-1".into(),
+                outcome_side: OutcomeSide::Yes,
+                side: Side::Buy,
+                price: "0.50".into(),
+                quantity: "10".into(),
+                filled_quantity: "0".into(),
+                time_in_force: TimeInForce::Ioc,
+                // A live BUY acked by the venue and resting on the book — the
+                // state an own-fill arrives against.
+                state: OrderState::Acked,
+                updated_at: "2026-05-26T12:00:00Z".into(),
+                observed_at: "2026-05-26T12:00:00Z".into(),
+                reject_reason: None,
+            })
+            .expect("seed resting order");
+    }
+
+    /// F7 end-to-end seam: an own-fill arriving on the private WS channel must
+    /// flow `apply_private_venue_event` -> `project_event` -> `gateway.apply_fill`
+    /// and be counted in metrics. This is the exact path with real money on it.
+    /// (The cash/position/daily-loss arithmetic of `apply_fill` itself is covered
+    /// by the gateway crate's
+    /// `live_path_async_submit_then_fills_track_cash_and_daily_loss`; here we
+    /// prove the live-runner private-event wiring around it, plus WS-replay
+    /// dedupe and the non-private passthrough.)
+    #[tokio::test]
+    async fn own_fill_event_flows_through_apply_private_venue_event_into_sleeve_state() {
+        let venue: BoxedVenue = Box::new(RecordingVenueClient::new());
+        let mut gateway = DryRunGateway::new(RiskGate::new(f7_limits()), venue);
+        let mut metrics = Metrics::default();
+        seed_resting_buy_yes(&mut gateway, "c-1");
+
+        let own_fill = private_event_record(
+            "own_fill",
+            1,
+            serde_json::json!({
+                "client_order_id": "c-1",
+                "instrument": "kalshi:M-1",
+                "fill_id": "f-1",
+                "price": "0.50",
+                "quantity": "10",
+                "fee": "0.01",
+                "remaining_quantity": "0",
+            }),
+        );
+
+        let halt = apply_private_venue_event(&own_fill, &mut gateway, &mut metrics).unwrap();
+        assert!(
+            !halt,
+            "a known own-fill must not trigger a reconciliation halt"
+        );
+        assert_eq!(
+            metrics.own_fills, 1,
+            "the fill must be counted exactly once"
+        );
+        assert_eq!(metrics.duplicate_own_fills, 0);
+        assert_eq!(metrics.private_event_errors, 0);
+
+        // Idempotency: replaying the same fill_id is deduped, not double-counted.
+        let halt = apply_private_venue_event(&own_fill, &mut gateway, &mut metrics).unwrap();
+        assert!(!halt);
+        assert_eq!(metrics.own_fills, 1);
+        assert_eq!(metrics.duplicate_own_fills, 1);
+
+        // A non-private (quote) event is a passthrough: not handled here.
+        let quote = private_event_record(
+            "quote",
+            2,
+            serde_json::json!({ "instrument": "kalshi:M-1", "bid": "0.49", "ask": "0.51" }),
+        );
+        assert!(!apply_private_venue_event(&quote, &mut gateway, &mut metrics).unwrap());
+    }
+
+    /// F7 safety path: an own-fill for an order the OMS has never seen must halt
+    /// the live run for reconciliation rather than silently dropping a real fill.
+    #[tokio::test]
+    async fn own_fill_for_unknown_order_halts_for_reconciliation() {
+        let venue: BoxedVenue = Box::new(RecordingVenueClient::new());
+        let mut gateway = DryRunGateway::new(RiskGate::new(f7_limits()), venue);
+        let mut metrics = Metrics::default();
+
+        let own_fill = private_event_record(
+            "own_fill",
+            1,
+            serde_json::json!({
+                "client_order_id": "unknown-cid",
+                "instrument": "kalshi:M-1",
+                "fill_id": "f-9",
+                "price": "0.50",
+                "quantity": "10",
+                "fee": "0.01",
+                "remaining_quantity": "0",
+            }),
+        );
+
+        let halt = apply_private_venue_event(&own_fill, &mut gateway, &mut metrics).unwrap();
+        assert!(
+            halt,
+            "an own-fill for an unknown order must halt for reconciliation"
+        );
+        assert_eq!(metrics.own_fills, 0);
+        assert_eq!(metrics.private_event_errors, 1);
+    }
+
     #[test]
     fn live_tennis_sleeve_config_parses_with_conservative_limits() {
         // The committed live sleeve is a go-live artifact: it MUST stay parseable
@@ -351,11 +613,14 @@ max_position_notional = "34"
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../configs/sleeves/sports-tennis-kalshi-live-a.toml");
         let limits = load_risk_limits(Some(&path)).expect("live tennis sleeve must parse");
-        assert_eq!(limits.max_order_notional, "25");
-        assert_eq!(limits.max_position_notional, "100");
-        assert_eq!(limits.max_daily_loss, "150");
-        assert_eq!(limits.max_open_orders, 5);
-        assert_eq!(limits.max_gross_exposure, "250");
+        // $8 throwaway first-live envelope (see the sleeve TOML header): one
+        // 5-contract order, whole-bankroll caps, single open order. Update in
+        // lockstep if the committed sleeve is re-funded.
+        assert_eq!(limits.max_order_notional, "5");
+        assert_eq!(limits.max_position_notional, "8");
+        assert_eq!(limits.max_daily_loss, "8");
+        assert_eq!(limits.max_open_orders, 1);
+        assert_eq!(limits.max_gross_exposure, "8");
     }
 
     #[test]
@@ -564,6 +829,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         match rest.get_balance().await {
             Ok(balance) => {
                 report.balance_ticks = balance.available_ticks();
+                // F6: arm the Rust available-cash gate with venue truth. Until
+                // this is set the gate is inert (None); the notional/gross caps
+                // are the only bound. The gateway keeps it in sync on fills.
+                gateway.sleeve_state.available_cash_ticks = Some(balance.available_ticks());
                 let cents = balance.available_cents();
                 eprintln!(
                     "reconcile-on-start: venue balance=${}.{:02}",
@@ -594,9 +863,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let mut adopted_instruments = Vec::new();
                 for order in &resting {
                     let snapshot = order.to_resting_snapshot(&now).map_err(|e| {
+                        // Fail-closed, but self-diagnosing: dump the full venue
+                        // payload (including any fields we do not model, captured
+                        // in `extra`) so the operator can tell a stale/market
+                        // order from a Kalshi field rename before canceling.
+                        eprintln!(
+                            "reconcile-on-start: un-adoptable venue order {} — raw venue payload follows:\n{order:#?}",
+                            order.order_id
+                        );
                         format!(
                             "reconcile-on-start: cannot adopt venue order {}; {e}; \
-                             rerun with --cancel-orphans-on-start to clear venue truth",
+                             inspect the payload dump above, then rerun with \
+                             --cancel-orphans-on-start to clear venue truth",
                             order.order_id
                         )
                     })?;
@@ -644,6 +922,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // `--max-live-orders` is a one-way budget on submission events to
     // bound the worst-case venue-credit consumption, not a "currently open"
     // count. (N8)
+    if args.seed_open_market_state_on_start {
+        let now = rfc3339_now();
+        for ticker in &tickers {
+            let instrument = format!("kalshi:{ticker}");
+            gateway.apply_market_state(
+                &instrument,
+                MarketState::Opened,
+                Some("startup-open-seed"),
+                &now,
+            )?;
+        }
+        eprintln!(
+            "seeded {} subscribed market(s) as Opened at startup; lifecycle events still override",
+            tickers.len()
+        );
+    }
     if gateway.sleeve_state.kill_switch_engaged {
         return Err(
             "startup reconciliation adopted state that breaches risk; clear or repair venue state before live trading"
@@ -672,12 +966,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // empty, so risk would reject them anyway. Counting dropped warmup
         // decisions in metrics surfaces the case where a researcher
         // expected an order from prefill alone.
-        let events = score_tennis_snapshot_file(artifact_dir, snapshot_path)?;
+        let (events, missing_odds) = score_tennis_snapshot_file(
+            artifact_dir,
+            snapshot_path,
+            args.expect_tennis_schema_version.as_deref(),
+        )?;
         eprintln!(
             "scored {} tennis snapshots from {}",
             events.len(),
             snapshot_path.display()
         );
+        metrics.tennis_snapshots_scored += events.len() as u64;
+        metrics.tennis_snapshots_missing_odds += missing_odds as u64;
+        if missing_odds > 0 {
+            // F8: a snapshot with no bookmaker odds is scored, but if the sleeve
+            // sets require_odds_present the order is suppressed downstream. Make
+            // that loud here and in the metrics snapshot so a zero-order run is
+            // never silently attributed to "no edge".
+            eprintln!(
+                "WARNING: {missing_odds} of {} tennis snapshots carried no bookmaker odds; \
+                 with require_odds_present=true these markets will NOT trade. \
+                 Wire an odds feed (see tennis-build-snapshots / docs) before funding.",
+                events.len(),
+            );
+        }
         for normalized in events {
             let strategy_event = match StrategyEvent::from_record(&normalized) {
                 Ok(e) => e,
@@ -705,25 +1017,39 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // the await. Bounded capacity gives natural backpressure: when the
     // main loop falls behind, the WS task awaits on `send`, which in turn
     // applies TCP backpressure on tungstenite.
-    let (env_tx, mut env_rx) = mpsc::channel::<KalshiWsEnvelope>(WS_INGEST_CHANNEL_CAPACITY);
+    let (env_tx, mut env_rx) = mpsc::channel::<LiveInput>(WS_INGEST_CHANNEL_CAPACITY);
     let (reconnect_tx, reconnect_rx) = mpsc::channel::<&'static str>(4);
     let ws_errors_counter = Arc::new(AtomicU64::new(0));
+    let external_signal_errors_counter = Arc::new(AtomicU64::new(0));
     let ws_task = {
         let channels_owned: Vec<String> = channels.iter().map(|&s| s.to_string()).collect();
         let tickers_owned: Vec<String> = tickers.clone();
         let ws_errors = ws_errors_counter.clone();
+        let ws_tx = env_tx.clone();
         tokio::spawn(async move {
             ws_reader_task(
                 ws,
                 channels_owned,
                 tickers_owned,
-                env_tx,
+                ws_tx,
                 reconnect_rx,
                 ws_errors,
             )
             .await
         })
     };
+    let external_signal_task = args.external_signals_jsonl.as_ref().map(|path| {
+        let tx = env_tx.clone();
+        let source = args.external_signal_source.clone();
+        let path = path.clone();
+        let errors = external_signal_errors_counter.clone();
+        let max_age_secs = args.external_signal_max_age_secs;
+        let poll_ms = args.external_signals_poll_ms;
+        tokio::spawn(async move {
+            external_signal_reader_task(path, source, tx, max_age_secs, poll_ms, errors).await
+        })
+    });
+    drop(env_tx);
 
     eprintln!("running for {}s...", args.duration_secs);
     while Instant::now() < deadline {
@@ -737,12 +1063,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             _ = tokio::time::sleep(Duration::from_secs(1)) => WsLoopResult::Tick,
             recv = tokio::time::timeout(remaining, env_rx.recv()) => match recv {
                 Err(_) => WsLoopResult::Deadline,
-                Ok(Some(env)) => WsLoopResult::Envelope(env),
+                Ok(Some(input)) => WsLoopResult::Input(input),
                 Ok(None) => WsLoopResult::WsTerminated,
             },
         };
         let recv_at = Instant::now();
-        let env_msg = match recv_t {
+        let input_msg = match recv_t {
             WsLoopResult::Deadline => break,
             WsLoopResult::Shutdown(reason) => {
                 gateway.sleeve_state.kill_switch_engaged = true;
@@ -753,10 +1079,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             WsLoopResult::Tick => {
                 if let Some(path) = &args.metrics_snapshot_file {
+                    // Keep the mark-to-market drawdown current during quiet
+                    // periods so the snapshot reflects the true daily-loss
+                    // headroom even when no event is flowing (F3).
+                    gateway.sleeve_state.unrealized_drawdown_loss =
+                        liquidation_unrealized_drawdown_ticks(&gateway.sleeve_state);
                     let live = LiveStatus {
                         elapsed_secs: start_time.elapsed().as_secs_f64(),
                         kill_switch_engaged: gateway.sleeve_state.kill_switch_engaged,
                         daily_realized_loss_ticks: gateway.sleeve_state.daily_realized_loss,
+                        unrealized_drawdown_loss_ticks: gateway
+                            .sleeve_state
+                            .unrealized_drawdown_loss,
                         live_place_attempts,
                     };
                     write_metrics_snapshot(
@@ -773,7 +1107,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
                 continue;
             }
-            WsLoopResult::Envelope(e) => e,
+            WsLoopResult::Input(LiveInput::WsTerminated) => {
+                eprintln!("ws reader task exited; halting main loop");
+                gateway.sleeve_state.kill_switch_engaged = true;
+                if args.live_submit {
+                    cancel_all_or_log_async(&mut gateway, "ws-terminated").await;
+                }
+                break;
+            }
+            WsLoopResult::Input(input) => input,
             WsLoopResult::WsTerminated => {
                 eprintln!("ws reader task exited; halting main loop");
                 gateway.sleeve_state.kill_switch_engaged = true;
@@ -784,50 +1126,64 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         };
 
-        metrics.raw_events += 1;
-        metrics
-            .by_channel
-            .entry(env_msg.msg_type.clone())
-            .and_modify(|c| *c += 1)
-            .or_insert(1);
-
-        // normalize
-        let normalized = match normalize_ws_payload(&env_msg, OffsetDateTime::now_utc()) {
-            Ok(n) => n,
-            Err(NormalizeError::Ignored(_)) => {
-                metrics.normalize_ignored += 1;
-                continue;
-            }
-            Err(NormalizeError::UnsupportedChannel(c)) => {
-                metrics.normalize_unsupported += 1;
+        let (normalized, normalize_done) = match input_msg {
+            LiveInput::Ws(env_msg) => {
+                metrics.raw_events += 1;
                 metrics
                     .by_channel
-                    .entry(format!("unsupported:{c}"))
-                    .and_modify(|x| *x += 1)
+                    .entry(env_msg.msg_type.clone())
+                    .and_modify(|c| *c += 1)
                     .or_insert(1);
-                continue;
-            }
-            Err(NormalizeError::SequenceGap { .. }) => {
-                metrics.sequence_gaps += 1;
-                metrics.normalize_errors += 1;
-                eprintln!("sequence gap detected; forcing ws resubscribe");
-                if reconnect_tx.send("sequence-gap").await.is_err() {
-                    eprintln!("ws task gone; cannot request resubscribe");
-                    break;
-                }
-                continue;
-            }
-            Err(e) => {
-                metrics.normalize_errors += 1;
-                eprintln!("normalize err: {e}");
-                continue;
-            }
-        };
 
-        let normalize_done = Instant::now();
-        metrics
-            .normalize_latency_us
-            .push((normalize_done - recv_at).as_micros() as u64);
+                let normalized = match normalize_ws_payload(&env_msg, OffsetDateTime::now_utc()) {
+                    Ok(n) => n,
+                    Err(NormalizeError::Ignored(_)) => {
+                        metrics.normalize_ignored += 1;
+                        continue;
+                    }
+                    Err(NormalizeError::UnsupportedChannel(c)) => {
+                        metrics.normalize_unsupported += 1;
+                        metrics
+                            .by_channel
+                            .entry(format!("unsupported:{c}"))
+                            .and_modify(|x| *x += 1)
+                            .or_insert(1);
+                        continue;
+                    }
+                    Err(NormalizeError::SequenceGap { .. }) => {
+                        metrics.sequence_gaps += 1;
+                        metrics.normalize_errors += 1;
+                        eprintln!("sequence gap detected; forcing ws resubscribe");
+                        if reconnect_tx.send("sequence-gap").await.is_err() {
+                            eprintln!("ws task gone; cannot request resubscribe");
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        metrics.normalize_errors += 1;
+                        eprintln!("normalize err: {e}");
+                        continue;
+                    }
+                };
+
+                let normalize_done = Instant::now();
+                metrics
+                    .normalize_latency_us
+                    .push((normalize_done - recv_at).as_micros() as u64);
+                (normalized, normalize_done)
+            }
+            LiveInput::External(normalized) => {
+                metrics.external_signal_events += 1;
+                metrics
+                    .by_channel
+                    .entry("external-signals-jsonl".into())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
+                (normalized, recv_at)
+            }
+            LiveInput::WsTerminated => unreachable!("handled above"),
+        };
 
         metrics.normalized_events += 1;
 
@@ -903,9 +1259,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             ..
         } = &strategy_event
         {
-            if let (Some((bid, bid_qty)), Some((ask, ask_qty))) = (bids.first(), asks.first()) {
+            if let (Some((bid, bid_qty)), Some((no_bid, ask_qty))) = (bids.first(), asks.first()) {
                 let bid_t = bid.ticks() / 100;
-                let ask_t = ask.ticks() / 100;
+                // runtime-hot carries Kalshi `no` book levels as the ask-side
+                // vector. Convert the top NO bid into an executable YES ask
+                // before recording side-specific last-look BBO.
+                let ask_t = 10_000_i64.saturating_sub(no_bid.ticks() / 100);
                 const HALF_DOLLAR_4DP_TICKS: i64 = 5_000;
                 if bid_t > 0 && ask_t > 0 && ask_t.saturating_sub(bid_t) <= HALF_DOLLAR_4DP_TICKS {
                     record_book_bbo(
@@ -920,6 +1279,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
         }
+        // F3: re-mark open positions to the freshest executable book before the
+        // risk gate runs this event's decisions. This folds liquidation-mark
+        // drawdown into `max_daily_loss` so a held position bleeding intraday
+        // counts toward the stop before it is realized at settlement.
+        gateway.sleeve_state.unrealized_drawdown_loss =
+            liquidation_unrealized_drawdown_ticks(&gateway.sleeve_state);
         // Read from the gateway by reference for the strategy context — no
         // clone of the sleeve_state per quote. Strategies only need a
         // read-only view; the explicit `&` enforces that.
@@ -1110,9 +1475,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     drop(reconnect_tx);
     ws_task.abort();
     let _ = ws_task.await;
+    if let Some(task) = external_signal_task {
+        task.abort();
+        let _ = task.await;
+    }
     metrics.ws_errors = metrics
         .ws_errors
         .saturating_add(ws_errors_counter.load(Ordering::Relaxed));
+    metrics.external_signal_errors = metrics
+        .external_signal_errors
+        .saturating_add(external_signal_errors_counter.load(Ordering::Relaxed));
     metrics.duration = start_time.elapsed();
 
     print_report(&metrics, &tickers, &args);
@@ -1372,7 +1744,7 @@ async fn ws_reader_task(
     mut ws: KalshiWsClient,
     channels: Vec<String>,
     tickers: Vec<String>,
-    env_tx: mpsc::Sender<KalshiWsEnvelope>,
+    env_tx: mpsc::Sender<LiveInput>,
     mut reconnect_rx: mpsc::Receiver<&'static str>,
     ws_errors: Arc<AtomicU64>,
 ) {
@@ -1411,7 +1783,7 @@ async fn ws_reader_task(
                         if stable_msg_streak >= STABLE_MSGS_TO_RESET_RECONNECT {
                             reconnect_attempts = 0;
                         }
-                        if env_tx.send(env).await.is_err() {
+                        if env_tx.send(LiveInput::Ws(env)).await.is_err() {
                             break;
                         }
                     }
@@ -1437,6 +1809,7 @@ async fn ws_reader_task(
         }
     }
     let _ = ws.close().await;
+    let _ = env_tx.send(LiveInput::WsTerminated).await;
 }
 
 async fn reconnect_ws(
@@ -1459,6 +1832,166 @@ async fn reconnect_ws(
     ws.subscribe(channels, ticker_refs).await?;
     eprintln!("ws reconnected after attempt {}", *attempts);
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct ExternalSignalJsonlRow {
+    as_of: String,
+    #[serde(alias = "market_id")]
+    instrument: String,
+    #[serde(alias = "probability")]
+    implied_prob: f64,
+}
+
+async fn external_signal_reader_task(
+    path: PathBuf,
+    source: String,
+    tx: mpsc::Sender<LiveInput>,
+    max_age_secs: u64,
+    poll_ms: u64,
+    errors: Arc<AtomicU64>,
+) {
+    let mut offset = 0_u64;
+    let mut seq = 0_u64;
+    let poll = Duration::from_millis(poll_ms.max(25));
+    loop {
+        match read_external_signal_lines(&path, &source, &mut offset, &mut seq, max_age_secs) {
+            Ok(events) => {
+                for event in events {
+                    if tx.send(LiveInput::External(event)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                errors.fetch_add(1, Ordering::Relaxed);
+                eprintln!("external signal tail error ({}): {e}", path.display());
+            }
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+fn read_external_signal_lines(
+    path: &std::path::Path,
+    source: &str,
+    offset: &mut u64,
+    seq: &mut u64,
+    max_age_secs: u64,
+) -> Result<Vec<NormalizedEventRecord>, Box<dyn Error + Send + Sync>> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if len < *offset {
+        *offset = 0;
+    }
+    file.seek(SeekFrom::Start(*offset))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut events = Vec::new();
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            break;
+        }
+        *offset = (*offset).saturating_add(bytes as u64);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        *seq = seq.saturating_add(1);
+        match external_signal_row_event(trimmed, source, *seq, max_age_secs) {
+            Ok(Some(event)) => events.push(event),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("external signal row skipped: {e}");
+            }
+        }
+    }
+    Ok(events)
+}
+
+fn external_signal_row_event(
+    line: &str,
+    source: &str,
+    seq: u64,
+    max_age_secs: u64,
+) -> Result<Option<NormalizedEventRecord>, Box<dyn Error + Send + Sync>> {
+    let row: ExternalSignalJsonlRow = serde_json::from_str(line)?;
+    if !external_signal_fresh(&row.as_of, max_age_secs) {
+        return Ok(None);
+    }
+    if !(0.0..=1.0).contains(&row.implied_prob) {
+        return Ok(None);
+    }
+    let market_id = row
+        .instrument
+        .strip_prefix("kalshi:")
+        .unwrap_or(row.instrument.as_str());
+    let probability = format!("{:.6}", row.implied_prob);
+    external_probability_event(market_id, source, &probability, &row.as_of, seq).map(Some)
+}
+
+fn external_signal_fresh(as_of: &str, max_age_secs: u64) -> bool {
+    let signal_epoch = epoch_seconds_from_rfc3339(as_of);
+    if signal_epoch == 0 {
+        return false;
+    }
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let age = now.saturating_sub(signal_epoch);
+    age >= -5 && age <= max_age_secs as i64
+}
+
+fn external_probability_event(
+    market_id: &str,
+    source: &str,
+    probability: &str,
+    as_of: &str,
+    seq: u64,
+) -> Result<NormalizedEventRecord, Box<dyn Error + Send + Sync>> {
+    let now = rfc3339_now();
+    let payload = serde_json::json!({
+        "source": source,
+        "market_id": market_id,
+        "implied_prob": probability,
+        "as_of": as_of,
+    });
+    let event_id = format!("external-jsonl:{source}:{market_id}:{seq}");
+    let payload_json = payload.to_string();
+    let provenance = EventProvenance {
+        source: source.to_string(),
+        channel: "external-signals-jsonl".into(),
+        schema_version: "normalized-event-v1".into(),
+        venue: Some("kalshi".into()),
+        source_sequence: Some(seq.to_string()),
+        normalization_version: "external-jsonl-v1".into(),
+        metadata: Metadata::new(),
+    };
+    let digest = canonical_sha256(&serde_json::json!({
+        "event_id": event_id.clone(),
+        "event_kind": "external",
+        "payload_json": payload_json.clone(),
+        "provenance": provenance.clone(),
+    }))?;
+    let event = NormalizedEventRecord {
+        event_id: event_id.clone(),
+        event_kind: "external".into(),
+        payload_json,
+        provenance,
+        audit: AuditStamp {
+            object_id: event_id,
+            object_kind: "normalized_event".into(),
+            schema_version: "normalized-event-v1".into(),
+            produced_at: now,
+            producer: "live-runner-external-jsonl".into(),
+            canonical_sha256: digest,
+            parent_ids: vec![],
+            trace_id: None,
+            metadata: Metadata::new(),
+        },
+    };
+    event.validate()?;
+    Ok(event)
 }
 
 /// Async bulk-cancel for the hot path. Used by the main loop on every
@@ -1732,8 +2265,19 @@ struct TennisV2SnapshotRow {
 fn score_tennis_snapshot_file(
     artifact_dir: &std::path::Path,
     snapshot_path: &std::path::Path,
-) -> Result<Vec<NormalizedEventRecord>, Box<dyn Error>> {
+    expect_schema_version: Option<&str>,
+) -> Result<(Vec<NormalizedEventRecord>, usize), Box<dyn Error>> {
     let version = bundle_feature_schema_version(artifact_dir).unwrap_or_default();
+    // F9 fail-closed gate: refuse to trade if the operator's declared schema
+    // version disagrees with the promoted bundle. A mismatch would mis-shape
+    // the live feature vector (v2 = 34 features, v1 = 20).
+    if let Err(reason) = check_tennis_schema_version(&version, expect_schema_version) {
+        return Err(format!(
+            "{reason} (promoted bundle at {}). Refusing to start the live run.",
+            artifact_dir.display(),
+        )
+        .into());
+    }
     if version == "2" {
         eprintln!("tennis scoring: feature_schema v2 (34 features)");
         score_tennis_v2_snapshot_file(artifact_dir, snapshot_path)
@@ -1743,14 +2287,41 @@ fn score_tennis_snapshot_file(
     }
 }
 
+/// F9 fail-closed schema guard, factored out as a pure function so it can be
+/// unit-tested without a real ONNX bundle on disk. `found` is the bundle's
+/// declared `feature_schema_version` (empty string if its manifest carried
+/// none); `expected` is the operator's `--expect-tennis-schema-version`. When
+/// the operator declares an expectation, a disagreement is a hard error — the
+/// live runner must not score a v1 bundle with the v2 vector, or vice versa.
+/// When the operator declares no expectation, the guard is a no-op (the
+/// version still drives builder selection downstream).
+fn check_tennis_schema_version(found: &str, expected: Option<&str>) -> Result<(), String> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if found == expected {
+        return Ok(());
+    }
+    let found_label = if found.is_empty() {
+        "<missing manifest feature_schema_version>"
+    } else {
+        found
+    };
+    Err(format!(
+        "tennis bundle feature_schema_version mismatch: operator expected `{expected}` \
+         (--expect-tennis-schema-version) but the bundle declares `{found_label}`"
+    ))
+}
+
 fn score_tennis_v1_snapshot_file(
     artifact_dir: &std::path::Path,
     snapshot_path: &std::path::Path,
-) -> Result<Vec<NormalizedEventRecord>, Box<dyn Error>> {
+) -> Result<(Vec<NormalizedEventRecord>, usize), Box<dyn Error>> {
     let mut artifact = TennisOnnxArtifact::load_bundle(artifact_dir)?;
     let file = File::open(snapshot_path)?;
     let reader = BufReader::new(file);
     let mut events = Vec::new();
+    let mut missing_odds = 0usize;
     for (index, line) in reader.lines().enumerate() {
         let line = line?;
         let trimmed = line.trim();
@@ -1759,24 +2330,30 @@ fn score_tennis_v1_snapshot_file(
         }
         let row: TennisSnapshotRow = serde_json::from_str(trimmed)?;
         let probability = artifact.predict_snapshot(&row.snapshot)?;
+        let odds_present = tennis_v1_odds_present(&row.snapshot);
+        if !odds_present {
+            missing_odds += 1;
+        }
         events.push(tennis_prediction_event(
             &row.market_id,
             &row.source,
             probability,
+            odds_present,
             index as u64 + 1,
         )?);
     }
-    Ok(events)
+    Ok((events, missing_odds))
 }
 
 fn score_tennis_v2_snapshot_file(
     artifact_dir: &std::path::Path,
     snapshot_path: &std::path::Path,
-) -> Result<Vec<NormalizedEventRecord>, Box<dyn Error>> {
+) -> Result<(Vec<NormalizedEventRecord>, usize), Box<dyn Error>> {
     let mut artifact = TennisV2OnnxArtifact::load_bundle(artifact_dir)?;
     let file = File::open(snapshot_path)?;
     let reader = BufReader::new(file);
     let mut events = Vec::new();
+    let mut missing_odds = 0usize;
     for (index, line) in reader.lines().enumerate() {
         let line = line?;
         let trimmed = line.trim();
@@ -1785,27 +2362,36 @@ fn score_tennis_v2_snapshot_file(
         }
         let row: TennisV2SnapshotRow = serde_json::from_str(trimmed)?;
         let probability = artifact.predict_snapshot(&row.snapshot)?;
+        let odds_present = tennis_v2_odds_present(&row.snapshot);
+        if !odds_present {
+            missing_odds += 1;
+        }
         events.push(tennis_prediction_event(
             &row.market_id,
             &row.source,
             probability,
+            odds_present,
             index as u64 + 1,
         )?);
     }
-    Ok(events)
+    Ok((events, missing_odds))
 }
 
 fn tennis_prediction_event(
     market_id: &str,
     source: &str,
     probability: f32,
+    odds_present: bool,
     seq: u64,
 ) -> Result<NormalizedEventRecord, Box<dyn Error>> {
     let now = rfc3339_now();
+    let confidence = probability.max(1.0 - probability);
     let payload = serde_json::json!({
         "source": source,
         "market_id": market_id,
         "player_1_win_probability": format!("{probability:.6}"),
+        "model_confidence": format!("{confidence:.6}"),
+        "odds_present": odds_present,
     });
     let event_id = format!("tennis-xgboost:{market_id}:{seq}");
     let payload_json = payload.to_string();
@@ -1845,6 +2431,16 @@ fn tennis_prediction_event(
     Ok(event)
 }
 
+fn tennis_v1_odds_present(snapshot: &TennisMatchSnapshot) -> bool {
+    snapshot.p1_decimal_odds.is_some_and(|value| value > 1.0)
+        && snapshot.p2_decimal_odds.is_some_and(|value| value > 1.0)
+}
+
+fn tennis_v2_odds_present(snapshot: &TennisV2Snapshot) -> bool {
+    snapshot.p1_decimal_odds.is_some_and(|value| value > 1.0)
+        && snapshot.p2_decimal_odds.is_some_and(|value| value > 1.0)
+}
+
 // ---------- metrics ----------
 
 #[derive(Default)]
@@ -1852,6 +2448,10 @@ struct Metrics {
     duration: Duration,
     raw_events: u64,
     normalized_events: u64,
+    tennis_snapshots_scored: u64,
+    tennis_snapshots_missing_odds: u64,
+    external_signal_events: u64,
+    external_signal_errors: u64,
     normalize_ignored: u64,
     normalize_unsupported: u64,
     normalize_errors: u64,
@@ -1919,6 +2519,14 @@ fn print_report(metrics: &Metrics, tickers: &[String], args: &Args) {
     println!(
         "normalized events:              {}  ({:.1}/s)",
         metrics.normalized_events, nps
+    );
+    println!(
+        "external signal events:         {}",
+        metrics.external_signal_events
+    );
+    println!(
+        "external signal errors:         {}",
+        metrics.external_signal_errors
     );
     println!(
         "  normalize ignored ctrl msgs:  {}",
@@ -2012,6 +2620,7 @@ struct LiveStatus {
     elapsed_secs: f64,
     kill_switch_engaged: bool,
     daily_realized_loss_ticks: i64,
+    unrealized_drawdown_loss_ticks: i64,
     live_place_attempts: u32,
 }
 
@@ -2026,12 +2635,18 @@ fn build_metrics_value(
         "kill_switch_engaged": live.kill_switch_engaged,
         "daily_realized_loss_ticks": live.daily_realized_loss_ticks,
         "daily_realized_loss_usd": live.daily_realized_loss_ticks as f64 / 10_000.0,
+        "unrealized_drawdown_loss_ticks": live.unrealized_drawdown_loss_ticks,
+        "unrealized_drawdown_loss_usd": live.unrealized_drawdown_loss_ticks as f64 / 10_000.0,
         "live_place_attempts": live.live_place_attempts,
         "max_live_orders": args.max_live_orders,
         "tickers": tickers,
         "live_submit": args.live_submit,
         "raw_events": metrics.raw_events,
         "normalized_events": metrics.normalized_events,
+        "tennis_snapshots_scored": metrics.tennis_snapshots_scored,
+        "tennis_snapshots_missing_odds": metrics.tennis_snapshots_missing_odds,
+        "external_signal_events": metrics.external_signal_events,
+        "external_signal_errors": metrics.external_signal_errors,
         "normalize_errors": metrics.normalize_errors,
         "sequence_gaps": metrics.sequence_gaps,
         "strategy_errors": metrics.strategy_errors,
@@ -2084,6 +2699,10 @@ fn write_metrics_json(
         "live_submit": args.live_submit,
         "raw_events": metrics.raw_events,
         "normalized_events": metrics.normalized_events,
+        "tennis_snapshots_scored": metrics.tennis_snapshots_scored,
+        "tennis_snapshots_missing_odds": metrics.tennis_snapshots_missing_odds,
+        "external_signal_events": metrics.external_signal_events,
+        "external_signal_errors": metrics.external_signal_errors,
         "normalize_errors": metrics.normalize_errors,
         "sequence_gaps": metrics.sequence_gaps,
         "strategy_errors": metrics.strategy_errors,

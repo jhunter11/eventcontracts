@@ -1,0 +1,38 @@
+strategy_id = "kalshi-noarb-scanner-v1"
+name = "kalshi_noarb_scanner"
+version = "1.0.0"
+description = "Deterministic intra-Kalshi logical no-arbitrage scanner over one configured ladder group (sum-to-one lock + monotonicity flag)."
+feature_schema_id = "kalshi_noarb_features"
+
+[subscription]
+venues = ["kalshi"]
+# Subscribe to the family that contains the ladder; the scanner filters down to
+# the exact `brackets` tickers below. Replace with the family you are scanning.
+instrument_patterns = ["KXHIGH*"]
+event_kinds = ["quote"]
+
+[default_execution_priority]
+tier = "standard"
+max_delay_ms = 1000
+expires_after_ms = 2000
+reason = "arb legs are IOC; the edge is logical consistency, not a sub-100ms race"
+
+[parameters]
+# brackets = "TICKER:lo:hi;..." — the mutually-exclusive (exclusive) or
+# cumulative ladder to scan. THESE ARE PLACEHOLDERS: replace with live tickers
+# from REST discovery before the scanner can match anything.
+brackets = "KXHIGHNY-EXAMPLE-B71:71:73;KXHIGHNY-EXAMPLE-B73:73:75;KXHIGHNY-EXAMPLE-B75:75:77"
+ladder_kind = "exclusive"
+min_edge_bps = "100"
+size = "5"
+max_quote_age_seconds = "30"
+venue = "kalshi"
+
+[tags]
+family = "arbitrage"
+mode = "paper"
+# `arb` is a reserved Rust archetype (not yet implemented); this runs on the
+# Python live-paper path. Two-leg cumulative-lock execution is the promotion step.
+archetype = "arb"
+research_doc = "docs/v7-live-test-ready-strategy-specs.md#6-intra-kalshi-no-arb-scanner"
+note = "brackets are placeholders; replace with live tickers via REST discovery"

@@ -1,0 +1,19 @@
+sleeve_id = "mlb-outright-kalshi-paper-a"
+strategy_id = "mlb-outright-residual-v1"
+strategy_version = "1.0.0"
+venue = "kalshi"
+capital_allocation = "1500"
+currency = "USD"
+
+[risk]
+# Long-duration outrights: tight per-order + gross caps, low open-order count.
+max_order_notional = "75"
+max_position_notional = "500"
+max_daily_loss = "400"
+max_open_orders = 8
+max_gross_exposure = "600"
+currency = "USD"
+
+[tags]
+mode = "paper"
+family = "sports"

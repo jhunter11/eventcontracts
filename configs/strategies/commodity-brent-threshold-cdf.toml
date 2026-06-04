@@ -1,0 +1,40 @@
+strategy_id = "commodity-brent-threshold-cdf-v1"
+name = "ladder_cdf"
+version = "1.0.0"
+description = "Brent daily-threshold ladder priced off one externally supplied close distribution (full-ladder CDF)."
+feature_schema_id = "commodity_brent_threshold_features"
+
+[subscription]
+venues = ["kalshi"]
+# KXBRENTD = Brent daily threshold ladder (two-sided in 2026-06-02 sampling).
+# Confirm exact tickers via REST discovery.
+instrument_patterns = ["KXBRENTD*"]
+event_kinds = ["quote", "external"]
+external_sources = ["brent-dist"]
+
+[default_execution_priority]
+tier = "relaxed"
+max_delay_ms = 2000
+expires_after_ms = 600000
+reason = "commodity threshold edge is a better close distribution, not a sub-100ms race"
+
+[parameters]
+# Producer publishes {mean, sigma, dist} for the Brent daily close from
+# ICE Brent futures + intraday-vol Brownian bridge. THESE BRACKETS ARE
+# PLACEHOLDERS: replace with live KXBRENTD tickers + their thresholds.
+signal_source = "brent-dist"
+brackets = "KXBRENTD-EXAMPLE-T78:78:999;KXBRENTD-EXAMPLE-T80:80:999;KXBRENTD-EXAMPLE-T82:82:999"
+ladder_kind = "cumulative"
+dist = "normal"
+min_edge_bps = "250"
+size = "3"
+max_orders = "6"
+venue = "kalshi"
+
+[tags]
+family = "commodity"
+mode = "paper"
+# ladder_cdf is a Python runtime (no Rust archetype yet); runs on live-paper.
+archetype = "ladder_cdf"
+research_doc = "docs/v7-live-test-ready-strategy-specs.md"
+note = "verify Brent settlement source + close window before trading; brackets are placeholders"

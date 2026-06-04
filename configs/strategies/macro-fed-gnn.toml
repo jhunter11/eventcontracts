@@ -26,4 +26,4 @@ size = "10"
 [tags]
 family = "macro"
 mode = "paper"
-research_doc = "docs/strategy-specs.md#5"
+research_doc = "docs/v7-live-test-ready-strategy-specs.md"

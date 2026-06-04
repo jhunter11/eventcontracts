@@ -16,13 +16,31 @@ reason = "pre-match fair-value signal does not require low-latency execution"
 
 [parameters]
 prediction_source = "tennis_xgboost_onnx"
-min_edge_bps = "150"
+min_edge_bps = "250"
+min_model_confidence = "0.62"
+# require_odds_present = true means the sleeve ONLY trades a market when the
+# scored snapshot carried real bookmaker odds (both players, decimal > 1.0).
+# OPERATOR: this makes the live sleeve a NO-OP unless an odds source is merged
+# into the tennis snapshot JSONL fed to --tennis-snapshots-jsonl. If you have no
+# odds feed, either wire one (research/tennis_odds.py merge) or set this false
+# AND retrain/repromote a bundle whose model does not lean on the odds features.
+require_odds_present = true
 size = "5"
+# Trailing stop-loss on an OPEN position (probability points; 0.12 = 12c). The
+# position holds to settlement (no take-profit) unless the held side's best bid
+# falls this far below its running peak, at which point it is liquidated as a
+# taker sell at the bid. 0 disables the exit (pure hold-to-completion). This is
+# drawdown control, not alpha — see docs/tennis-tradeability-findings-and-plan.md.
+trailing_stop_loss = "0.12"
 onnx_input_name = "features"
-feature_schema_version = "1"
+# Must match the promoted bundle's feature schema. v2 = 34-feature vector
+# (Elo blend, serve/return, fatigue, form, odds block). A v1 bundle with this
+# set to "2" will mis-shape the live feature vector — verify before go-live.
+feature_schema_version = "2"
 
 [tags]
 family = "sports"
 sport = "tennis"
 mode = "paper"
 model_format = "onnx"
+research_doc = "docs/v7-live-test-ready-strategy-specs.md"

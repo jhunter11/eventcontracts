@@ -13,8 +13,10 @@ execution before any live order path exists.
 
 ## Repository Layout
 
-This is a polyglot workspace. Python code lives under `python/`, future
-Rust crates under `rust/`, and the cross-language file-format contracts
+This is a polyglot workspace. Python code lives under `python/`, the Rust
+hot-path and live-spine crates under `rust/` (`runner`, `runtime-hot`, `risk`,
+`gateway`, `oms`, `live-runner`, `kalshi`, `parity`, `model-runtime`, `bus`,
+`contracts`), and the cross-language file-format contracts
 that both consume under `contracts/`. The Python/Rust seam is files on
 disk (TOML specs, JSON schemas, Parquet parity cases, ONNX models), not
 in-process imports.
@@ -232,6 +234,13 @@ rate-limit allocation, but never to bypass risk checks.
   MVP sequence, and hardening plan.
 - [docs/deep-research-report.md](docs/deep-research-report.md): research assessment and
   market-structure rationale behind the roadmap.
+- [docs/production-readiness-assessment.md](docs/production-readiness-assessment.md):
+  acquirer-lens readiness + scalability audit, severity-ranked findings, and the
+  ordered path (P0–P7) to live.
+- [docs/live-deployment-remaining-roadmap.md](docs/live-deployment-remaining-roadmap.md):
+  the 12 non-negotiable live invariants, deployment stages, and workstreams.
+- [docs/quant-mind-integration-assessment.md](docs/quant-mind-integration-assessment.md):
+  decision memo on using external research-extraction tooling at the front of the edge funnel.
 
 ## Live Trading Boundary
 

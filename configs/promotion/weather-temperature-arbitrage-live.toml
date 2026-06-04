@@ -1,0 +1,4 @@
+strategy_spec = "../strategies/weather-temperature-arbitrage-live.toml"
+parity_cases = "../../contracts/parity/weather_temperature_arbitrage"
+stage = "paper"
+promoted = true

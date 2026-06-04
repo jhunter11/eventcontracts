@@ -33,7 +33,7 @@
       "correlation_id": "expected-1",
       "emitted_at": "2026-05-26T12:00:01Z",
       "decision_kind": "place_order",
-      "decision_json": "{\"kind\":\"place_order\",\"client_order_id\":\"c-tennis-buy-00000001\",\"instrument_id\":\"kalshi:KX-ATP-DEMO\",\"outcome_side\":\"Yes\",\"side\":\"Buy\",\"price\":\"0.57\",\"quantity\":\"5\",\"fair_price\":\"0.7\",\"min_executable_edge_ticks\":150,\"time_in_force\":\"Ioc\"}",
+      "decision_json": "{\"kind\":\"place_order\",\"client_order_id\":\"c-tennis-buy-00000001\",\"instrument_id\":\"kalshi:KX-ATP-DEMO\",\"outcome_side\":\"Yes\",\"side\":\"Buy\",\"price\":\"0.57\",\"quantity\":\"5\",\"fair_price\":\"0.7\",\"min_executable_edge_ticks\":250,\"time_in_force\":\"Ioc\"}",
       "priority_tier": "relaxed",
       "audit": {
         "object_id": "expected-1",

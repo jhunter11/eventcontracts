@@ -1,0 +1,37 @@
+strategy_id = "equity-close-range-cdf-v1"
+name = "ladder_cdf"
+version = "1.0.0"
+description = "S&P/Nasdaq daily-close range ladder priced coherently off one close distribution (full-ladder CDF)."
+feature_schema_id = "equity_close_range_cdf_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXINX*", "KXNASDAQ100*"]
+event_kinds = ["quote", "external"]
+external_sources = ["equity-dist"]
+
+[default_execution_priority]
+tier = "standard"
+max_delay_ms = 2000
+expires_after_ms = 600000
+reason = "midday CDF residual is slow; final-30-min Brownian bridge is not a sub-100ms race"
+
+[parameters]
+# Producer publishes {mean, sigma} for the index close (ES/NQ fair value +
+# intraday vol + Brownian bridge into 4pm). Mutually-exclusive close ranges.
+# PLACEHOLDERS: replace with live KXINX / KXNASDAQ100 range tickers.
+signal_source = "equity-dist"
+brackets = "KXINX-EXAMPLE-R1:5800:5850;KXINX-EXAMPLE-R2:5850:5900;KXINX-EXAMPLE-R3:5900:5950"
+ladder_kind = "exclusive"
+dist = "normal"
+min_edge_bps = "200"
+size = "5"
+max_orders = "8"
+venue = "kalshi"
+
+[tags]
+family = "equity"
+mode = "paper"
+archetype = "ladder_cdf"
+research_doc = "docs/v7-live-test-ready-strategy-specs.md"
+note = "coherent-ladder variant of equity-index-range-ladder; brackets are placeholders"

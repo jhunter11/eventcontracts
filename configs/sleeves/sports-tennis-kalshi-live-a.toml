@@ -11,8 +11,13 @@
 #       * Rust (live, --live-submit): on breach it REJECTS new risk-increasing
 #         orders but still ALLOWS risk-reducing exits, re-evaluated every event.
 #         It does NOT latch a kill switch and does NOT halt the process.
-#         Accounting is loss legs + fees for the UTC day (winning fills do NOT
-#         credit back), so it trips sooner than a net-PnL view would.
+#         Accounting is realized loss legs + fees for the UTC day (winning fills
+#         do NOT credit back) PLUS the current liquidation-mark unrealized
+#         drawdown on open positions (re-marked to the best bid each event), so
+#         a held position bleeding intraday counts toward the cap before it
+#         settles. It trips sooner than a net-PnL view would. The live metrics
+#         snapshot reports both daily_realized_loss_usd and
+#         unrealized_drawdown_loss_usd — watch them.
 #       * Python (backtest/paper): a realized-loss breach LATCHES a one-way
 #         kill switch (operator reset required).
 #     The hard process-level stops for a live run are the operator kill-switch
@@ -36,15 +41,26 @@ sleeve_id = "sports-tennis-kalshi-live-a"
 strategy_id = "sports-tennis-xgboost-v1"
 strategy_version = "1.0.0"
 venue = "kalshi"
-capital_allocation = "500"   # OPERATOR: set to your funded amount.
+capital_allocation = "8"     # $8 throwaway infra-validation + real-fill data-collection run.
 currency = "USD"
 
+# ----------------------------------------------------------------------------
+# $8 THROWAWAY FIRST-LIVE ENVELOPE (2026-05-31). This is an INFRASTRUCTURE + DATA
+# run, not a validated-edge run: the sleeve prices off the model, which backtests
+# WORSE than the closing line (see docs/tennis-tradeability-findings-and-plan.md).
+# Expect the $8 to be the cost of proving the live path end-to-end and capturing
+# real Kalshi tick quotes + fills (the Stage-1 data we lack). Order size stays at
+# the parity-pinned 5 contracts; pair with --max-live-orders 1 for session one so
+# the entire test is a single real round-trip (~$3-$5 at risk), held to
+# settlement (the trailing-stop exit is a 2nd PlaceOrder and is blocked under
+# --max-live-orders 1 — use --max-live-orders 2 to let the stop fire).
+# ----------------------------------------------------------------------------
 [risk]
-max_order_notional = "25"        # max $ per single order
-max_position_notional = "100"    # max $ exposure per outcome
-max_daily_loss = "150"           # hard stop for the UTC day (>= 5x order)
-max_open_orders = 5
-max_gross_exposure = "250"       # max $ gross across the sleeve
+max_order_notional = "5"         # one 5-contract order at any price up to $1.00
+max_position_notional = "8"      # max $ exposure per outcome (= whole bankroll)
+max_daily_loss = "8"             # UTC-day de-risk trigger; --max-live-orders is the real stop
+max_open_orders = 1
+max_gross_exposure = "8"         # max $ gross across the sleeve (= whole bankroll)
 currency = "USD"
 max_market_data_age_ms = 5000    # Python/backtest freshness (taker: keep tight)
 max_spread = "0.10"              # Python: skip wide/thin books

@@ -1,0 +1,32 @@
+strategy_id = "entertainment-awards-v1"
+name = "external_edge"
+version = "1.0.0"
+description = "Awards (Oscars/Emmys/Grammys) win-probability taker vs Kalshi mid via the external_edge archetype."
+feature_schema_id = "entertainment_awards_features"
+
+[subscription]
+venues = ["kalshi"]
+# Confirm exact series tickers via REST discovery before relying on these.
+instrument_patterns = ["KXOSCAR*", "KXEMMY*", "KXGRAMMY*", "KXAWARDS*"]
+event_kinds = ["quote", "external"]
+external_sources = ["awards-model"]
+
+[default_execution_priority]
+tier = "relaxed"
+max_delay_ms = 5000
+expires_after_ms = 3600000
+reason = "awards win probabilities move on news; half-life is hours-to-days, not ms"
+
+[parameters]
+signal_source = "awards-model"
+min_edge_bps = "400"
+size = "5"
+confidence_floor = "0.70"
+venue = "kalshi"
+
+[tags]
+family = "entertainment"
+subfamily = "awards"
+mode = "paper"
+archetype = "external_edge"
+research_doc = "docs/v7-live-test-ready-strategy-specs.md#2-entertainment-box-office--awards"

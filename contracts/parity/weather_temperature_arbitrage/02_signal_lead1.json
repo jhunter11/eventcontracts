@@ -1,0 +1,31 @@
+{
+  "case_id": "weather_temperature_arbitrage_02_signal_lead1",
+  "event": {
+    "event_id": "weather:signal:lead1",
+    "event_kind": "external",
+    "payload_json": "{\"source\":\"open-meteo\",\"market_id\":\"M-1\",\"implied_prob\":\"0.70\",\"lead_days\":1,\"close_time\":\"2026-05-26T13:00:00Z\",\"instrument_id\":{\"venue\":\"kalshi\",\"market_id\":\"M-1\"}}",
+    "provenance": {
+      "source": "open-meteo",
+      "channel": "kxhigh_station_calibration",
+      "schema_version": "weather-temperature-probability-v1",
+      "venue": "kalshi",
+      "source_sequence": "2",
+      "normalization_version": "normalizer-v1",
+      "metadata": {}
+    },
+    "audit": {
+      "object_id": "weather:signal:lead1",
+      "object_kind": "normalized_event",
+      "schema_version": "normalized-event-v1",
+      "produced_at": "2026-05-26T12:00:01Z",
+      "producer": "external-fixture",
+      "canonical_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "parent_ids": [],
+      "trace_id": null,
+      "metadata": {}
+    }
+  },
+  "feature_vector": null,
+  "expected_decisions": [],
+  "tolerance_bps": "0"
+}

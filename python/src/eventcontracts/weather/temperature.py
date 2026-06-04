@@ -12,6 +12,7 @@ from eventcontracts.domain.events import EventProvenance, ExternalSignalEvent
 from eventcontracts.domain.ids import EventId
 from eventcontracts.domain.models import InstrumentId
 from eventcontracts.domain.validation import require_aware_datetime, require_non_empty
+from eventcontracts.weather.calibration import StationCalibration
 
 ThresholdDirection = Literal["above", "below"]
 
@@ -221,6 +222,7 @@ class TemperatureThresholdModel:
         bias_f: float = 0.0,
         min_uncertainty_f: float = 0.75,
         model_family: str = "gaussian_rules_v2",
+        calibration: StationCalibration | None = None,
     ) -> None:
         if base_uncertainty_f <= 0:
             raise ValueError("base_uncertainty_f must be positive")
@@ -238,6 +240,14 @@ class TemperatureThresholdModel:
         self.bias_f = bias_f
         self.min_uncertainty_f = min_uncertainty_f
         self.model_family = model_family
+        # Optional ground-truth calibration (fit per settlement station from
+        # NOAA GHCND vs Open-Meteo history). When present, the daily-high path
+        # uses the fitted bias + residual sigma instead of the hand-tuned
+        # heuristic — this is what the Phase-1 walk-forward gate validated
+        # (+26.5% Brier, ECE 0.049 -> 0.006). See weather.calibration.
+        self.calibration = calibration
+        if calibration is not None:
+            self.model_family = f"{model_family}+calib:{calibration.station}"
 
     def predict(
         self,
@@ -257,9 +267,23 @@ class TemperatureThresholdModel:
             reference = max(points, key=lambda point: point.temperature_f)
             raw_temperature = reference.temperature_f
             features = self._features(points, reference, snapshot.as_of)
-            expected_temperature = raw_temperature + self.bias_f - self._cloud_cap_adjustment(points, reference)
+            if self.calibration is not None:
+                # Ground-truth-calibrated daily-high: fitted additive bias for
+                # the settlement station/month, replacing the heuristic cloud-cap.
+                expected_temperature = self.calibration.corrected_high(
+                    raw_temperature, month=market.target_day.month
+                )
+            else:
+                expected_temperature = (
+                    raw_temperature + self.bias_f - self._cloud_cap_adjustment(points, reference)
+                )
             basis = "daily_high"
-        uncertainty = self._uncertainty(points, reference, snapshot.as_of, features)
+        if self.calibration is not None and market.target_time is None:
+            # Use the fitted residual sigma (the honest forecast error) for the
+            # daily-high distribution; the heuristic stays for hourly markets.
+            uncertainty = self.calibration.effective_sigma()
+        else:
+            uncertainty = self._uncertainty(points, reference, snapshot.as_of, features)
         z = (market.threshold_f - expected_temperature) / uncertainty
         probability_above = 1.0 - _normal_cdf(z)
         implied = probability_above if market.direction == "above" else 1.0 - probability_above

@@ -21,13 +21,18 @@ arithmetic — that arithmetic is the only thing the Rust runtime must mirror.
 
 from __future__ import annotations
 
+import json
 import math
 from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from eventcontracts.models import evaluation as _evaluation
+from eventcontracts.models import onnx_export as _onnx
+from eventcontracts.models import parity as _parity
 from eventcontracts.research.tennis_xgboost import (
     _normalized_implied_probabilities,
     _number,
@@ -239,6 +244,15 @@ def feature_schema_document() -> dict[str, Any]:
     }
 
 
+def write_feature_schema(path: str | Path) -> Path:
+    """Write the v2 feature schema used by Python/Rust promotion."""
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(feature_schema_document(), indent=2) + "\n", encoding="utf-8")
+    return target
+
+
 def feature_row_v2(snapshot: TennisV2Snapshot) -> dict[str, float]:
     """Stateless snapshot → ordered feature row. Mirror this exactly in Rust."""
 
@@ -437,15 +451,49 @@ def build_v2_training_frame(
     include_mirrored: bool = True,
     recent_window: int = 14,
     elo_base_k: float = 250.0,
+    elo_layoff_boost: float = 0.0,
     surface_blend: float = 0.4,
 ) -> pl.DataFrame:
     """Build v2 pre-match features from Sackmann-style ATP rows.
 
-    State (Elo with dynamic K + margin-of-victory, rolling serve/return,
-    fatigue windows, surface form, opponent-adjusted form) is updated only
-    *after* each match row is emitted, so a match never sees its own outcome.
+    State (Elo with dynamic K [experience] and margin-of-victory, rolling
+    serve/return, fatigue windows, surface form, opponent-adjusted form) is updated
+    only *after* each match row is emitted, so a match never sees its own outcome.
     Reads ``winner_decimal_odds`` / ``loser_decimal_odds`` (or ``AvgW``/``AvgL``)
     when present so a downstream odds merge lights up the market block.
+
+    ``elo_layoff_boost`` adds an inactivity term to the dynamic K (stale ratings
+    adapt faster after a long break). It is **default-off (0.0)**: a 2025-26 ATP
+    holdout showed no calibration gain (deltas within noise — long layoffs are rare
+    on the main tour), so it stays opt-in to avoid a forced model retrain. Whatever
+    value is used here, ``build_upcoming_snapshot`` must use the same so the live
+    features match the model's training distribution.
+    """
+
+    snapshots = _build_v2_snapshots(
+        matches,
+        include_mirrored=include_mirrored,
+        recent_window=recent_window,
+        elo_base_k=elo_base_k,
+        elo_layoff_boost=elo_layoff_boost,
+        surface_blend=surface_blend,
+    )
+    return _v2_snapshots_to_frame(snapshots)
+
+
+def _build_v2_snapshots(
+    matches: pl.DataFrame,
+    *,
+    include_mirrored: bool = True,
+    recent_window: int = 14,
+    elo_base_k: float = 250.0,
+    elo_layoff_boost: float = 0.0,
+    surface_blend: float = 0.4,
+) -> list[TennisV2Snapshot]:
+    """Replay history and emit one (or two, mirrored) snapshot per match.
+
+    Shared by ``build_v2_training_frame`` and ``build_upcoming_snapshot`` so the
+    two paths can never drift in how per-player state is accumulated.
     """
 
     required = {"winner_id", "loser_id", "tourney_date"}
@@ -505,7 +553,14 @@ def build_v2_training_frame(
             snapshots.append(_mirror_v2(win_snap))
 
         # --- update state after emitting (no leakage) ---
-        _update_elo(elo, elo_n, surf_elo, winner, loser, surface, w_games, l_games, base_k=elo_base_k)
+        # layoff is read from last_played BEFORE its post-match update below.
+        w_days_since = _days_since(last_played.get(winner), match_date)
+        l_days_since = _days_since(last_played.get(loser), match_date)
+        _update_elo(
+            elo, elo_n, surf_elo, winner, loser, surface, w_games, l_games,
+            base_k=elo_base_k, w_days_since=w_days_since, l_days_since=l_days_since,
+            layoff_boost=elo_layoff_boost,
+        )
         exp_w = 1.0 / (1.0 + 10.0 ** ((elo[loser] - elo[winner]) / 400.0))
         recent_perf[winner].append(1.0 - exp_w)
         recent_perf[loser].append(0.0 - (1.0 - exp_w))
@@ -521,7 +576,7 @@ def build_v2_training_frame(
         last_played[winner] = match_date
         last_played[loser] = match_date
 
-    return _v2_snapshots_to_frame(snapshots)
+    return snapshots
 
 
 def _v2_snapshot(
@@ -679,6 +734,78 @@ def _mirror_v2(s: TennisV2Snapshot) -> TennisV2Snapshot:
     )
 
 
+def build_upcoming_snapshot(
+    history: pl.DataFrame,
+    *,
+    p1_id: str,
+    p2_id: str,
+    match_date: date,
+    surface: str,
+    best_of: int = 3,
+    round: str = "",
+    tourney_level: str = "",
+    p1_rank: int | None = None,
+    p2_rank: int | None = None,
+    p1_rank_points: float | None = None,
+    p2_rank_points: float | None = None,
+    p1_seed: int | None = None,
+    p2_seed: int | None = None,
+    p1_age: float | None = None,
+    p2_age: float | None = None,
+    p1_height_cm: float | None = None,
+    p2_height_cm: float | None = None,
+    p1_hand: str = "U",
+    p2_hand: str = "U",
+    p1_decimal_odds: float | None = None,
+    p2_decimal_odds: float | None = None,
+    recent_window: int = 14,
+    match_id: str | None = None,
+) -> TennisV2Snapshot:
+    """Build a pre-match v2 snapshot for an UPCOMING match by replaying ``history``.
+
+    ``history`` is Sackmann-style rows (the same schema ``build_v2_training_frame``
+    consumes). Per-player *state* features (Elo, surface Elo, blend, serve/return,
+    form, fatigue, surface record, rest days) are reconstructed from all prior
+    matches; *static/recent* fields (rank, points, age, height, hand, seed) come
+    from the args — the operator script auto-fills them from each player's most
+    recent appearance. ``match_date`` must be on/after the last history date so the
+    synthetic row sorts last and sees every prior match. The result is a
+    ``TennisV2Snapshot`` ready to serialize into the runner's snapshot JSONL.
+    """
+    pl = _polars()
+    synthetic = {
+        "winner_id": p1_id,
+        "loser_id": p2_id,
+        "tourney_date": int(match_date.strftime("%Y%m%d")),
+        "tourney_id": "zzz-upcoming",  # sorts after real tourney ids on a date tie
+        "match_num": 1_000_000_000,  # sorts strictly last among same-date rows
+        "match_id": match_id or f"{p1_id}-vs-{p2_id}-{match_date.isoformat()}",
+        "surface": surface,
+        "best_of": best_of,
+        "round": round,
+        "tourney_level": tourney_level,
+        "score": "",  # outcome unknown; state-update after the row is irrelevant
+        "winner_rank": p1_rank,
+        "loser_rank": p2_rank,
+        "winner_rank_points": p1_rank_points,
+        "loser_rank_points": p2_rank_points,
+        "winner_seed": p1_seed,
+        "loser_seed": p2_seed,
+        "winner_age": p1_age,
+        "loser_age": p2_age,
+        "winner_ht": p1_height_cm,
+        "loser_ht": p2_height_cm,
+        "winner_hand": p1_hand,
+        "loser_hand": p2_hand,
+        "winner_decimal_odds": p1_decimal_odds,
+        "loser_decimal_odds": p2_decimal_odds,
+    }
+    combined = pl.concat([history, pl.DataFrame([synthetic])], how="diagonal_relaxed")
+    snapshots = _build_v2_snapshots(combined, include_mirrored=False, recent_window=recent_window)
+    # Synthetic row sorts last → its (single, non-mirrored) snapshot is the tail.
+    return snapshots[-1]
+
+
 def _v2_snapshots_to_frame(snapshots: Sequence[TennisV2Snapshot]) -> pl.DataFrame:
     pl = _polars()
     if not snapshots:
@@ -700,6 +827,30 @@ def _v2_snapshots_to_frame(snapshots: Sequence[TennisV2Snapshot]) -> pl.DataFram
     return pl.DataFrame(rows)
 
 
+# Layoff (inactivity) sensitivity for the dynamic Elo K-factor. A rating unused
+# for a long stretch is stale (rust / injury / age), so a returning result carries
+# more information and should move it more. No boost inside the grace window
+# (normal tour cadence has multi-week gaps), ramping to the cap.
+_ELO_LAYOFF_GRACE_DAYS = 30
+_ELO_LAYOFF_CAP_DAYS = 365
+
+
+def _dynamic_k(matches_played: int, days_since_last: int | None, *, base_k: float, layoff_boost: float) -> float:
+    """Elo K-factor that shrinks with experience and grows after a layoff.
+
+    Experience term is the canonical 538 tennis form ``base_k / (matches + 5)**0.4``
+    — provisional players adapt fast, veterans are stable. Layoff term scales K up
+    linearly from the grace window to ``(1 + layoff_boost)x`` at the cap.
+    ``days_since_last`` is None for a player's first match (already max K via m=0),
+    so the layoff term never applies there."""
+    k = base_k / ((matches_played + 5) ** 0.4)
+    if layoff_boost > 0.0 and days_since_last is not None and days_since_last > _ELO_LAYOFF_GRACE_DAYS:
+        span = _ELO_LAYOFF_CAP_DAYS - _ELO_LAYOFF_GRACE_DAYS
+        frac = min(days_since_last - _ELO_LAYOFF_GRACE_DAYS, span) / span
+        k *= 1.0 + layoff_boost * frac
+    return k
+
+
 def _update_elo(
     elo: dict[str, float],
     elo_n: dict[str, int],
@@ -711,9 +862,12 @@ def _update_elo(
     l_games: int,
     *,
     base_k: float,
+    w_days_since: int | None,
+    l_days_since: int | None,
+    layoff_boost: float,
 ) -> None:
-    k_w = base_k / ((elo_n[winner] + 5) ** 0.4)
-    k_l = base_k / ((elo_n[loser] + 5) ** 0.4)
+    k_w = _dynamic_k(elo_n[winner], w_days_since, base_k=base_k, layoff_boost=layoff_boost)
+    k_l = _dynamic_k(elo_n[loser], l_days_since, base_k=base_k, layoff_boost=layoff_boost)
     mov = _mov_multiplier(w_games, l_games)
     exp_w = 1.0 / (1.0 + 10.0 ** ((elo[loser] - elo[winner]) / 400.0))
     delta = (1.0 - exp_w) * mov
@@ -885,12 +1039,43 @@ def train_v2(
     )
 
 
+def export_v2_onnx(
+    model: Any,
+    path: str | Path,
+    *,
+    input_name: str = "features",
+    target_opset: int = 15,
+) -> Path:
+    """Export a v2 XGBoost booster to ONNX with the 34-feature schema pinned."""
+
+    export = _onnx.export_model_onnx(
+        model,
+        TENNIS_V2_FEATURE_NAMES,
+        path,
+        model_family=_onnx.ModelFamily.XGBOOST,
+        task=_onnx.ModelTask.BINARY_CLASSIFICATION,
+        feature_schema_id=FEATURE_SCHEMA_ID,
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+        input_name=input_name,
+        target_opset=target_opset,
+    )
+    return export.path
+
+
 def predict_v2(model: Any, frame: pl.DataFrame) -> tuple[float, ...]:
     from importlib import import_module
 
     xgb = import_module("xgboost")
     matrix = frame.select(TENNIS_V2_FEATURE_NAMES).to_numpy()
     return tuple(float(v) for v in model.predict(xgb.DMatrix(matrix)))
+
+
+def predict_v2_onnx_probabilities(model_path: str | Path, frame: pl.DataFrame) -> tuple[float, ...]:
+    """Run a v2 ONNX export through ONNX Runtime."""
+
+    features = frame.select(TENNIS_V2_FEATURE_NAMES).to_numpy()
+    probabilities = _onnx.predict_onnx(model_path, features, output_select="scalar:1")
+    return tuple(float(value) for value in probabilities)
 
 
 def predict_v2_antisymmetric(model: Any, frame: pl.DataFrame) -> tuple[float, ...]:
@@ -910,6 +1095,80 @@ def predict_v2_antisymmetric(model: Any, frame: pl.DataFrame) -> tuple[float, ..
     p_forward = np.asarray(model.predict(xgb.DMatrix(forward)), dtype=np.float64)
     p_back = np.asarray(model.predict(xgb.DMatrix(swapped)), dtype=np.float64)
     return tuple(float(v) for v in 0.5 * (p_forward + (1.0 - p_back)))
+
+
+def write_v2_parity_cases(
+    frame: pl.DataFrame,
+    probabilities: Sequence[float],
+    path: str | Path,
+    *,
+    max_rows: int = 100,
+) -> Path:
+    """Write v2 ONNX export-parity rows for promotion bundles."""
+
+    if frame.height != len(probabilities):
+        raise ValueError("frame and probabilities must contain the same number of rows")
+    rows = frame.to_dicts()
+    return _parity.write_parity_cases(
+        path,
+        feature_names=TENNIS_V2_FEATURE_NAMES,
+        rows=[[float(row[name]) for name in TENNIS_V2_FEATURE_NAMES] for row in rows],
+        expected=[float(value) for value in probabilities],
+        schema_id=FEATURE_SCHEMA_ID,
+        schema_version=FEATURE_SCHEMA_VERSION,
+        case_ids=[str(row["match_id"]) for row in rows],
+        labels=[int(row["label"]) for row in rows],
+        scalar_field="expected_player_1_win_probability",
+        extra={"match_date": [str(row["match_date"]) for row in rows]},
+        max_rows=max_rows,
+    )
+
+
+def confidence_gate_metrics(
+    y_true: Sequence[int],
+    y_probability: Sequence[float],
+    *,
+    cutoffs: Sequence[float] = (0.55, 0.57, 0.60, 0.62, 0.65, 0.67, 0.70),
+) -> list[dict[str, float | int]]:
+    """Accuracy/coverage table for abstaining on low-confidence predictions."""
+
+    import numpy as np
+
+    labels = np.asarray([int(value) for value in y_true], dtype=np.int8)
+    probabilities = np.asarray([float(value) for value in y_probability], dtype=np.float64)
+    if labels.shape != probabilities.shape:
+        raise ValueError(f"labels and probabilities differ in shape: {labels.shape} != {probabilities.shape}")
+    confidence = np.maximum(probabilities, 1.0 - probabilities)
+    predicted = (probabilities >= 0.5).astype(np.int8)
+    rows: list[dict[str, float | int]] = []
+    for cutoff in cutoffs:
+        threshold = float(cutoff)
+        mask = confidence >= threshold
+        samples = int(mask.sum())
+        if samples == 0:
+            continue
+        rows.append(
+            {
+                "cutoff": threshold,
+                "coverage": float(samples / len(labels)),
+                "accuracy": float((predicted[mask] == labels[mask]).mean()),
+                "samples": samples,
+            }
+        )
+    return rows
+
+
+def evaluate_v2_probabilities(
+    y_true: Sequence[int],
+    y_probability: Sequence[float],
+    *,
+    threshold: float = 0.5,
+) -> _evaluation.ClassificationMetrics:
+    return _evaluation.evaluate_classification(
+        [int(value) for value in y_true],
+        [float(value) for value in y_probability],
+        threshold=threshold,
+    )
 
 
 def _swap_features(matrix: Any) -> Any:

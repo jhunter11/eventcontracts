@@ -1,0 +1,37 @@
+strategy_id = "macro-cpi-cdf-v1"
+name = "ladder_cdf"
+version = "1.0.0"
+description = "CPI / Core-CPI threshold ladder priced as one implied CDF vs a nowcast distribution (full-ladder CDF, pre-release only)."
+feature_schema_id = "macro_cpi_cdf_features"
+
+[subscription]
+venues = ["kalshi"]
+instrument_patterns = ["KXCPI*", "KXCPICORE*"]
+event_kinds = ["quote", "external"]
+external_sources = ["cpi-dist"]
+
+[default_execution_priority]
+tier = "relaxed"
+max_delay_ms = 5000
+expires_after_ms = 3600000
+reason = "pre-release CPI distribution edge is slow-moving; release sniping is excluded"
+
+[parameters]
+# Producer publishes {mean, sigma} for MoM CPI from a component nowcast +
+# survey dispersion. ">= threshold" contracts -> cumulative. PRE-RELEASE ONLY.
+# PLACEHOLDERS: replace with live KXCPI / KXCPICORE threshold tickers.
+signal_source = "cpi-dist"
+brackets = "KXCPI-EXAMPLE-T02:0.002:1;KXCPI-EXAMPLE-T03:0.003:1;KXCPI-EXAMPLE-T04:0.004:1"
+ladder_kind = "cumulative"
+dist = "normal"
+min_edge_bps = "150"
+size = "5"
+max_orders = "8"
+venue = "kalshi"
+
+[tags]
+family = "macro"
+mode = "paper"
+archetype = "ladder_cdf"
+research_doc = "docs/v7-live-test-ready-strategy-specs.md"
+note = "coherent-CDF variant of macro_cpi_predictor; pre-release only; brackets are placeholders"

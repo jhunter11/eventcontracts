@@ -42,6 +42,7 @@ parity-check:
 	cd rust && cargo run --quiet -p eventcontracts-parity --bin parity_check -- --strategy-spec ../configs/strategies/sports-tennis-xgboost.toml --cases ../contracts/parity/sports_tennis_xgboost
 	cd rust && cargo run --quiet -p eventcontracts-parity --bin parity_check -- --strategy-spec ../configs/strategies/flu-hospitalization-surge.toml --cases ../contracts/parity/flu_hospitalization_surge
 	cd rust && cargo run --quiet -p eventcontracts-parity --bin parity_check -- --strategy-spec ../configs/strategies/crop-drought-yield-reversion.toml --cases ../contracts/parity/crop_drought_yield_reversion
+	cd rust && cargo run --quiet -p eventcontracts-parity --bin parity_check -- --strategy-spec ../configs/strategies/weather-temperature-arbitrage-live.toml --cases ../contracts/parity/weather_temperature_arbitrage
 
 rust-bench-check:
 	cd rust && cargo bench --workspace --no-run
