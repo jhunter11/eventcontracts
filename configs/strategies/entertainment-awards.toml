@@ -22,6 +22,7 @@ signal_source = "awards-model"
 min_edge_bps = "400"
 size = "5"
 confidence_floor = "0.70"
+min_confidence = "0.70"   # alias kept equal so the Rust archetype (reads min_confidence) and Python (reads confidence_floor) enforce the same gate (audit F2)
 venue = "kalshi"
 
 [tags]

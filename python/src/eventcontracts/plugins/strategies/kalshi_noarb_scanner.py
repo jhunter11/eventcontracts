@@ -40,7 +40,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
 from uuid import uuid4
 
 from eventcontracts.domain.decisions import NoAction, PlaceOrder, StrategyDecision
@@ -60,6 +60,7 @@ from eventcontracts.strategy.pricing import clamp_price
 from eventcontracts.strategy.registry import register
 
 FOUR_DP = Decimal("0.0001")
+CENT = Decimal("0.01")
 # Kalshi per-contract fee curve: 0.07 * price * (1 - price). Matches the repo's
 # fee model (see the tennis-tradeability memory: fee != flat 7%).
 FEE_COEFF = Decimal("0.07")
@@ -96,6 +97,13 @@ class KalshiNoArbScanner(StrategyBase):
         )
         self.venue = _venue(str(spec.parameters.get("venue", "kalshi")))
         self._books: dict[str, _Book] = {}
+        # Refuse to emit an exclusive lock on a non-exhaustive (gappy/overlapping)
+        # ladder — "exactly one resolves YES" would be false (audit F7).
+        self._exclusive_gap = (
+            _exclusive_ladder_gap(self.brackets)
+            if self.ladder_kind == "exclusive"
+            else None
+        )
 
     def on_event(
         self, event: NormalizedEvent, ctx: StrategyContext
@@ -133,6 +141,8 @@ class KalshiNoArbScanner(StrategyBase):
 
     # -- exclusive (sum-to-one) lock ----------------------------------------
     def _scan_exclusive(self, fresh: dict[str, _Book]) -> Sequence[StrategyDecision]:
+        if self._exclusive_gap is not None:
+            return (NoAction(reason=f"refuse:{self._exclusive_gap}"),)
         total_ask = Decimal("0")
         total_fee = Decimal("0")
         for book in fresh.values():
@@ -265,7 +275,37 @@ def _as_decimal(value: object) -> Decimal | None:
 
 
 def _fee(price: Decimal) -> Decimal:
-    return FEE_COEFF * price * (Decimal("1") - price)
+    """Per-contract Kalshi taker fee, rounded UP to the next cent.
+
+    Kalshi charges ``ceil(100 * 0.07 * n * p * (1-p))`` cents per *order*; the
+    Rust model (`risk/fees.rs`) ceils, this used to not (audit F7), so locks were
+    booked with a sub-cent fee underestimate that can flip an 8-leg "risk-free
+    lock" net-negative. Per-contract ceil is the conservative worst case for a
+    no-arb check: ceil(n*x) <= n*ceil(x), so this never *understates* the fee.
+    """
+    raw = FEE_COEFF * price * (Decimal("1") - price)
+    return raw.quantize(CENT, rounding=ROUND_CEILING)
+
+
+def _exclusive_ladder_gap(brackets: Sequence[_Bracket]) -> str | None:
+    """Return a reason if an exclusive ladder is not contiguous, else None.
+
+    An exclusive (sum-to-one) lock assumes *exactly one* bracket resolves YES, so
+    the brackets must tile the outcome space with no interior gap or overlap. A
+    gap silently turns the "lock" into an unhedged range bet (audit F7). This
+    checks ``hi[i] == lo[i+1]`` across brackets sorted by ``lo``. Open-ended tails
+    cannot be expressed as ``lo:hi`` and must be supplied as their own brackets;
+    tail exhaustiveness is the spec author's responsibility (documented), this
+    catches interior gaps/overlaps which are the silent-loss case.
+    """
+    ordered = sorted(brackets, key=lambda b: b.lo)
+    for low, high in zip(ordered, ordered[1:], strict=False):
+        if low.hi != high.lo:
+            return (
+                f"non_contiguous_ladder:{low.market_id}.hi={low.hi}"
+                f"!={high.market_id}.lo={high.lo}"
+            )
+    return None
 
 
 def _parse_brackets(raw: str) -> list[_Bracket]:

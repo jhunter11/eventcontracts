@@ -63,7 +63,16 @@ class ExternalEdgeStrategy(StrategyBase):
         self.signal_source = str(spec.parameters.get("signal_source", "external"))
         self.min_edge_bps = Decimal(str(spec.parameters.get("min_edge_bps", "250")))
         self.size = Decimal(str(spec.parameters.get("size", "5")))
-        self.confidence_floor = Decimal(str(spec.parameters.get("confidence_floor", "0")))
+        # Confidence gate. Canonical key is ``confidence_floor``; ``min_confidence``
+        # is accepted as an alias so a spec written for the Rust archetype (which
+        # reads ``min_confidence``) still enforces the gate here — they used to read
+        # different keys and silently disagree (audit F2).
+        self.confidence_floor = Decimal(str(
+            spec.parameters.get(
+                "confidence_floor",
+                spec.parameters.get("min_confidence", "0"),
+            )
+        ))
         self.venue = _venue(str(spec.parameters.get("venue", "kalshi")))
         # Cache YES mid + last quote per market so signal-triggered orders carry
         # executable BBO evidence (the runner does not backfill on a signal).
@@ -93,9 +102,15 @@ class ExternalEdgeStrategy(StrategyBase):
         if not (Decimal("0") <= prob <= Decimal("1")):
             return (NoAction(reason="censored:probability_out_of_range"),)
 
+        # Fail-closed: when a floor is configured, a missing/unparseable
+        # confidence must NOT pass (it used to — audit F2 fail-open). Mirrors the
+        # Rust archetype, which treats absent confidence as 0 when the gate is on.
         confidence = _decimal(event.payload.get("confidence"))
-        if confidence is not None and confidence < self.confidence_floor:
-            return (NoAction(reason="confidence_below_floor"),)
+        if self.confidence_floor > 0:
+            if confidence is None:
+                return (NoAction(reason="confidence_missing_fail_closed"),)
+            if confidence < self.confidence_floor:
+                return (NoAction(reason="confidence_below_floor"),)
 
         mid = self._mid_by_market.get(market_id)
         if mid is None:
