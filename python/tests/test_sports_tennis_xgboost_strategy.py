@@ -185,6 +185,111 @@ def test_tennis_disabled_trailing_stop_holds_to_completion() -> None:
     assert crash[0].reason == "trailing_stop_disabled"
 
 
+def test_tennis_entry_partial_fills_accumulate_held_qty() -> None:
+    """Two partial fills of an entry order must accumulate held_qty, not reset it."""
+    strategy = _strategy()
+    strategy.on_event(_signal("0.70"), CONTEXT)
+    entry = strategy.on_event(_quote("0.55", "0.57"), CONTEXT)
+    coid = entry[0].client_order_id
+
+    # First partial: 3 contracts filled
+    strategy.on_event(_fill(coid, OutcomeSide.YES, OrderSide.BUY, "3"), CONTEXT)
+    # Second partial: 2 more contracts filled
+    strategy.on_event(_fill(coid, OutcomeSide.YES, OrderSide.BUY, "2"), CONTEXT)
+
+    state = strategy._markets[INSTRUMENT.market_id]
+    assert state.held_qty == Decimal("5"), "held_qty must be sum of both partial fills"
+    assert state.holding is True
+
+
+def test_tennis_exit_partial_fill_reduces_held_qty_without_closing() -> None:
+    """A partial fill of the exit order reduces held_qty but does NOT close the position.
+
+    Before the fix, a partial exit fill immediately set held_qty=None and closed=True,
+    which would mean the engine thought it had closed 5 contracts when only 3 were sold,
+    leaving an unintended net short of 2 contracts.
+    """
+    strategy = _strategy()
+    strategy.on_event(_signal("0.70"), CONTEXT)
+    entry = strategy.on_event(_quote("0.55", "0.57"), CONTEXT)
+    coid = entry[0].client_order_id
+    _feedback(strategy, "IntentAccepted", entry[0])
+    strategy.on_event(_fill(coid, OutcomeSide.YES, OrderSide.BUY, "5"), CONTEXT)
+
+    # Force trailing stop to fire
+    strategy.on_event(_quote("0.66", "0.68"), CONTEXT)  # peak = 0.66
+    exit_decision = strategy.on_event(_quote("0.53", "0.55"), CONTEXT)
+    assert isinstance(exit_decision[0], PlaceOrder)
+    exit_coid = exit_decision[0].client_order_id
+
+    # Only 3 of the 5 exit contracts fill
+    strategy.on_event(_fill(exit_coid, OutcomeSide.YES, OrderSide.SELL, "3"), CONTEXT)
+
+    state = strategy._markets[INSTRUMENT.market_id]
+    assert state.held_qty == Decimal("2"), "remaining 2 contracts must still be tracked"
+    assert state.holding is True, "position is not fully closed"
+    assert state.closed is False, "position must not be marked closed on a partial exit fill"
+    assert state.exit_client_order_id is None, "exit order id must be cleared to allow retry"
+
+
+def test_tennis_exit_full_fill_closes_position() -> None:
+    """A full exit fill closes the position completely (regression guard)."""
+    strategy = _strategy()
+    strategy.on_event(_signal("0.70"), CONTEXT)
+    entry = strategy.on_event(_quote("0.55", "0.57"), CONTEXT)
+    coid = entry[0].client_order_id
+    _feedback(strategy, "IntentAccepted", entry[0])
+    strategy.on_event(_fill(coid, OutcomeSide.YES, OrderSide.BUY, "5"), CONTEXT)
+
+    strategy.on_event(_quote("0.66", "0.68"), CONTEXT)
+    exit_decision = strategy.on_event(_quote("0.53", "0.55"), CONTEXT)
+    assert isinstance(exit_decision[0], PlaceOrder)
+    exit_coid = exit_decision[0].client_order_id
+
+    strategy.on_event(_fill(exit_coid, OutcomeSide.YES, OrderSide.SELL, "5"), CONTEXT)
+
+    state = strategy._markets[INSTRUMENT.market_id]
+    assert state.held_qty is None
+    assert state.holding is False
+    assert state.closed is True
+
+
+def test_tennis_late_exit_fill_after_cancel_does_not_grow_position() -> None:
+    """A liquidation fill that races the exit order's cancel/expiry must still be
+    booked as a liquidation (reduce held_qty), NOT mis-classified as an entry add.
+
+    Race: an IOC exit is emitted (exit_client_order_id set), the venue
+    cancels/expires it (clears exit_client_order_id so a retry is allowed), and
+    THEN a partial fill for that same order arrives. Before the fix, _apply_fill
+    keyed off the now-None exit pointer, fell through to the entry branch, and
+    GREW the held position by the fill qty — the opposite of selling. Classifying
+    by exit_order_ids membership keeps the late fill a liquidation.
+    """
+    strategy = _strategy()
+    strategy.on_event(_signal("0.70"), CONTEXT)
+    entry = strategy.on_event(_quote("0.55", "0.57"), CONTEXT)
+    coid = entry[0].client_order_id
+    _feedback(strategy, "IntentAccepted", entry[0])
+    strategy.on_event(_fill(coid, OutcomeSide.YES, OrderSide.BUY, "5"), CONTEXT)
+
+    strategy.on_event(_quote("0.66", "0.68"), CONTEXT)  # peak
+    exit_decision = strategy.on_event(_quote("0.53", "0.55"), CONTEXT)
+    assert isinstance(exit_decision[0], PlaceOrder)
+    exit_coid = exit_decision[0].client_order_id
+
+    state = strategy._markets[INSTRUMENT.market_id]
+    # Simulate the venue cancel/expiry clearing the live pointer (what
+    # _apply_order_update does on CANCELED/EXPIRED) BEFORE the fill lands.
+    state.exit_client_order_id = None
+
+    # Late partial liquidation fill for the cancelled exit order.
+    strategy.on_event(_fill(exit_coid, OutcomeSide.YES, OrderSide.SELL, "3"), CONTEXT)
+
+    assert state.held_qty == Decimal("2"), "late exit fill must REDUCE held_qty, not grow it"
+    assert state.holding is True
+    assert state.closed is False
+
+
 def _strategy() -> SportsTennisXgboostStrategy:
     spec = load_strategy_spec(REPO_ROOT / "configs/strategies/sports-tennis-xgboost.toml")
     return SportsTennisXgboostStrategy(spec)

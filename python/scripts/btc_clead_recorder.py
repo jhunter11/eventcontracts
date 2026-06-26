@@ -50,6 +50,9 @@ QueueItem = tuple[str, CryptoTick]
 
 
 async def _coinbase_reader(queue: asyncio.Queue[QueueItem], stop_at: datetime) -> None:
+    # RESILIENCE-TODO: no reconnect loop — a single WS disconnect ends this reader task.
+    # The outer _record_live will keep running but silently lose Coinbase ticks until restart.
+    # Fix: wrap the websockets.connect call in a while-loop with exponential backoff.
     import websockets
 
     async with websockets.connect(COINBASE_WS, ping_interval=20, ping_timeout=20) as ws:
@@ -63,6 +66,7 @@ async def _coinbase_reader(queue: asyncio.Queue[QueueItem], stop_at: datetime) -
 
 
 async def _kraken_reader(queue: asyncio.Queue[QueueItem], stop_at: datetime) -> None:
+    # RESILIENCE-TODO: same as _coinbase_reader — no reconnect loop on WS disconnect.
     import websockets
 
     async with websockets.connect(KRAKEN_WS, ping_interval=20, ping_timeout=20) as ws:

@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 
+import eventcontracts.adapters.venues.kalshi.client as kalshi_client
 from eventcontracts.adapters.venues.kalshi import KalshiAuth, KalshiPublicClient, KalshiWebSocketClient
 from eventcontracts.cli.capture import capture_kalshi_fixture, capture_kalshi_rest_polls, resolve_kalshi_tickers
 from eventcontracts.cli.main import main as cli
@@ -98,6 +99,104 @@ def test_rest_client_maps_authenticated_balance_to_cash_balance() -> None:
         assert balance.total == Decimal("123.45")
         assert balance.held_for_orders == Decimal("0")
         assert balance.updated_at == datetime(2026, 5, 27, 10, 0, tzinfo=UTC)
+
+    asyncio.run(run())
+
+
+def test_rest_client_submits_v2_event_order_with_signed_post(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    async def run() -> None:
+        requests: list[httpx.Request] = []
+
+        def fake_sign(path: Path | None, pem: str | None, message: bytes) -> str:
+            assert path is None
+            assert pem == "pem"
+            assert b"POST/trade-api/v2/portfolio/events/orders" in message
+            return "signed"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(
+                201,
+                json={
+                    "order_id": "ord-1",
+                    "client_order_id": "coid-1",
+                    "fill_count": "0.00",
+                    "remaining_count": "1.00",
+                    "ts_ms": 1715793600123,
+                },
+            )
+
+        monkeypatch.setattr(kalshi_client, "_sign_pss_sha256", fake_sign)
+        client = KalshiPublicClient(
+            base_url="https://example.test/trade-api/v2",
+            auth=KalshiAuth(api_key_id="kid", private_key_pem="pem"),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+
+        payload = await client.create_event_order_payload(
+            ticker="KXMLBGAME-TEST-NYM",
+            client_order_id="coid-1",
+            side="bid",
+            count=Decimal("1"),
+            price=Decimal("0.5100"),
+        )
+
+        assert payload["order_id"] == "ord-1"
+        assert len(requests) == 1
+        request = requests[0]
+        assert request.method == "POST"
+        assert request.url.path == "/trade-api/v2/portfolio/events/orders"
+        assert request.headers["KALSHI-ACCESS-KEY"] == "kid"
+        assert request.headers["KALSHI-ACCESS-SIGNATURE"] == "signed"
+        body = json.loads(request.content)
+        assert body == {
+            "ticker": "KXMLBGAME-TEST-NYM",
+            "client_order_id": "coid-1",
+            "side": "bid",
+            "count": "1.00",
+            "price": "0.5100",
+            "time_in_force": "good_till_canceled",
+            "self_trade_prevention_type": "taker_at_cross",
+            "post_only": False,
+            "cancel_order_on_pause": True,
+            "reduce_only": False,
+            "subaccount": 0,
+            "exchange_index": 0,
+        }
+
+    asyncio.run(run())
+
+
+def test_rest_client_cancels_v2_event_order_with_signed_delete(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    async def run() -> None:
+        requests: list[httpx.Request] = []
+
+        def fake_sign(path: Path | None, pem: str | None, message: bytes) -> str:
+            assert path is None
+            assert pem == "pem"
+            assert b"DELETE/trade-api/v2/portfolio/events/orders/ord-1" in message
+            return "signed"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={"order_id": "ord-1", "client_order_id": "coid-1", "reduced_by": "1.00"})
+
+        monkeypatch.setattr(kalshi_client, "_sign_pss_sha256", fake_sign)
+        client = KalshiPublicClient(
+            base_url="https://example.test/trade-api/v2",
+            auth=KalshiAuth(api_key_id="kid", private_key_pem="pem"),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+
+        payload = await client.cancel_event_order_payload("ord-1")
+
+        assert payload["order_id"] == "ord-1"
+        assert len(requests) == 1
+        request = requests[0]
+        assert request.method == "DELETE"
+        assert request.url.path == "/trade-api/v2/portfolio/events/orders/ord-1"
+        assert request.headers["KALSHI-ACCESS-KEY"] == "kid"
+        assert request.headers["KALSHI-ACCESS-SIGNATURE"] == "signed"
 
     asyncio.run(run())
 

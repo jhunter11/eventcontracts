@@ -15,7 +15,7 @@ from the shared schema (cross-language parity covers both).
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from uuid import uuid4
@@ -61,6 +61,13 @@ class _MarketState:
     held_qty: Decimal | None = None
     peak_bid: Decimal | None = None
     exit_client_order_id: ClientOrderId | None = None
+    # Every client_order_id we have ever emitted as a liquidation/exit for this
+    # market. ``exit_client_order_id`` is cleared on cancel/expiry so a NEW exit
+    # can be attempted, but a fill for an already-cancelled exit can still arrive
+    # afterwards (IOC partial races the expiry). Classifying a fill by this set
+    # -- not by the live pointer -- keeps a late liquidation fill from being
+    # mis-booked as an entry that GROWS the position.
+    exit_order_ids: set[ClientOrderId] = field(default_factory=set)
     closed: bool = False
 
 
@@ -243,6 +250,7 @@ class SportsTennisXgboostStrategy(StrategyBase):
         )
         client_order_id = ClientOrderId(uuid4().hex)
         state.exit_client_order_id = client_order_id
+        state.exit_order_ids.add(client_order_id)
         snapshot = _snapshot_for_side(state.latest_quote_snapshot, state.held_side)
         return (
             PlaceOrder(
@@ -319,24 +327,42 @@ class SportsTennisXgboostStrategy(StrategyBase):
         if state is None or event.fill.quantity <= 0:
             return
         client_order_id = event.fill.client_order_id
-        if state.exit_client_order_id is not None and client_order_id == state.exit_client_order_id:
-            # Liquidation filled -> position closed for good (no re-entry).
-            state.holding = False
-            state.held_qty = None
-            state.exit_client_order_id = None
-            state.closed = True
+        if client_order_id in state.exit_order_ids:
+            # Liquidation fill: subtract the actual filled qty from the held position.
+            # Classify by membership in exit_order_ids (not the live
+            # exit_client_order_id pointer): that pointer is cleared on
+            # cancel/expiry so a new exit can be tried, but a late fill for an
+            # already-cancelled IOC exit can still arrive afterwards and must NOT
+            # be mis-booked as an entry that grows the position.
+            # A partial fill reduces held_qty but does NOT close the position; the
+            # exit pointer is cleared so the trailing-stop logic can re-attempt on
+            # the next adverse quote. Only when held_qty reaches zero (or goes
+            # negative, which would indicate a data error) is it fully closed.
+            remaining = (state.held_qty or Decimal("0")) - event.fill.quantity
+            if remaining <= 0:
+                state.holding = False
+                state.held_qty = None
+                state.exit_client_order_id = None
+                state.closed = True
+            else:
+                state.held_qty = remaining
+                state.exit_client_order_id = None  # allow a new exit attempt
             return
-        # Entry fill -> establish the held position. The held side comes from our
-        # recorded entry intent (so it matches the Rust twin, whose fill carries
-        # no side); quantity comes from the fill.
+        # Entry fill -> establish (or grow) the held position. The held side comes
+        # from our recorded entry intent (so it matches the Rust twin, whose fill
+        # carries no side); quantity is accumulated across partial fills.
         state.pending_client_order_id = None
         state.active_client_order_id = client_order_id
         state.holding = True
         state.held_side = (
             state.pending_side if state.pending_side is not None else event.fill.outcome_side
         )
-        state.held_qty = (state.held_qty or Decimal("0")) + event.fill.quantity
-        state.peak_bid = None
+        prev_qty = state.held_qty or Decimal("0")
+        state.held_qty = prev_qty + event.fill.quantity
+        # Only reset the trailing-stop peak when the position is first established;
+        # subsequent partial fills grow the position without discarding the peak.
+        if prev_qty == Decimal("0"):
+            state.peak_bid = None
 
     @staticmethod
     def _unlock_completed_if_ready(state: _MarketState, now: datetime) -> None:

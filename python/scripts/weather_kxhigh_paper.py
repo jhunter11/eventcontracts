@@ -187,6 +187,26 @@ def market_payload(ticker: str) -> dict[str, Any]:
     return market if isinstance(market, dict) else d
 
 
+def kalshi_result(ticker: str) -> str | None:
+    """The contract's official settled outcome ('yes'/'no') once Kalshi has
+    determined it, else None.
+
+    Kalshi marks KXHIGH markets `determined` within hours of close, whereas the
+    GHCND daily actual lags ~3-4 days. The contract result is therefore the fast,
+    definitionally-correct settlement source for paper PnL / CLV / Brier — the
+    GHCND high is only needed for forecast-error / sigma analysis, not to settle.
+    """
+    try:
+        m = market_payload(ticker)
+    except Exception:  # noqa: BLE001
+        return None
+    status = str(m.get("status") or "").lower()
+    result = str(m.get("result") or "").lower()
+    if status in {"determined", "settled", "finalized"} and result in {"yes", "no"}:
+        return result
+    return None
+
+
 def historical_candlesticks(
     ticker: str,
     *,
@@ -299,6 +319,22 @@ def kalshi_fee(price: float, contracts: int = 1) -> float:
     return 0.07 * price * (1.0 - price) * contracts
 
 
+def kalshi_fee_realized(price: float, contracts: int = 1) -> float:
+    """Realized Kalshi taker fee actually charged on the ORDER, in dollars.
+
+    Kalshi charges ``ceil(100 * 0.07 * C * p * (1-p))`` cents on the whole order
+    (see risk/limits._kalshi_fee_per_contract and the Rust risk/fees.rs model).
+    The marginal ``kalshi_fee`` deliberately skips this ceil for edge display, but
+    realized PnL must use the charged amount or it under-counts fees by up to a
+    cent per fill and over-states net PnL."""
+    import math
+
+    if contracts <= 0:
+        return 0.0
+    raw_cents = 100.0 * 0.07 * price * (1.0 - price) * contracts
+    return math.ceil(raw_cents - 1e-9) / 100.0
+
+
 def _side_price_from_yes(yes_price: float, side: str) -> float:
     return yes_price if side == "YES" else 1.0 - yes_price
 
@@ -315,7 +351,9 @@ def _entry_fee(entry: dict[str, Any]) -> float:
     existing = _opt_f(entry.get("fee"))
     if existing is not None:
         return existing
-    return kalshi_fee(_entry_fill_price(entry), _entry_size(entry))
+    # Realized PnL must use the fee Kalshi actually charges (ceil-to-cent on the
+    # order), not the unrounded marginal-edge approximation.
+    return kalshi_fee_realized(_entry_fill_price(entry), _entry_size(entry))
 
 
 def _attach_clv(entry: dict[str, Any], closing_yes_mid_value: float) -> None:
@@ -328,8 +366,22 @@ def _attach_clv(entry: dict[str, Any], closing_yes_mid_value: float) -> None:
     entry["clv"] = round(clv_per_contract * _entry_size(entry), 4)
 
 
+def _round_high_to_int(high_f: float) -> int:
+    """Round a daily-high F to the settled integer the SAME way the model does.
+
+    The pricing distribution rounds with ``math.floor(x + 0.5)`` (round-half-UP;
+    see distribution._rounded_high), but Python's built-in ``round`` is banker's
+    rounding (round-half-to-EVEN: round(70.5)==70, round(72.5)==72). Using the
+    built-in here would settle a ``.5`` actual against a different integer than
+    the one the contract was priced and defined on, flipping the YES/NO outcome
+    on the boundary. Mirror the model so settlement and pricing agree."""
+    import math
+
+    return math.floor(high_f + 0.5)
+
+
 def _entry_yes_result(entry: dict[str, Any], high_f: float) -> bool:
-    hi = round(high_f)
+    hi = _round_high_to_int(high_f)
     floor_s, cap_s = entry.get("floor_strike"), entry.get("cap_strike")
     st = entry["strike_type"]
     if st == "greater":
@@ -569,7 +621,15 @@ def main() -> int:
                         "ticker": c.ticker,
                         "station": code,
                         "target_day": c.target_day.isoformat(),
-                        "close_time": m.get("close_time"),
+                        # Use THIS bracket's own close_time (parsed into the
+                        # contract). The loop variable ``m`` here is stale — it is
+                        # left bound to the LAST market from the earlier
+                        # ``for m in markets`` loop, so ``m.get("close_time")``
+                        # would stamp every record with the wrong bracket's close,
+                        # corrupting CLV (which trusts the stored close_time first).
+                        "close_time": (
+                            c.close_time.isoformat() if c.close_time is not None else None
+                        ),
                         "strike_type": c.strike_type,
                         "floor_strike": c.floor_strike,
                         "cap_strike": c.cap_strike,
@@ -586,7 +646,10 @@ def main() -> int:
                         "yes_mid_at_entry": round(mid, 4),
                         "market_mid_at_entry": round(market_mid_at_entry, 4),
                         "fee_per_contract": round(kalshi_fee(entry), 4),
-                        "fee": round(kalshi_fee(entry, args.size), 4),
+                        # Realized order fee = ceil-to-cent (what Kalshi charges);
+                        # _entry_fee trusts this stored value at settle time, so it
+                        # must already be the charged amount, not the marginal est.
+                        "fee": round(kalshi_fee_realized(entry, args.size), 4),
                         "edge_after_fee": round(edge_af, 4),
                         "predicted_edge_after_fee": round(edge_af, 4),
                         "distribution_method": distribution.method,
@@ -666,11 +729,12 @@ def _settle(
         return 2
     token = _noaa_token()
     if not token:
-        print("NOAA_TOKEN not in .env; cannot settle")
-        return 2
+        print("NOAA_TOKEN not in .env; GHCND actual-high unavailable — "
+              "settling from Kalshi determined results only")
     sid_by_code = {code: loc.station_id for _, (code, loc) in KXHIGH_STATIONS.items()}
     entries = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines() if line.strip()]
     actual_cache: dict[tuple[str, str], float | None] = {}
+    kalshi_result_cache: dict[str, str | None] = {}
     close_cache: dict[str, datetime | None] = {}
     closing_mid_cache: dict[str, float | None] = {}
     updated_entries: list[dict[str, Any]] = []
@@ -690,7 +754,7 @@ def _settle(
         key = (code, day_s)
         if key not in actual_cache:
             try:
-                actual_cache[key] = ghcnd_high(sid, date.fromisoformat(day_s), token) if sid else None
+                actual_cache[key] = ghcnd_high(sid, date.fromisoformat(day_s), token) if (sid and token) else None
             except Exception:  # noqa: BLE001
                 actual_cache[key] = None
 
@@ -721,13 +785,25 @@ def _settle(
             e["clv_status"] = "pending:market_not_closed"
 
         actual = actual_cache[key]
-        if actual is None:
-            e["settlement_status"] = "pending:no_ghcnd_actual"
-            updated_entries.append(e)
-            pending += 1
-            continue
-        hi = round(actual)
-        yes = _entry_yes_result(e, actual)
+        if actual is not None:
+            # Preferred when available: enriches with the actual high (for sigma work).
+            hi: int | None = _round_high_to_int(actual)
+            yes = _entry_yes_result(e, actual)
+            settle_source = "ghcnd"
+        else:
+            # GHCND lags ~3-4 days; settle from the contract's own determined result,
+            # which resolves within hours and is definitionally correct for the outcome.
+            if ticker not in kalshi_result_cache:
+                kalshi_result_cache[ticker] = kalshi_result(ticker)
+            res = kalshi_result_cache[ticker]
+            if res is None:
+                e["settlement_status"] = "pending:no_actual_no_kalshi_result"
+                updated_entries.append(e)
+                pending += 1
+                continue
+            hi = None
+            yes = (res == "yes")
+            settle_source = "kalshi_result"
         won = yes if e["side"] == "YES" else (not yes)
         pnl, gross, fee = _entry_realized_pnl(e, won=won)
         pnl_total += pnl
@@ -736,18 +812,21 @@ def _settle(
         wins += 1 if won else 0
         settled += 1
         e["settlement_status"] = "settled"
-        e["actual_high_f"] = round(actual, 2)
-        e["actual_high_int"] = hi
+        e["settle_source"] = settle_source
+        if hi is not None:
+            e["actual_high_f"] = round(actual, 2)
+            e["actual_high_int"] = hi
         e["settled_yes"] = yes
         e["won"] = won
         e["gross_pnl"] = round(gross, 4)
         e["fee"] = round(fee, 4)
         e["realized_pnl"] = round(pnl, 4)
         clv_text = f" clv={float(e['clv']):+.2f}" if "clv" in e else ""
+        outcome_text = f"actual_hi={hi}" if hi is not None else f"kalshi={'YES' if yes else 'NO'}"
         print(f"  {ticker:24s} {e['side']:3s}@{_entry_fill_price(e):.2f}x{_entry_size(e):>3d} "
-              f"actual_hi={hi} -> {'WON ' if won else 'LOST'} pnl={pnl:+.2f}{clv_text}")
+              f"{outcome_text} -> {'WON ' if won else 'LOST'} pnl={pnl:+.2f}{clv_text}")
         updated_entries.append(e)
-    print(f"\n  settled={settled} pending={pending} (GHCND not yet published)")
+    print(f"\n  settled={settled} pending={pending}")
     if settled:
         print(f"  realized PnL = ${pnl_total:+.2f}  gross=${gross_total:+.2f}  fees=${fee_total:.2f}")
         print(f"  win_rate={wins/settled:.0%}  over {settled} fills")

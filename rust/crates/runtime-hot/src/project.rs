@@ -311,9 +311,16 @@ fn passthrough(kind: HotEventKind, payload: &str) -> HotEvent {
 /// - `{"snapshot": {"yes": [[price, size], ...], "no": [[price, size], ...]}}`
 /// - `{"delta": {"side": "yes"|"no", "price": ..., "delta": ...}}`
 /// - flat `{"yes": [...], "no": [...]}` (snapshot fallback)
+/// - live feed keys `yes_dollars_fp` / `no_dollars_fp` (ascending order from Kalshi)
 ///
 /// Prices in Kalshi book payloads are cents (integers 1..99); we accept both
 /// integer and decimal forms.
+///
+/// **Level ordering**: Kalshi sends snapshot levels in ascending price order.
+/// After parsing, bids are sorted descending (best bid = highest price first)
+/// and asks are sorted ascending (best ask = lowest price first) so that
+/// `best_bid()` / `best_ask()` — which call `.first()` — return the correct
+/// top-of-book level.
 fn parse_kalshi_book(
     raw: &Value,
 ) -> Result<
@@ -342,14 +349,24 @@ fn parse_kalshi_book(
         } else {
             let _ = asks.try_push(level);
         }
+        // Deltas are single-level; ordering is not needed for a 1-element vec.
         return Ok((false, bids, asks, false));
-    } else if raw.get("yes").is_some() || raw.get("no").is_some() {
+    } else if raw.get("yes").is_some()
+        || raw.get("no").is_some()
+        || raw.get("yes_dollars_fp").is_some()
+        || raw.get("no_dollars_fp").is_some()
+    {
         (raw, true)
     } else {
         return Ok((true, bids, asks, false));
     };
 
-    if let Some(arr) = snap_obj.get("yes").and_then(Value::as_array) {
+    // Accept both canonical `yes` and live-feed `yes_dollars_fp` keys.
+    let yes_arr = snap_obj
+        .get("yes")
+        .or_else(|| snap_obj.get("yes_dollars_fp"))
+        .and_then(Value::as_array);
+    if let Some(arr) = yes_arr {
         for entry in arr {
             if let Some(level) = level_from_pair(entry)? {
                 if bids.try_push(level).is_err() {
@@ -359,7 +376,13 @@ fn parse_kalshi_book(
             }
         }
     }
-    if let Some(arr) = snap_obj.get("no").and_then(Value::as_array) {
+
+    // Accept both canonical `no` and live-feed `no_dollars_fp` keys.
+    let no_arr = snap_obj
+        .get("no")
+        .or_else(|| snap_obj.get("no_dollars_fp"))
+        .and_then(Value::as_array);
+    if let Some(arr) = no_arr {
         for entry in arr {
             if let Some(level) = level_from_pair(entry)? {
                 if asks.try_push(level).is_err() {
@@ -369,6 +392,14 @@ fn parse_kalshi_book(
             }
         }
     }
+
+    // Kalshi sends levels in ascending price order. Sort so that `.first()`
+    // returns the best level: bids descending (highest = best), asks ascending
+    // (lowest = best). Use unstable sort — order among equal prices is
+    // undefined by Kalshi anyway and unstable is faster.
+    bids.sort_unstable_by(|a, b| b.price.cmp(&a.price));
+    asks.sort_unstable_by(|a, b| a.price.cmp(&b.price));
+
     Ok((is_snapshot, bids, asks, truncated))
 }
 
@@ -557,6 +588,118 @@ mod tests {
         assert_eq!(b.bids[0].price, FixedPrice::from_cents(42));
         assert_eq!(b.bids[0].size, Qty(50));
         assert!(b.asks.is_empty());
+    }
+
+    /// Delta `no` side routes to `asks`, not `bids`.
+    #[test]
+    fn project_book_delta_no_side() {
+        let rec = make(
+            "book",
+            json!({
+                "instrument": "kalshi:X",
+                "raw": {
+                    "delta": {"side": "no", "price": 57, "delta": 30}
+                }
+            }),
+        );
+        let HotEvent::Book(b) = project_event(&rec).unwrap() else {
+            panic!("expected book");
+        };
+        assert!(!b.is_snapshot);
+        assert!(b.bids.is_empty());
+        assert_eq!(b.asks.len(), 1);
+        assert_eq!(b.asks[0].price, FixedPrice::from_cents(57));
+        assert_eq!(b.asks[0].size, Qty(30));
+    }
+
+    /// Snapshot with BOTH sides in ascending Kalshi order — exercises the sort
+    /// fix and two-sided parsing together. The bug that t220 targeted: levels
+    /// were never sorted and only one side was populated. After the fix,
+    /// best_bid() must return the HIGHEST yes price and best_ask() the LOWEST
+    /// no price.
+    #[test]
+    fn project_book_snapshot_two_sided_unsorted_input_sorts_both_sides() {
+        let rec = make(
+            "book",
+            json!({
+                "instrument": "kalshi:X",
+                "raw": {
+                    "snapshot": {
+                        // Ascending (as Kalshi sends): 40 < 41 < 42
+                        "yes": [[40, 500], [41, 250], [42, 100]],
+                        // Ascending: 57 < 58 < 59
+                        "no":  [[57, 80],  [58, 60],  [59, 40]],
+                    }
+                }
+            }),
+        );
+        let HotEvent::Book(b) = project_event(&rec).unwrap() else {
+            panic!("expected book");
+        };
+        assert!(b.is_snapshot);
+        assert!(!b.truncated);
+        // Bids must be sorted descending: best bid = 42 (highest)
+        assert_eq!(b.bids.len(), 3);
+        assert_eq!(b.bids[0].price, FixedPrice::from_cents(42));
+        assert_eq!(b.bids[1].price, FixedPrice::from_cents(41));
+        assert_eq!(b.bids[2].price, FixedPrice::from_cents(40));
+        assert_eq!(b.best_bid().unwrap().price, FixedPrice::from_cents(42));
+        // Asks must be sorted ascending: best ask = 57 (lowest)
+        assert_eq!(b.asks.len(), 3);
+        assert_eq!(b.asks[0].price, FixedPrice::from_cents(57));
+        assert_eq!(b.asks[1].price, FixedPrice::from_cents(58));
+        assert_eq!(b.asks[2].price, FixedPrice::from_cents(59));
+        assert_eq!(b.best_ask().unwrap().price, FixedPrice::from_cents(57));
+    }
+
+    /// Kalshi sends snapshot levels in ascending price order; after sorting,
+    /// `best_bid()` must return the highest-price bid level.
+    #[test]
+    fn project_book_snapshot_ascending_input_sorts_correctly() {
+        // Ascending order (low → high) as Kalshi sends it in the live feed.
+        let rec = make(
+            "book",
+            json!({
+                "instrument": "kalshi:X",
+                "raw": {
+                    "snapshot": {
+                        "yes": [[41, 250], [42, 100]],   // ascending: 41 < 42
+                        "no":  [[57, 60], [58, 75]],     // ascending: 57 < 58
+                    }
+                }
+            }),
+        );
+        let HotEvent::Book(b) = project_event(&rec).unwrap() else {
+            panic!("expected book");
+        };
+        // After sort: bids[0] should be the HIGHEST price (42), asks[0] the LOWEST (57).
+        assert_eq!(b.bids[0].price, FixedPrice::from_cents(42));
+        assert_eq!(b.best_bid().unwrap().price, FixedPrice::from_cents(42));
+        assert_eq!(b.asks[0].price, FixedPrice::from_cents(57));
+        assert_eq!(b.best_ask().unwrap().price, FixedPrice::from_cents(57));
+    }
+
+    /// Live Kalshi WS feed uses `yes_dollars_fp` / `no_dollars_fp` keys.
+    #[test]
+    fn project_book_snapshot_yes_dollars_fp_keys() {
+        let rec = make(
+            "book",
+            json!({
+                "instrument": "kalshi:X",
+                "raw": {
+                    "yes_dollars_fp": [["0.41", "250"], ["0.42", "100"]],
+                    "no_dollars_fp":  [["0.57", "60"],  ["0.58", "75"]],
+                }
+            }),
+        );
+        let HotEvent::Book(b) = project_event(&rec).unwrap() else {
+            panic!("expected book");
+        };
+        assert!(b.is_snapshot);
+        assert_eq!(b.bids[0].price, FixedPrice::from_cents(42));
+        assert_eq!(b.best_bid().unwrap().price, FixedPrice::from_cents(42));
+        assert_eq!(b.asks[0].price, FixedPrice::from_cents(57));
+        assert_eq!(b.best_ask().unwrap().price, FixedPrice::from_cents(57));
     }
 
     #[test]

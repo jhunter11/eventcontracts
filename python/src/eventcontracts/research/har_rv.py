@@ -27,6 +27,23 @@ from dataclasses import dataclass
 import numpy as np
 
 
+def _r_squared(ss_res: float, ss_tot: float, y: np.ndarray) -> float:
+    """Coefficient of determination, numerically safe for degenerate targets.
+
+    A strict ``ss_tot > 0`` guard is fragile: when the target is (near-)constant
+    -- e.g. constant realized variance -- ``ss_tot`` is floating-point noise that
+    is still > 0, while ``ss_res`` is comparable noise, so ``1 - ss_res/ss_tot``
+    can explode to a large negative number (observed: R^2 = -15). When there is
+    no real variance to explain, R^2 is undefined; report 0.0. Tolerance scales
+    with the data so it is unit-agnostic (log-space vs raw RV)."""
+
+    scale = float(np.abs(y).max()) if y.size else 0.0
+    tol = 1e-12 * max(scale * scale * max(y.size, 1), 1.0)
+    if ss_tot <= tol:
+        return 0.0
+    return 1.0 - ss_res / ss_tot
+
+
 def log_returns(prices: Sequence[float]) -> list[float]:
     """Close-to-close log returns from a price path."""
 
@@ -146,7 +163,7 @@ class HARRV:
         resid = y - x @ beta
         ss_res = float(resid @ resid)
         ss_tot = float(((y - y.mean()) ** 2).sum())
-        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        r2 = _r_squared(ss_res, ss_tot, y)
         return HARRVFit(
             beta0=float(beta[0]),
             beta_d=float(beta[1]),
@@ -268,7 +285,7 @@ class HARFamily:
         resid = y - full @ coef
         ss_res = float(resid @ resid)
         ss_tot = float(((y - ybar) ** 2).sum())
-        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        r2 = _r_squared(ss_res, ss_tot, y)
         names = ["const"]
         for key in _VARIANT_COMPONENTS[self.variant]:
             names += [f"{key}_d", f"{key}_w", f"{key}_m"]

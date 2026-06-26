@@ -147,14 +147,44 @@ class KalshiPublicClient:
         return cls(base_url=environment.rest_base_url, auth=KalshiAuth.from_env())
 
     async def _get(self, path: str, params: Mapping[str, str | int] | None = None) -> dict[str, Any]:
+        return await self._request("GET", path, params=params)
+
+    async def _post(self, path: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        return await self._request("POST", path, json_payload=payload)
+
+    async def _delete(self, path: str) -> dict[str, Any]:
+        return await self._request("DELETE", path)
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Mapping[str, str | int] | None = None,
+        json_payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
-        headers = self.auth.headers("GET", url)
+        headers = self.auth.headers(method, url)
+        if json_payload is not None:
+            headers["Content-Type"] = "application/json"
         if self._client is not None:
-            response = await self._client.get(url, params=params, headers=headers)
+            response = await self._client.request(
+                method,
+                url,
+                params=params,
+                headers=headers,
+                json=dict(json_payload) if json_payload is not None else None,
+            )
             response.raise_for_status()
             return _as_dict(response.json())
         async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(url, params=params, headers=headers)
+            response = await client.request(
+                method,
+                url,
+                params=params,
+                headers=headers,
+                json=dict(json_payload) if json_payload is not None else None,
+            )
             response.raise_for_status()
             return _as_dict(response.json())
 
@@ -173,6 +203,49 @@ class KalshiPublicClient:
         subaccount: int | None = None,
     ) -> CashBalance:
         return (await self.get_balance(subaccount=subaccount)).cash_balance(currency=currency)
+
+    async def create_event_order_payload(
+        self,
+        *,
+        ticker: str,
+        client_order_id: str,
+        side: str,
+        count: Decimal | str | int,
+        price: Decimal | str | int,
+        time_in_force: str = "good_till_canceled",
+        self_trade_prevention_type: str = "taker_at_cross",
+        post_only: bool = False,
+        cancel_order_on_pause: bool = True,
+        reduce_only: bool = False,
+        subaccount: int = 0,
+        exchange_index: int = 0,
+    ) -> dict[str, Any]:
+        """Submit a Kalshi V2 event-market order and return the raw payload.
+
+        This is an authenticated write path. Callers must gate real usage with
+        the operator/panel/spend controls outside this adapter.
+        """
+        payload = _event_order_payload(
+            ticker=ticker,
+            client_order_id=client_order_id,
+            side=side,
+            count=count,
+            price=price,
+            time_in_force=time_in_force,
+            self_trade_prevention_type=self_trade_prevention_type,
+            post_only=post_only,
+            cancel_order_on_pause=cancel_order_on_pause,
+            reduce_only=reduce_only,
+            subaccount=subaccount,
+            exchange_index=exchange_index,
+        )
+        return await self._post("/portfolio/events/orders", payload)
+
+    async def cancel_event_order_payload(self, order_id: str) -> dict[str, Any]:
+        """Cancel a Kalshi V2 event-market order by venue order id."""
+        if not str(order_id).strip():
+            raise ValueError("order_id must not be empty")
+        return await self._delete(f"/portfolio/events/orders/{order_id}")
 
     async def get_markets_payload(
         self,
@@ -579,6 +652,57 @@ def _balance_snapshot_from_payload(payload: Mapping[str, Any]) -> KalshiBalanceS
         updated_at=_parse_unix_time(payload.get("updated_ts")),
         raw=dict(payload),
     )
+
+
+def _event_order_payload(
+    *,
+    ticker: str,
+    client_order_id: str,
+    side: str,
+    count: Decimal | str | int,
+    price: Decimal | str | int,
+    time_in_force: str,
+    self_trade_prevention_type: str,
+    post_only: bool,
+    cancel_order_on_pause: bool,
+    reduce_only: bool,
+    subaccount: int,
+    exchange_index: int,
+) -> dict[str, Any]:
+    ticker = str(ticker).strip()
+    client_order_id = str(client_order_id).strip()
+    side = str(side).strip().lower()
+    if not ticker:
+        raise ValueError("ticker must not be empty")
+    if not client_order_id:
+        raise ValueError("client_order_id must not be empty")
+    if side not in {"bid", "ask"}:
+        raise ValueError("side must be 'bid' or 'ask'")
+    count_value = Decimal(str(count))
+    price_value = Decimal(str(price))
+    if count_value <= 0:
+        raise ValueError("count must be positive")
+    if price_value <= 0 or price_value >= 1:
+        raise ValueError("price must be greater than 0 and less than 1")
+    return {
+        "ticker": ticker,
+        "client_order_id": client_order_id,
+        "side": side,
+        "count": _format_decimal(count_value, places=2),
+        "price": _format_decimal(price_value, places=4),
+        "time_in_force": time_in_force,
+        "self_trade_prevention_type": self_trade_prevention_type,
+        "post_only": bool(post_only),
+        "cancel_order_on_pause": bool(cancel_order_on_pause),
+        "reduce_only": bool(reduce_only),
+        "subaccount": int(subaccount),
+        "exchange_index": int(exchange_index),
+    }
+
+
+def _format_decimal(value: Decimal, *, places: int) -> str:
+    quant = Decimal("1").scaleb(-places)
+    return format(value.quantize(quant), "f")
 
 
 def _message_time(message: Mapping[str, Any]) -> datetime | None:

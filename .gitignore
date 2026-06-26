@@ -58,3 +58,5 @@ live-test/
 .claude/
 .codex/
 .gemini/
+
+*.log

@@ -28,7 +28,12 @@ from eventcontracts.weather.temperature import HourlyWeatherPoint, TemperatureFo
 from tests.conftest import REPO_ROOT
 
 sys.path.insert(0, str(REPO_ROOT / "python" / "scripts"))
-from weather_kxhigh_paper import _attach_clv, _entry_realized_pnl, _entry_yes_result  # noqa: E402
+from weather_kxhigh_paper import (  # noqa: E402
+    _attach_clv,
+    _entry_realized_pnl,
+    _entry_yes_result,
+    _round_high_to_int,
+)
 
 # Real-shaped Kalshi /markets payloads (fields trimmed to what the parser reads).
 _GREATER = {"ticker": "KXHIGHNY-26MAY31-T79", "strike_type": "greater", "floor_strike": 79}
@@ -365,5 +370,25 @@ def test_weather_paper_settlement_pnl_charges_fee() -> None:
     assert _entry_yes_result(entry, 72.1)
     pnl, gross, fee = _entry_realized_pnl(entry, won=True)
     assert gross == pytest.approx(8.2)
-    assert fee == pytest.approx(0.07 * 0.18 * 0.82 * 10)
+    # Kalshi charges ceil-to-cent on the order: ceil(100 * 0.07 * 0.18 * 0.82 * 10)
+    # = ceil(10.332) = 11 cents = $0.11. Realized PnL must use the charged fee,
+    # not the unrounded marginal approximation (0.10332).
+    import math
+
+    assert fee == pytest.approx(math.ceil(0.07 * 0.18 * 0.82 * 10 * 100) / 100)
+    assert fee == pytest.approx(0.11)
     assert pnl == pytest.approx(gross - fee)
+
+
+def test_settlement_rounds_half_up_like_the_pricing_model() -> None:
+    # The pricing distribution rounds the high with floor(x + 0.5) (round-half-UP),
+    # so settlement must too. Python's built-in round() is banker's rounding and
+    # would settle a .5 actual against a different integer than the model priced.
+    assert _round_high_to_int(72.5) == 73
+    assert _round_high_to_int(70.5) == 71
+    assert _round_high_to_int(72.4) == 72
+    # A 72.5 actual settles a [73, 74] "between" bracket... no; it settles the
+    # bracket whose YES region contains 73, proving the half-up choice flows
+    # through _entry_yes_result.
+    entry = {"strike_type": "greater", "floor_strike": 72.0, "cap_strike": None, "side": "YES"}
+    assert _entry_yes_result(entry, 72.5)  # round-half-up -> 73 >= 72 + 1

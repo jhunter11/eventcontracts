@@ -67,7 +67,12 @@ def test_markout_no_network_writes_horizon_metadata_and_ledger(tmp_path: Path) -
             "--min-executable-size",
             "0",
             "--max-source-age-seconds",
-            "999999",
+            # Fixtures are frozen at a fixed calendar date (2026-06-04), but the
+            # CLI computes source age against real wall-clock now(). Use a sentinel
+            # that dwarfs the fixture's ever-growing real-time age so the staleness
+            # gate never fires here — otherwise the test silently rots once the
+            # fixture is >~11.6 days old (the old 999999s ceiling). ~1000 years.
+            "31536000000",
             "--report-json",
             str(entry_json),
             "--report-md",
@@ -126,7 +131,12 @@ def test_markout_horizons_no_network_writes_bundle_and_reports(tmp_path: Path) -
             "--min-executable-size",
             "0",
             "--max-source-age-seconds",
-            "999999",
+            # Fixtures are frozen at a fixed calendar date (2026-06-04), but the
+            # CLI computes source age against real wall-clock now(). Use a sentinel
+            # that dwarfs the fixture's ever-growing real-time age so the staleness
+            # gate never fires here — otherwise the test silently rots once the
+            # fixture is >~11.6 days old (the old 999999s ceiling). ~1000 years.
+            "31536000000",
             "--report-json",
             str(entry_json),
             "--report-md",
