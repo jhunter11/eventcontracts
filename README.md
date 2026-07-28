@@ -1,15 +1,37 @@
 # Event Contracts Research Framework
 
-This repository is an execution-aware event-contract research stack covering
-Kalshi, Polymarket global, and future venue adapters. It is intentionally built
-around typed data contracts first: strategies consume normalized events, read
-state through a context, and emit typed decisions that a runner can route
-through risk, paper execution, or a live gateway later.
+**A research stack for event-contract markets — Kalshi, Polymarket — built so that a strategy cannot cheat.**
 
-The project is not a live trading bot yet. The current production-shaped use
-case is market-edge research: capture real venue data, normalize it, replay it
-through strategy specs, and estimate fills with book/trade-based paper
-execution before any live order path exists.
+Strategies receive normalized events and return typed decisions. They do not call venue clients, read storage, place orders, or know what time it is. The runner owns all of that.
+
+That constraint is the design. A strategy that can reach the network can look ahead; a strategy that returns values cannot. It also means the same strategy object runs unchanged across backtest, replay, paper, and eventually live.
+
+```bash
+python3 explore.py
+```
+
+A numbered menu: the typed seam between Python and Rust, the strategy specs, and a synthetic end-to-end run that takes a strategy from raw events to a risk-gated decision with no network and no credentials.
+
+```
+   raw venue payload                    Kalshi REST/WS, Polymarket, weather, macro
+        │
+        ▼
+   normalized event                     one typed shape, whatever the venue
+        │
+        ▼
+   Strategy.on_event(event, ctx)        returns values; touches nothing
+        │
+        ▼
+   strategy decision ─▶ intent ─▶ risk gate ─▶ paper executor · bus · OMS
+```
+
+**614 Python tests**, passing from a bare checkout · **38 strategy specs** · **18 frozen parity cases** that both the Python and Rust implementations must reproduce exactly · **11 Rust crates** for the hot path.
+
+## Not a live trading bot
+
+There is no live order path, deliberately. The point is to normalize, replay, and estimate fills honestly *before* anything can send an order.
+
+Fill estimation is pessimistic by construction: marketable orders walk the captured opposite book; passive orders join a configurable fraction of visible same-price depth and only fill when later captured trades actually consume that queue. Repeated REST trade polls are deduped so fill volume isn't multiplied by the polling rate.
 
 ## Repository Layout
 
@@ -19,7 +41,9 @@ hot-path and live-spine crates under `rust/` (`runner`, `runtime-hot`, `risk`,
 `contracts`), and the cross-language file-format contracts
 that both consume under `contracts/`. The Python/Rust seam is files on
 disk (TOML specs, JSON schemas, Parquet parity cases, ONNX models), not
-in-process imports.
+in-process imports — so either side can be rewritten without touching the
+other, and a mismatch surfaces as a schema-validation failure rather than a
+silent divergence.
 
 ## Dependency Setup
 
@@ -66,7 +90,14 @@ pytest plugins from affecting this repository.
 
 ## Current Package Shape
 
-All Python source lives under `python/src/eventcontracts/`:
+The interesting modules first: `domain` (the types everything else agrees on),
+`strategy` (the plug-in contract), `runner` (lifecycle, provenance, risk,
+dispatch), `normalization` (contract matching and cross-venue rejection),
+`replay` (deterministic event-time), and `execution` (paper fills and queue
+modelling). The full inventory:
+
+<details>
+<summary>All 25 packages under <code>python/src/eventcontracts/</code></summary>
 
 - `domain`: venue-neutral dataclasses and closed sum types.
 - `strategy`: the researcher-facing strategy protocol, lifecycle states, read-only context contract, and registry.
@@ -92,6 +123,8 @@ All Python source lives under `python/src/eventcontracts/`:
 - `external`: point-in-time weather, crypto, macro, and other provider contracts.
 - `contracts`: dependency-free validation helpers for the cross-language schema files in top-level `contracts/`.
 - `markets`: subscription-based market detection and in-memory reference catalog for paper/dry-run mode.
+
+</details>
 
 Other top-level directories:
 
